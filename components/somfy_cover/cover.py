@@ -12,7 +12,7 @@ from esphome.const import (
 
 CODEOWNERS = ["@LeonardPitzu"]
 
-AUTO_LOAD = ["button", "time_based"]
+AUTO_LOAD = ["button", "time_based", "remote_receiver", "text_sensor"]
 
 DEPENDENCIES = ["esp32"]
 
@@ -25,6 +25,8 @@ CONF_REMOTE_CODE = "remote_code"
 CONF_SOMFY_STORAGE_KEY = "storage_key"
 CONF_SOMFY_STORAGE_NAMESPACE = "storage_namespace"
 CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
+
+CONF_REMOTE_RECEIVER = "remote_receiver"
 
 CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
 CONF_LOG_CODES = "log_codes"
@@ -42,6 +44,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_SOMFY_STORAGE_KEY): cv.All(cv.string, cv.Length(max=15)),
             cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(cv.string, cv.Length(max=15)),
             cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
+
+            cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
+            cv.Optional(CONF_RECEIVE_REMOTE_CODES): cv.ensure_list(cv.uint32_t),
+            cv.Optional(CONF_LOG_CODES, default=True): cv.boolean,
+            cv.Optional(CONF_LOG_TEXT_SENSOR): cv.use_id(text_sensor.TextSensor),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32, PLATFORM_ESP8266, PLATFORM_RP2040]),
