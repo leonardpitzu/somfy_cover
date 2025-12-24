@@ -167,6 +167,6 @@ button:
 
 This is based on the work of https://github.com/HarmEllis/esphome-somfy-cover-remote and https://github.com/fawick/somfy_cover_2025.12
 The original esphome implementations were "unidirectional" in the sense that the shades were controlled correctly but the changes in the shade position triggered by physical remotes were not synced back to HA.
-The receiver/decoder component was implemented to coer this case based on the RTS decoder component from https://github.com/rstrouse/ESPSomfy-RTS
+The receiver/decoder component was implemented to cover this case based on the RTS decoder component from https://github.com/rstrouse/ESPSomfy-RTS
 
 All credits go to the original authors.
