@@ -28,7 +28,6 @@ CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
 
 CONF_REMOTE_RECEIVER = "remote_receiver"
 CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
-CONF_LOG_CODES = "log_codes"
 CONF_LOG_TEXT_SENSOR = "log_text_sensor"
 
 CONFIG_SCHEMA = cv.All(
@@ -45,7 +44,6 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
             cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
             cv.Optional(CONF_RECEIVE_REMOTE_CODES): cv.ensure_list(cv.uint32_t),
-            cv.Optional(CONF_LOG_CODES, default=True): cv.boolean,
             cv.Optional(CONF_LOG_TEXT_SENSOR): cv.use_id(text_sensor.TextSensor),
         }
     ).extend(cv.COMPONENT_SCHEMA),
