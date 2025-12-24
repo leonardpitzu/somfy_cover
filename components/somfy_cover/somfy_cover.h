@@ -109,6 +109,13 @@ protected:
   text_sensor::TextSensor *log_text_sensor_{nullptr};
   uint32_t last_rx_ms_{0};
 
+  // RX-derived UI sync (no TX). We simulate time-based movement when a physical remote is used.
+  bool rx_sync_active_{false};
+  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
+  uint32_t rx_start_ms_{0};
+  float rx_start_pos_{0.0f};
+  uint32_t rx_last_publish_ms_{0};
+
   // Set via the constructor
   NVSRollingCodeStorage *storage_;
 
