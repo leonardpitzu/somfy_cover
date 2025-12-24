@@ -42,7 +42,9 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_CLOSE_DURATION): cv.positive_time_period_milliseconds,
             cv.Required(CONF_REMOTE_CODE): cv.uint32_t,
             cv.Required(CONF_SOMFY_STORAGE_KEY): cv.All(cv.string, cv.Length(max=15)),
-            cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(cv.string, cv.Length(max=15)),
+            cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(
+                cv.string, cv.Length(max=15)
+            ),
             cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
 
             cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
@@ -52,6 +54,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32, PLATFORM_ESP8266, PLATFORM_RP2040]),
+    #cv.only_with_arduino,
 )
 
 
