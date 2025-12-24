@@ -18,8 +18,12 @@ allowed_remotes:
  - pair this remote with the motor of the shade
  - open the web interface of this controller
  - press a button on the remote control that controls the shade
- - copy-paste the remote's id in the ```receive_remote_codes```
+ - copy-paste the remote's id in ```allowed_remotes``` from the "Detected Remote" sensor in the web interface (or directly form HA)
+ - recompile & flash/update
+ - enjoy
 
+The "Detected Remote" sensor whows 3 values at once, e.g.
+```0x123456 MY 0x0123``` - this means Remote ID | Button from the remote pressed | rolling code value
 
 ## Generate remote code 
 The remote code is a three byte hex code.
