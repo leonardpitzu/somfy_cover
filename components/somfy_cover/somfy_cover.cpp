@@ -139,24 +139,19 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 }
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
-  if (this->log_codes_) {
-    const auto &raw = data.get_raw_data();
-    ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
-    if (!raw.empty()) {
-      std::string s;
-      const size_t n = std::min<size_t>(raw.size(), 20);
-      for (size_t i = 0; i < n; i++) {
-        char buf[16];
-        snprintf(buf, sizeof(buf), "%d", (int) raw[i]);
-        s += buf;
-        if (i + 1 < n) s += ",";
-      }
-      ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
+  const auto &raw = data.get_raw_data();
+  ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
+  if (!raw.empty()) {
+    std::string s;
+    const size_t n = std::min<size_t>(raw.size(), 20);
+    for (size_t i = 0; i < n; i++) {
+      char buf[16];
+      snprintf(buf, sizeof(buf), "%d", (int) raw[i]);
+      s += buf;
+      if (i + 1 < n) s += ",";
     }
+    ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
   }
-  // If nothing is configured, don't spend cycles decoding.
-  if (!this->log_codes_ && this->receive_remote_codes_.empty())
-    return false;
 
   // Basic de-duplication: Somfy remotes send repeats, and we may receive multiple frames per press.
   const uint32_t now = millis();
@@ -173,16 +168,12 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
 
   this->last_rx_ms_ = now;
 
-  const bool is_known_remote =
-      std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) !=
-      this->receive_remote_codes_.end();
+  const bool is_known_remote = std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) != this->receive_remote_codes_.end();
+  
+  if (!this->receive_remote_codes_.empty() && !is_known_remote)
+    return true;  // ignore other remotes (but we already logged in DEBUG above)
 
-  if (this->log_codes_) {
-    ESP_LOGD(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code, this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
-  } else if (!is_known_remote) {
-    // Not logging and not known => ignore.
-    return false;
-  }
+  ESP_LOGD(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code, this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
 
   if (this->log_text_sensor_ != nullptr) {
     char buf[96];
@@ -193,9 +184,8 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   if (!is_known_remote)
     return true;
 
-  // Keep HA UI in sync without transmitting anything.
+// Keep HA UI in sync without transmitting anything.
 // We simulate movement using the configured open/close durations so HA doesn't jump instantly.
-//
 // NOTE: We *do not* rely on TimeBasedCover's internal movement state here, because this RX update is
 // driven externally (physical remote) and we only want UI synchronization.
 auto start_rx_move = [&](cover::CoverOperation op) {
@@ -238,9 +228,7 @@ switch (cmd) {
 
 void SomfyCover::setup() {
   // Setup cover rolling code storage
-  this->storage_ =
-      new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
-
+  this->storage_ = new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
 
   // Optional receiver support
   if (this->remote_receiver_ != nullptr) {
@@ -256,18 +244,15 @@ void SomfyCover::setup() {
   automationTriggerUp_->add_action(actionTriggerUp);
 
   automationTriggerDown_ = new Automation<>(this->get_close_trigger());
-  actionTriggerDown_ =
-      new SomfyCoverAction<>([=, this] { return this->close(); });
+  actionTriggerDown_ = new SomfyCoverAction<>([=, this] { return this->close(); });
   automationTriggerDown_->add_action(actionTriggerDown_);
 
   automationTriggerStop_ = new Automation<>(this->get_stop_trigger());
-  actionTriggerStop_ =
-      new SomfyCoverAction<>([=, this] { return this->stop(); });
+  actionTriggerStop_ = new SomfyCoverAction<>([=, this] { return this->stop(); });
   automationTriggerStop_->add_action(actionTriggerStop_);
 
   // Attach the prog button
-  this->cover_prog_button_->add_on_press_callback(
-      [=, this] { return this->program(); });
+  this->cover_prog_button_->add_on_press_callback([=, this] { return this->program(); });
 
   // Set extra settings
   this->has_built_in_endstop_ = true;
@@ -286,8 +271,7 @@ void SomfyCover::loop() {
     // Scale the duration to the *remaining travel distance*.
     // Example: if open_duration is 40s for 0%->100%, and we're at 75% and moving to 100%,
     // the remaining time should be ~10s.
-    const uint32_t full_dur_ms =
-        (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? this->open_duration_ : this->close_duration_;
+    const uint32_t full_dur_ms = (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? this->open_duration_ : this->close_duration_;
     float remaining = 1.0f;
     if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
       remaining = COVER_OPEN - this->rx_start_pos_;
