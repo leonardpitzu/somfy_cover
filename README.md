@@ -148,7 +148,7 @@ cover:
     prog_button: program_room2
     remote_transmitter: transmitter
     remote_receiver: receiver
-   detected_remote: detected_remote
+    detected_remote: detected_remote
     allowed_remotes:
       - 0x778899
 
