@@ -15,6 +15,7 @@
 
 // Libraries for SomfyRemote
 #include "NVSRollingCodeStorage.h"
+// #include <SomfyRemote.h>
 
 #define COVER_OPEN 1.0f
 #define COVER_CLOSED 0.0f
@@ -56,6 +57,14 @@ public:
   void dump_config() override;
 
   bool on_receive(remote_base::RemoteReceiveData data) override;
+
+  // // Set time based cover values
+  // void set_open_duration(uint32_t open_duration) {
+  //   this->open_duration_ = open_duration;
+  // }
+  // void set_close_duration(uint32_t close_duration) {
+  //   this->close_duration_ = close_duration;
+  // }
 
   void set_remote_transmitter(remote_transmitter::RemoteTransmitterComponent *t) {
     this->remote_transmitter_ = t;
@@ -130,11 +139,11 @@ protected:
   bool decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command);
   static const char *command_to_string_(Command cmd);
 
-  void build_frame(uint8_t *frame, Command command, uint16_t code);
-  void build_timings(remote_base::RawTimings & t, uint8_t *frame, uint8_t sync);
+	void build_frame(uint8_t *frame, Command command, uint16_t code);
+	void build_timings(remote_base::RawTimings & t, uint8_t *frame, uint8_t sync);
 
   void send_high(remote_base::RawTimings & t, int32_t durationInMicroseconds);
-  void send_low(remote_base::RawTimings & t, int32_t durationInMicroseconds);
+	void send_low(remote_base::RawTimings & t, int32_t durationInMicroseconds);
 
 };
 
