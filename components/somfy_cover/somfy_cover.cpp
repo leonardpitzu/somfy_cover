@@ -140,7 +140,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   const auto &raw = data.get_raw_data();
-  ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
+  //ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
   if (!raw.empty()) {
     std::string s;
     const size_t n = std::min<size_t>(raw.size(), 20);
@@ -150,7 +150,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
       s += buf;
       if (i + 1 < n) s += ",";
     }
-    ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
+    //ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
   }
 
   // Basic de-duplication: Somfy remotes send repeats, and we may receive multiple frames per press.
