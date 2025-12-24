@@ -36,8 +36,7 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code,
-                               Command &command) {
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
   // Decoder based on ESPSomfy-RTS receive state machine (Somfy.cpp/Somfy.h reference):
   // - detect >=4 hardware sync pulses (~4*SYMBOL)
   // - detect software sync (~4850us)
@@ -195,25 +194,38 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   if (!is_known_remote)
     return true;
 
-  // Keep HA in sync (simple: assume full open/closed on UP/DOWN, stop on MY/UP_DOWN).
+  // Keep HA UI in sync without transmitting anything.
+  // We *simulate* movement over the configured time_based durations so HA doesn't jump to 0/100% instantly.
+  auto start_rx_move = [&](cover::CoverOperation op) {
+    const uint32_t now_ms = millis();
+    this->rx_sync_active_ = true;
+    this->rx_operation_ = op;
+    this->rx_start_ms_ = now_ms;
+    this->rx_start_pos_ = this->position;
+    this->rx_last_publish_ms_ = 0;
+    this->current_operation = op;
+    this->publish_state();
+  };
+
   switch (cmd) {
     case Command::Up:
     case Command::MyUp:
-      this->position = COVER_OPEN;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->publish_state();
+      start_rx_move(cover::COVER_OPERATION_OPENING);
       break;
+
     case Command::Down:
     case Command::MyDown:
-      this->position = COVER_CLOSED;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->publish_state();
+      start_rx_move(cover::COVER_OPERATION_CLOSING);
       break;
+
     case Command::My:
     case Command::UpDown:
+      // Stop: keep current position, just stop movement
+      this->rx_sync_active_ = false;
       this->current_operation = cover::COVER_OPERATION_IDLE;
       this->publish_state();
       break;
+
     default:
       break;
   }
