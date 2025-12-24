@@ -9,16 +9,28 @@ This is an external component for [ESPHOME](https://esphome.io/), to control Som
 Use the following ESPHome yaml as a base for your Somfy controller. Add one or more covers, depending on your needs.
 A shade can be controlled by either this controller or by physical remotes. For the state of the shade to be correctly refleced in HA each shade needs to have the remote control id's listed that control the shade.
 ```
-receive_remote_codes:
+allowed_remotes:
   - 0x112233
   - 0x445566
 ```
-How to:
+##  Basic how to guide:
  - generate a random ID for the new (this) remote control
  - pair this remote with the motor of the shade
  - open the web interface of this controller
  - press a button on the remote control that controls the shade
  - copy-paste the remote's id in the ```receive_remote_codes```
+
+
+## Generate remote code 
+The remote code is a three byte hex code.
+For example, use the website: https://www.browserling.com/tools/random-hex  
+Set to 6 digits and add `0x` in front of the generated hex number.
+
+## Pair the cover
+Put your cover in program mode with another remote, then use the `Prog x` button to pair with the ESP. From then on the cover should respond to the ESPHome Somfy controller. You can also connect multiple covers by pairing then one by one with the same `Program x` button.
+
+## Repeating command setting
+The *Somfy_Remote_Lib* library defaults to sending a command four times. Some devices do not handle this well and should only reveive the command one time. For these devices the optional parameter `repeat_command_count` can be set in the yaml for the cover.
 
 ```
 substitutions:
@@ -104,8 +116,8 @@ remote_receiver:
 
 text_sensor:
   - platform: template
-    id: "remote_control"
-    name: "Remote Control ID"
+    id: detected_remote
+    name: "Detected Remote"
 
 cover:
   - platform: somfy_cover
@@ -119,9 +131,8 @@ cover:
     prog_button: program_room1
     remote_transmitter: transmitter
     remote_receiver: receiver
-    log_codes: true
-    log_text_sensor: remote_control
-    receive_remote_codes:
+    detected_remote: detected_remote
+    allowed_remotes:
       - 0x112233
       - 0x445566
   - platform: somfy_cover
@@ -135,9 +146,8 @@ cover:
     prog_button: program_room2
     remote_transmitter: transmitter
     remote_receiver: receiver
-    log_codes: true
-    log_text_sensor: remote_control
-    receive_remote_codes:
+   detected_remote: detected_remote
+    allowed_remotes:
       - 0x778899
 
 button:
@@ -150,17 +160,6 @@ button:
     name: "Prog Room 2"
     entity_category: config
 ```
-
-## Generate remote code 
-The remote code is a three byte hex code.
-For example, use the website: https://www.browserling.com/tools/random-hex  
-Set to 6 digits and add `0x` in front of the generated hex number.
-
-## Pair the cover
-Put your cover in program mode with another remote, then use the `Prog x` button to pair with the ESP. From then on the cover should respond to the ESPHome Somfy controller. You can also connect multiple covers by pairing then one by one with the same `Program x` button.
-
-## Repeating command setting
-The *Somfy_Remote_Lib* library defaults to sending a command four times. Some devices do not handle this well and should only reveive the command one time. For these devices the optional parameter `repeat_command_count` can be set in the yaml for the cover.
 
 ## Credits
 
