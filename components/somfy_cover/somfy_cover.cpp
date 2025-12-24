@@ -134,12 +134,6 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
     return false;
   }
 
-  if (this->log_text_sensor_ != nullptr) {
-    char buf[96];
-    snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04" PRIX16, remote_code, this->command_to_string_(cmd), rolling);
-    this->log_text_sensor_->publish_state(buf);
-  }
-
   if (!is_known_remote)
     return true;
 
