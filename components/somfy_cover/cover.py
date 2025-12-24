@@ -1,5 +1,5 @@
 import esphome.codegen as cg
-from esphome.components import button, remote_transmitter, remote_receiver, text_sensor, cover
+from esphome.components import button, remote_transmitter, remote_receiver, cover
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_CLOSE_DURATION,
@@ -12,7 +12,7 @@ from esphome.const import (
 
 CODEOWNERS = ["@LeonardPitzu"]
 
-AUTO_LOAD = ["button", "time_based", "remote_receiver", "text_sensor"]
+AUTO_LOAD = ["button", "time_based", "remote_receiver"]
 
 DEPENDENCIES = ["esp32"]
 
@@ -30,7 +30,6 @@ CONF_REMOTE_RECEIVER = "remote_receiver"
 
 CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
 CONF_LOG_CODES = "log_codes"
-CONF_LOG_TEXT_SENSOR = "log_text_sensor"
 
 CONFIG_SCHEMA = cv.All(
     cover.cover_schema(SomfyCover)
@@ -48,7 +47,6 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
             cv.Optional(CONF_RECEIVE_REMOTE_CODES): cv.ensure_list(cv.uint32_t),
             cv.Optional(CONF_LOG_CODES, default=True): cv.boolean,
-            cv.Optional(CONF_LOG_TEXT_SENSOR): cv.use_id(text_sensor.TextSensor),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32, PLATFORM_ESP8266, PLATFORM_RP2040]),
@@ -87,7 +85,3 @@ async def to_code(config):
             cg.add(var.add_receive_remote_code(code))
 
     cg.add(var.set_log_codes(config[CONF_LOG_CODES]))
-
-    if CONF_LOG_TEXT_SENSOR in config:
-        ts = await cg.get_variable(config[CONF_LOG_TEXT_SENSOR])
-        cg.add(var.set_log_text_sensor(ts))
