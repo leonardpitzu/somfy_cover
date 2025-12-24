@@ -63,7 +63,6 @@ public:
 
   void set_remote_receiver(remote_receiver::RemoteReceiverComponent *r) { this->remote_receiver_ = r; }
   void add_receive_remote_code(uint32_t code) { this->receive_remote_codes_.push_back(code); }
-  void set_log_codes(bool value) { this->log_codes_ = value; }
   void set_log_text_sensor(text_sensor::TextSensor *ts) { this->log_text_sensor_ = ts; }
 
   // Set somfy cover button and value
@@ -105,7 +104,6 @@ protected:
   // Optional receiver path (for keeping HA in sync when physical remotes are used)
   remote_receiver::RemoteReceiverComponent *remote_receiver_{nullptr};
   std::vector<uint32_t> receive_remote_codes_;
-  bool log_codes_{false};
   text_sensor::TextSensor *log_text_sensor_{nullptr};
   uint32_t last_rx_ms_{0};
 
