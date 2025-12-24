@@ -6,10 +6,15 @@
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/components/remote_transmitter/remote_transmitter.h"
+#include "esphome/components/remote_receiver/remote_receiver.h"
+#include "esphome/components/text_sensor/text_sensor.h"
+#include <vector>
+#include <string>
+#include <cinttypes>
+#include <algorithm>
 
 // Libraries for SomfyRemote
 #include "NVSRollingCodeStorage.h"
-// #include <SomfyRemote.h>
 
 #define COVER_OPEN 1.0f
 #define COVER_CLOSED 0.0f
@@ -44,23 +49,22 @@ enum class Command : uint8_t {
 	Flag = 0xA
 };
 
-class SomfyCover : public time_based::TimeBasedCover {
+class SomfyCover : public time_based::TimeBasedCover, public remote_base::RemoteReceiverListener {
 public:
   void setup() override;
   void loop() override;
   void dump_config() override;
 
-  // // Set time based cover values
-  // void set_open_duration(uint32_t open_duration) {
-  //   this->open_duration_ = open_duration;
-  // }
-  // void set_close_duration(uint32_t close_duration) {
-  //   this->close_duration_ = close_duration;
-  // }
+  bool on_receive(remote_base::RemoteReceiveData data) override;
 
   void set_remote_transmitter(remote_transmitter::RemoteTransmitterComponent *t) {
     this->remote_transmitter_ = t;
   }
+
+  void set_remote_receiver(remote_receiver::RemoteReceiverComponent *r) { this->remote_receiver_ = r; }
+  void add_receive_remote_code(uint32_t code) { this->receive_remote_codes_.push_back(code); }
+  void set_log_codes(bool value) { this->log_codes_ = value; }
+  void set_log_text_sensor(text_sensor::TextSensor *ts) { this->log_text_sensor_ = ts; }
 
   // Set somfy cover button and value
   void set_prog_button(button::Button *cover_prog_button) {
@@ -98,6 +102,13 @@ protected:
   int repeat_count_{4};
   InternalGPIOPin *emitter_pin_{nullptr};
 
+  // Optional receiver path (for keeping HA in sync when physical remotes are used)
+  remote_receiver::RemoteReceiverComponent *remote_receiver_{nullptr};
+  std::vector<uint32_t> receive_remote_codes_;
+  bool log_codes_{false};
+  text_sensor::TextSensor *log_text_sensor_{nullptr};
+  uint32_t last_rx_ms_{0};
+
   // Set via the constructor
   NVSRollingCodeStorage *storage_;
 
@@ -115,6 +126,9 @@ protected:
   SomfyCoverAction<> *actionTriggerStop_;
 
   void send_command(Command command);
+
+  bool decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command);
+  static const char *command_to_string_(Command cmd);
 
 	void build_frame(uint8_t *frame, Command command, uint16_t code);
 	void build_timings(remote_base::RawTimings & t, uint8_t *frame, uint8_t sync);
