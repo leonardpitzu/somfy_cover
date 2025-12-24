@@ -36,9 +36,8 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code,
-                               Command &command) {
-  // Decoder based on ESPSomfy-RTS receive state machine (Somfy.cpp/Somfy.h reference):
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+  // Decoder based on ESPSomfy-RTS (https://github.com/rstrouse/ESPSomfy-RTS) receive state machine (Somfy.cpp/Somfy.h reference):
   // - detect >=4 hardware sync pulses (~4*SYMBOL)
   // - detect software sync (~4850us)
   // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
@@ -179,8 +178,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
       this->receive_remote_codes_.end();
 
   if (this->log_codes_) {
-    ESP_LOGI(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code,
-             this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
+    ESP_LOGD(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code, this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
   } else if (!is_known_remote) {
     // Not logging and not known => ignore.
     return false;
@@ -362,25 +360,25 @@ void SomfyCover::control(const cover::CoverCall &call) {
 
 void SomfyCover::open() {
   std::string command = "OPEN " + this->get_object_id();
-  ESP_LOGI("somfy", command.c_str());
+  ESP_LOGD("somfy", command.c_str());
   this->send_command(Command::Up);
 }
 
 void SomfyCover::close() {
   std::string command = "CLOSE " + this->get_object_id();
-  ESP_LOGI("somfy", command.c_str());
+  ESP_LOGD("somfy", command.c_str());
   this->send_command(Command::Down);
 }
 
 void SomfyCover::stop() {
   std::string command = "STOP " + this->get_object_id();
-  ESP_LOGI("somfy", command.c_str());
+  ESP_LOGD("somfy", command.c_str());
   this->send_command(Command::My);
 }
 
 void SomfyCover::program() {
   std::string command = "PROG " + this->get_object_id();
-  ESP_LOGI("somfy", command.c_str());
+  ESP_LOGD("somfy", command.c_str());
   this->send_command(Command::Prog);
 }
 
