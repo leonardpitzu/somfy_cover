@@ -84,4 +84,4 @@ async def to_code(config):
 
     if CONF_DETECTED_REMOTE in config:
         sens = await cg.get_variable(config[CONF_DETECTED_REMOTE])
-            cg.add(var.set_log_text_sensor(sens))
+        cg.add(var.set_log_text_sensor(sens))
