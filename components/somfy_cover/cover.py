@@ -84,8 +84,6 @@ async def to_code(config):
         for code in config[CONF_RECEIVE_REMOTE_CODES]:
             cg.add(var.add_receive_remote_code(code))
 
-    cg.add(var.set_log_codes(config[CONF_LOG_CODES]))
-
     if CONF_LOG_TEXT_SENSOR in config:
         ts = await cg.get_variable(config[CONF_LOG_TEXT_SENSOR])
         cg.add(var.set_log_text_sensor(ts))
