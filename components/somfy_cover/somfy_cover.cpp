@@ -35,7 +35,8 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code,
+                               Command &command) {
   // Look for the (software sync) mark + space pair, then decode 56 bits of Manchester data.
   // We keep this intentionally simple: it is meant for "learn remote code once, paste into YAML".
   const int n = static_cast<int>(data.size());
@@ -134,6 +135,12 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
     return false;
   }
 
+  if (this->log_text_sensor_ != nullptr) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04" PRIX16, remote_code, this->command_to_string_(cmd), rolling);
+    this->log_text_sensor_->publish_state(buf);
+  }
+
   if (!is_known_remote)
     return true;
 
@@ -166,8 +173,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
 
 void SomfyCover::setup() {
   // Setup cover rolling code storage
-  this->storage_ = new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
-
+  this->storage_ =new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
 
   // Optional receiver support
   if (this->remote_receiver_ != nullptr) {
