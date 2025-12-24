@@ -36,7 +36,8 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code,
+                               Command &command) {
   // Decoder based on ESPSomfy-RTS receive state machine (Somfy.cpp/Somfy.h reference):
   // - detect >=4 hardware sync pulses (~4*SYMBOL)
   // - detect software sync (~4850us)
@@ -195,40 +196,43 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
     return true;
 
   // Keep HA UI in sync without transmitting anything.
-  // We *simulate* movement over the configured time_based durations so HA doesn't jump to 0/100% instantly.
-  auto start_rx_move = [&](cover::CoverOperation op) {
-    const uint32_t now_ms = millis();
-    this->rx_sync_active_ = true;
-    this->rx_operation_ = op;
-    this->rx_start_ms_ = now_ms;
-    this->rx_start_pos_ = this->position;
-    this->rx_last_publish_ms_ = 0;
-    this->current_operation = op;
+// We simulate movement using the configured open/close durations so HA doesn't jump instantly.
+//
+// NOTE: We *do not* rely on TimeBasedCover's internal movement state here, because this RX update is
+// driven externally (physical remote) and we only want UI synchronization.
+auto start_rx_move = [&](cover::CoverOperation op) {
+  const uint32_t now_ms = millis();
+  this->rx_sync_active_ = true;
+  this->rx_operation_ = op;
+  this->rx_start_ms_ = now_ms;
+  this->rx_start_pos_ = this->position;
+  this->rx_last_publish_ms_ = 0;
+  this->current_operation = op;
+  this->publish_state();  // show "opening/closing" immediately (position stays as-is for now)
+};
+
+switch (cmd) {
+  case Command::Up:
+  case Command::MyUp:
+    start_rx_move(cover::COVER_OPERATION_OPENING);
+    break;
+
+  case Command::Down:
+  case Command::MyDown:
+    start_rx_move(cover::COVER_OPERATION_CLOSING);
+    break;
+
+  case Command::My:
+  case Command::UpDown:
+    // Stop: keep current position, just stop movement
+    this->rx_sync_active_ = false;
+    this->current_operation = cover::COVER_OPERATION_IDLE;
     this->publish_state();
-  };
+    break;
 
-  switch (cmd) {
-    case Command::Up:
-    case Command::MyUp:
-      start_rx_move(cover::COVER_OPERATION_OPENING);
-      break;
-
-    case Command::Down:
-    case Command::MyDown:
-      start_rx_move(cover::COVER_OPERATION_CLOSING);
-      break;
-
-    case Command::My:
-    case Command::UpDown:
-      // Stop: keep current position, just stop movement
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->publish_state();
-      break;
-
-    default:
-      break;
-  }
+  default:
+    break;
+}
 
   return true;
 }
@@ -274,7 +278,59 @@ void SomfyCover::setup() {
   TimeBasedCover::setup();
 }
 
-void SomfyCover::loop() { TimeBasedCover::loop(); }
+void SomfyCover::loop() {
+  // If we are syncing from a physical remote press, we simulate motion ourselves.
+  // This avoids TimeBasedCover instantly jumping the position (because its internal timers
+  // are not started by a CoverCall in this RX-driven path).
+  if (this->rx_sync_active_) {
+    const uint32_t now_ms = millis();
+
+    const uint32_t dur_ms =
+        (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? this->open_duration_ : this->close_duration_;
+
+    // If duration isn't set (or is 0), fall back to immediate end-state.
+    if (dur_ms == 0) {
+      this->position = (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? COVER_OPEN : COVER_CLOSED;
+      this->rx_sync_active_ = false;
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->publish_state();
+      return;
+    }
+
+    const uint32_t elapsed = now_ms - this->rx_start_ms_;
+    float progress = (elapsed >= dur_ms) ? 1.0f : (static_cast<float>(elapsed) / static_cast<float>(dur_ms));
+
+    float new_pos = this->rx_start_pos_;
+    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
+      new_pos = this->rx_start_pos_ + (COVER_OPEN - this->rx_start_pos_) * progress;
+    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
+      new_pos = this->rx_start_pos_ + (COVER_CLOSED - this->rx_start_pos_) * progress;
+    }
+
+    if (new_pos < COVER_CLOSED)
+      new_pos = COVER_CLOSED;
+    if (new_pos > COVER_OPEN)
+      new_pos = COVER_OPEN;
+
+    this->position = new_pos;
+
+    // Publish at a modest rate to keep Wi-Fi/HA traffic low, but smooth enough for UI.
+    if (this->rx_last_publish_ms_ == 0 || (now_ms - this->rx_last_publish_ms_) >= 250) {
+      this->rx_last_publish_ms_ = now_ms;
+      this->publish_state();
+    }
+
+    if (progress >= 1.0f) {
+      this->rx_sync_active_ = false;
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->publish_state();
+    }
+    return;
+  }
+
+  // Normal time-based operation (HA-driven control).
+  TimeBasedCover::loop();
+}
 
 void SomfyCover::dump_config() { ESP_LOGCONFIG(TAG, "Somfy cover"); }
 
