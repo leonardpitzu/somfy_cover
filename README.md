@@ -6,7 +6,19 @@ This is an external component for [ESPHOME](https://esphome.io/), to control Som
 - CC1101 RF module
 
 ## Setup
-Use the following ESPHome yaml as a base for your Somfy controller. Add one ore more covers, depending on your needs.
+Use the following ESPHome yaml as a base for your Somfy controller. Add one or more covers, depending on your needs.
+A shade can be controlled by either this controller or by physical remotes. For the state of the shade to be correctly refleced in HA each shade needs to have the remote control id's listed that control the shade.
+```
+receive_remote_codes:
+  - 0x112233
+  - 0x445566
+```
+How to:
+ - generate a random ID for the new (this) remote control
+ - pair this remote with the motor of the shade
+ - open the web interface of this controller
+ - press a button on the remote control that controls the shade
+ - copy-paste the remote's id in the ```receive_remote_codes```
 
 ```
 substitutions:
@@ -84,7 +96,16 @@ remote_transmitter:
       - cc1101.begin_tx
   on_complete:
     then:
-      - cc1101.set_idle
+      - cc1101.begin_rx
+
+remote_receiver:
+  id: "receiver"
+  pin: GPIO03
+
+text_sensor:
+  - platform: template
+    id: "remote_control"
+    name: "Remote Control ID"
 
 cover:
   - platform: somfy_cover
@@ -97,6 +118,12 @@ cover:
     remote_code: 0xabcde
     prog_button: program_room1
     remote_transmitter: transmitter
+    remote_receiver: receiver
+    log_codes: true
+    log_text_sensor: remote_control
+    receive_remote_codes:
+      - 0x112233
+      - 0x445566
   - platform: somfy_cover
     id: room2
     name: "Room 2"
@@ -107,6 +134,11 @@ cover:
     remote_code: 0xabcdf
     prog_button: program_room2
     remote_transmitter: transmitter
+    remote_receiver: receiver
+    log_codes: true
+    log_text_sensor: remote_control
+    receive_remote_codes:
+      - 0x778899
 
 button:
   - platform: template
