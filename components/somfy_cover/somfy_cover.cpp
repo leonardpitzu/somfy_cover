@@ -1,6 +1,7 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "somfy_cover.h"
+#include <cstdlib>
 
 namespace esphome {
 namespace somfy_cover {
@@ -37,66 +38,101 @@ const char *SomfyCover::command_to_string_(Command cmd) {
 
 bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code,
                                Command &command) {
-  // Look for the (software sync) mark + space pair, then decode 56 bits of Manchester data.
-  // We keep this intentionally simple: it is meant for "learn remote code once, paste into YAML".
+  // Decoder based on ESPSomfy-RTS receive state machine (Somfy.cpp/Somfy.h reference):
+  // - detect >=4 hardware sync pulses (~4*SYMBOL)
+  // - detect software sync (~4850us)
+  // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
+  // - de-obfuscate (XOR chain) and validate checksum
   const int n = static_cast<int>(data.size());
-  if (n < 10)
+  if (n < 20)
     return false;
 
-  auto approx = [](int32_t v, uint32_t target, uint32_t tol) -> bool {
-    const uint32_t av = static_cast<uint32_t>(std::abs(v));
-    return av >= (target > tol ? target - tol : 0) && av <= target + tol;
-  };
+  constexpr uint32_t SYMBOL = 640;
+  constexpr float TOLERANCE_MIN = 0.7f;
+  constexpr float TOLERANCE_MAX = 1.3f;
 
-  // Tolerance: Somfy timings are not ultra precise; accept ~30%.
-  const uint32_t tol_sync = SOMFY_SOFTWARE_SYNC_MARK_US / 3;
-  const uint32_t tol_sym = SOMFY_SYMBOL_US / 2;
+  const uint32_t tempo_synchro_hw_min = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MIN);
+  const uint32_t tempo_synchro_hw_max = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MAX);
+  const uint32_t tempo_synchro_sw_min = static_cast<uint32_t>(4850 * TOLERANCE_MIN);
+  const uint32_t tempo_synchro_sw_max = static_cast<uint32_t>(4850 * TOLERANCE_MAX);
+  const uint32_t tempo_half_symbol_min = static_cast<uint32_t>(SYMBOL * TOLERANCE_MIN);
+  const uint32_t tempo_half_symbol_max = static_cast<uint32_t>(SYMBOL * TOLERANCE_MAX);
+  const uint32_t tempo_symbol_min = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MIN);
+  const uint32_t tempo_symbol_max = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MAX);
 
+  auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
+
+  // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
+  int hw_sync = 0;
   int start = -1;
-  for (int i = 0; i + 1 < n; i++) {
-    if (data[i] > 0 && approx(data[i], SOMFY_SOFTWARE_SYNC_MARK_US, tol_sync) && data[i + 1] < 0 &&
-        approx(data[i + 1], SOMFY_SYMBOL_US, tol_sym)) {
-      start = i + 2;
+  for (int i = 0; i < n; i++) {
+    const uint32_t d = absu(data[i]);
+    if (d >= tempo_synchro_hw_min && d <= tempo_synchro_hw_max) {
+      hw_sync++;
+      continue;
+    }
+    if (d >= tempo_synchro_sw_min && d <= tempo_synchro_sw_max && hw_sync >= 4) {
+      start = i + 1;
       break;
     }
+    // Anything else resets the hardware sync counter.
+    hw_sync = 0;
   }
-  if (start < 0)
+  if (start < 0 || start >= n)
     return false;
 
-  if (start + 56 * 2 > n)
-    return false;
+  // Decode 56 bits into 7 bytes (MSB first), using the same pulse-width rules as ESPSomfy-RTS.
+  uint8_t payload[7]{0};
+  bool waiting_half_symbol = false;
+  uint8_t previous_bit = 0x00;
+  int bits = 0;
 
-  uint8_t raw[7]{0};
-  for (int bit = 0; bit < 56; bit++) {
-    const int32_t first = data[start + bit * 2];
-    const int32_t second = data[start + bit * 2 + 1];
+  for (int i = start; i < n && bits < 56; i++) {
+    const uint32_t d = absu(data[i]);
 
-    // Validate symbol lengths (best-effort).
-    if (!approx(first, SOMFY_SYMBOL_US, tol_sym) || !approx(second, SOMFY_SYMBOL_US, tol_sym))
+    if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
+      previous_bit = 1 - previous_bit;
+      payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+      bits++;
+    } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
+      if (waiting_half_symbol) {
+        waiting_half_symbol = false;
+        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+        bits++;
+      } else {
+        waiting_half_symbol = true;
+      }
+    } else {
+      // Out-of-range timing: abort.
       return false;
-
-    const uint8_t b = (first < 0) ? 1 : 0;  // 1 => space then mark, 0 => mark then space
-    raw[bit / 8] |= (b << (7 - (bit % 8)));
+    }
   }
 
-  // De-obfuscate (reverse of: frame[i] ^= frame[i-1] for i=1..6)
+  if (bits != 56)
+    return false;
+
+  // De-obfuscate (XOR chain): decoded[i] = payload[i] ^ payload[i-1], i>=1
   uint8_t frame[7]{0};
-  frame[0] = raw[0];
+  frame[0] = payload[0];
   for (int i = 1; i < 7; i++) {
-    frame[i] = raw[i] ^ raw[i - 1];
+    frame[i] = payload[i] ^ payload[i - 1];
   }
 
-  // Validate checksum: XOR of all nibbles, keep low 4 bits.
+  // Validate checksum (per ESPSomfy-RTS):
+  // For byte 1 we only want the upper nibble.
   uint8_t checksum = 0;
   for (uint8_t i = 0; i < 7; i++) {
-    checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
+    if (i == 1)
+      checksum = checksum ^ (frame[i] >> 4);
+    else
+      checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
   }
   checksum &= 0x0F;
-  if ((frame[1] & 0x0F) != checksum)
+  const uint8_t expected = frame[1] & 0x0F;
+  if (checksum != expected)
     return false;
 
-  const uint8_t cmd_nibble = (frame[1] >> 4) & 0x0F;
-  command = static_cast<Command>(cmd_nibble);
+  command = static_cast<Command>(frame[1] >> 4);
   rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
   remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
 
