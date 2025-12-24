@@ -1,5 +1,5 @@
 import esphome.codegen as cg
-from esphome.components import button, remote_transmitter, remote_receiver, text_sensor, cover
+from esphome.components import button, remote_transmitter, cover
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_CLOSE_DURATION,
@@ -10,7 +10,7 @@ from esphome.const import (
     PLATFORM_RP2040,
 )
 
-CODEOWNERS = ["@LeonardPitzu"]
+CODEOWNERS = ["@HarmEllis"]
 
 AUTO_LOAD = ["button", "time_based"]
 
@@ -26,11 +26,6 @@ CONF_SOMFY_STORAGE_KEY = "storage_key"
 CONF_SOMFY_STORAGE_NAMESPACE = "storage_namespace"
 CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
 
-CONF_REMOTE_RECEIVER = "remote_receiver"
-CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
-CONF_LOG_CODES = "log_codes"
-CONF_LOG_TEXT_SENSOR = "log_text_sensor"
-
 CONFIG_SCHEMA = cv.All(
     cover.cover_schema(SomfyCover)
     .extend(
@@ -41,12 +36,10 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_CLOSE_DURATION): cv.positive_time_period_milliseconds,
             cv.Required(CONF_REMOTE_CODE): cv.uint32_t,
             cv.Required(CONF_SOMFY_STORAGE_KEY): cv.All(cv.string, cv.Length(max=15)),
-            cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(cv.string, cv.Length(max=15)),
+            cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(
+                cv.string, cv.Length(max=15)
+            ),
             cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
-            cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
-            cv.Optional(CONF_RECEIVE_REMOTE_CODES): cv.ensure_list(cv.hex_uint32_t),
-            cv.Optional(CONF_LOG_CODES, default=False): cv.boolean,
-            cv.Optional(CONF_LOG_TEXT_SENSOR): cv.use_id(text_sensor.TextSensor),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32, PLATFORM_ESP8266, PLATFORM_RP2040]),
@@ -76,17 +69,3 @@ async def to_code(config):
     cg.add(var.set_storage_namespace(config[CONF_SOMFY_STORAGE_NAMESPACE]))
 
     cg.add(var.set_repeat_count(config[CONF_REPEAT_COMMAND_COUNT]))
-
-    if CONF_REMOTE_RECEIVER in config:
-        remote_receiver = await cg.get_variable(config[CONF_REMOTE_RECEIVER])
-        cg.add(var.set_remote_receiver(remote_receiver))
-
-    if CONF_RECEIVE_REMOTE_CODES in config:
-        for code in config[CONF_RECEIVE_REMOTE_CODES]:
-            cg.add(var.add_receive_remote_code(code))
-
-    cg.add(var.set_log_codes(config[CONF_LOG_CODES]))
-
-    if CONF_LOG_TEXT_SENSOR in config:
-        ts = await cg.get_variable(config[CONF_LOG_TEXT_SENSOR])
-        cg.add(var.set_log_text_sensor(ts))
