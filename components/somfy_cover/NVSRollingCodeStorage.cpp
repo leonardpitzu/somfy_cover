@@ -1,7 +1,5 @@
 #include "NVSRollingCodeStorage.h"
 
-// #ifdef ESP32
-
 #include <esp_system.h>
 #include <nvs.h>
 #include <nvs_flash.h>
