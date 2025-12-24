@@ -285,10 +285,25 @@ void SomfyCover::loop() {
   if (this->rx_sync_active_) {
     const uint32_t now_ms = millis();
 
-    const uint32_t dur_ms =
+    // Scale the duration to the *remaining travel distance*.
+    // Example: if open_duration is 40s for 0%->100%, and we're at 75% and moving to 100%,
+    // the remaining time should be ~10s.
+    const uint32_t full_dur_ms =
         (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? this->open_duration_ : this->close_duration_;
+    float remaining = 1.0f;
+    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
+      remaining = COVER_OPEN - this->rx_start_pos_;
+    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
+      remaining = this->rx_start_pos_ - COVER_CLOSED;
+    }
+    if (remaining < 0.0f)
+      remaining = 0.0f;
+    if (remaining > 1.0f)
+      remaining = 1.0f;
 
-    // If duration isn't set (or is 0), fall back to immediate end-state.
+    const uint32_t dur_ms = static_cast<uint32_t>(static_cast<float>(full_dur_ms) * remaining);
+
+    // If duration isn't set (or remaining travel is 0), fall back to immediate end-state.
     if (dur_ms == 0) {
       this->position = (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? COVER_OPEN : COVER_CLOSED;
       this->rx_sync_active_ = false;
