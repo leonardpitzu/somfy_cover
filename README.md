@@ -32,6 +32,8 @@ Put your cover in program mode with another remote, then use the `Prog x` button
 ## Repeating command setting
 The *Somfy_Remote_Lib* library defaults to sending a command four times. Some devices do not handle this well and should only reveive the command one time. For these devices the optional parameter `repeat_command_count` can be set in the yaml for the cover.
 
+In order to see more information set the log level to ```DEBUG```
+
 ```
 substitutions:
   devicename: shades
