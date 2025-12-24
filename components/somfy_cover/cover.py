@@ -1,5 +1,5 @@
 import esphome.codegen as cg
-from esphome.components import button, remote_transmitter, cover
+from esphome.components import button, remote_transmitter, remote_receiver, text_sensor, cover
 import esphome.config_validation as cv
 from esphome.const import (
     CONF_CLOSE_DURATION,
@@ -10,7 +10,7 @@ from esphome.const import (
     PLATFORM_RP2040,
 )
 
-CODEOWNERS = ["@HarmEllis"]
+CODEOWNERS = ["@LeonardPitzu"]
 
 AUTO_LOAD = ["button", "time_based"]
 
@@ -25,6 +25,10 @@ CONF_REMOTE_CODE = "remote_code"
 CONF_SOMFY_STORAGE_KEY = "storage_key"
 CONF_SOMFY_STORAGE_NAMESPACE = "storage_namespace"
 CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
+
+CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
+CONF_LOG_CODES = "log_codes"
+CONF_LOG_TEXT_SENSOR = "log_text_sensor"
 
 CONFIG_SCHEMA = cv.All(
     cover.cover_schema(SomfyCover)
@@ -69,3 +73,17 @@ async def to_code(config):
     cg.add(var.set_storage_namespace(config[CONF_SOMFY_STORAGE_NAMESPACE]))
 
     cg.add(var.set_repeat_count(config[CONF_REPEAT_COMMAND_COUNT]))
+
+    if CONF_REMOTE_RECEIVER in config:
+        remote_receiver = await cg.get_variable(config[CONF_REMOTE_RECEIVER])
+        cg.add(var.set_remote_receiver(remote_receiver))
+
+    if CONF_RECEIVE_REMOTE_CODES in config:
+        for code in config[CONF_RECEIVE_REMOTE_CODES]:
+            cg.add(var.add_receive_remote_code(code))
+
+    cg.add(var.set_log_codes(config[CONF_LOG_CODES]))
+
+    if CONF_LOG_TEXT_SENSOR in config:
+        ts = await cg.get_variable(config[CONF_LOG_TEXT_SENSOR])
+        cg.add(var.set_log_text_sensor(ts))
