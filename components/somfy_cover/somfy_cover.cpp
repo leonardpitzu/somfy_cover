@@ -104,6 +104,21 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 }
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
+  if (this->log_codes_) {
+    const auto &raw = data.get_raw_data();
+    ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
+    if (!raw.empty()) {
+      std::string s;
+      const size_t n = std::min<size_t>(raw.size(), 20);
+      for (size_t i = 0; i < n; i++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", (int) raw[i]);
+        s += buf;
+        if (i + 1 < n) s += ",";
+      }
+      ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
+    }
+  }
   // If nothing is configured, don't spend cycles decoding.
   if (!this->log_codes_ && this->receive_remote_codes_.empty())
     return false;
@@ -173,11 +188,16 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
 
 void SomfyCover::setup() {
   // Setup cover rolling code storage
-  this->storage_ =new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
+  this->storage_ =
+      new NVSRollingCodeStorage(this->storage_namespace_, this->storage_key_);
+
 
   // Optional receiver support
   if (this->remote_receiver_ != nullptr) {
+    ESP_LOGD(TAG, "RX: registering receiver listener for cover '%s'", this->name_.c_str());
     this->remote_receiver_->register_listener(this);
+  } else {
+    ESP_LOGD(TAG, "RX: no remote_receiver configured for cover '%s'", this->name_.c_str());
   }
 
   // Attach to timebased cover controls
@@ -186,15 +206,18 @@ void SomfyCover::setup() {
   automationTriggerUp_->add_action(actionTriggerUp);
 
   automationTriggerDown_ = new Automation<>(this->get_close_trigger());
-  actionTriggerDown_ = new SomfyCoverAction<>([=, this] { return this->close(); });
+  actionTriggerDown_ =
+      new SomfyCoverAction<>([=, this] { return this->close(); });
   automationTriggerDown_->add_action(actionTriggerDown_);
 
   automationTriggerStop_ = new Automation<>(this->get_stop_trigger());
-  actionTriggerStop_ = new SomfyCoverAction<>([=, this] { return this->stop(); });
+  actionTriggerStop_ =
+      new SomfyCoverAction<>([=, this] { return this->stop(); });
   automationTriggerStop_->add_action(actionTriggerStop_);
 
   // Attach the prog button
-  this->cover_prog_button_->add_on_press_callback([=, this] { return this->program(); });
+  this->cover_prog_button_->add_on_press_callback(
+      [=, this] { return this->program(); });
 
   // Set extra settings
   this->has_built_in_endstop_ = true;
