@@ -7,7 +7,6 @@
 #include "esphome/core/component.h"
 #include "esphome/components/remote_transmitter/remote_transmitter.h"
 #include "esphome/components/remote_receiver/remote_receiver.h"
-#include "esphome/components/text_sensor/text_sensor.h"
 #include <vector>
 #include <string>
 #include <cinttypes>
@@ -64,7 +63,6 @@ public:
   void set_remote_receiver(remote_receiver::RemoteReceiverComponent *r) { this->remote_receiver_ = r; }
   void add_receive_remote_code(uint32_t code) { this->receive_remote_codes_.push_back(code); }
   void set_log_codes(bool value) { this->log_codes_ = value; }
-  void set_log_text_sensor(text_sensor::TextSensor *ts) { this->log_text_sensor_ = ts; }
 
   // Set somfy cover button and value
   void set_prog_button(button::Button *cover_prog_button) {
@@ -106,7 +104,6 @@ protected:
   remote_receiver::RemoteReceiverComponent *remote_receiver_{nullptr};
   std::vector<uint32_t> receive_remote_codes_;
   bool log_codes_{false};
-  text_sensor::TextSensor *log_text_sensor_{nullptr};
   uint32_t last_rx_ms_{0};
 
   // Set via the constructor
@@ -130,11 +127,11 @@ protected:
   bool decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command);
   static const char *command_to_string_(Command cmd);
 
-	void build_frame(uint8_t *frame, Command command, uint16_t code);
-	void build_timings(remote_base::RawTimings & t, uint8_t *frame, uint8_t sync);
+  void build_frame(uint8_t *frame, Command command, uint16_t code);
+  void build_timings(remote_base::RawTimings & t, uint8_t *frame, uint8_t sync);
 
   void send_high(remote_base::RawTimings & t, int32_t durationInMicroseconds);
-	void send_low(remote_base::RawTimings & t, int32_t durationInMicroseconds);
+  void send_low(remote_base::RawTimings & t, int32_t durationInMicroseconds);
 
 };
 
