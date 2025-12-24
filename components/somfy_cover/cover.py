@@ -27,8 +27,8 @@ CONF_SOMFY_STORAGE_NAMESPACE = "storage_namespace"
 CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
 
 CONF_REMOTE_RECEIVER = "remote_receiver"
-CONF_RECEIVE_REMOTE_CODES = "receive_remote_codes"
-CONF_LOG_TEXT_SENSOR = "log_text_sensor"
+CONF_ALLOWED_REMOTES = "allowed_remotes"
+CONF_DETECTED_REMOTE = "detected_remote"
 
 CONFIG_SCHEMA = cv.All(
     cover.cover_schema(SomfyCover)
@@ -43,8 +43,8 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(cv.string, cv.Length(max=15)),
             cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
             cv.Optional(CONF_REMOTE_RECEIVER): cv.use_id(remote_receiver.RemoteReceiverComponent),
-            cv.Optional(CONF_RECEIVE_REMOTE_CODES): cv.ensure_list(cv.uint32_t),
-            cv.Optional(CONF_LOG_TEXT_SENSOR): cv.use_id(text_sensor.TextSensor),
+            cv.Optional(CONF_ALLOWED_REMOTES, default=[]): cv.ensure_list(cv.hex_int),
+            cv.Optional(CONF_DETECTED_REMOTE): cv.use_id(text_sensor.TextSensor),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on([PLATFORM_ESP32, PLATFORM_ESP8266, PLATFORM_RP2040]),
@@ -78,10 +78,10 @@ async def to_code(config):
         remote_receiver = await cg.get_variable(config[CONF_REMOTE_RECEIVER])
         cg.add(var.set_remote_receiver(remote_receiver))
 
-    if CONF_RECEIVE_REMOTE_CODES in config:
-        for code in config[CONF_RECEIVE_REMOTE_CODES]:
+    if CONF_ALLOWED_REMOTES in config:
+        for code in config[CONF_ALLOWED_REMOTES]:
             cg.add(var.add_receive_remote_code(code))
 
-    if CONF_LOG_TEXT_SENSOR in config:
-        ts = await cg.get_variable(config[CONF_LOG_TEXT_SENSOR])
-        cg.add(var.set_log_text_sensor(ts))
+    if CONF_DETECTED_REMOTE in config:
+        sens = await cg.get_variable(config[CONF_DETECTED_REMOTE])
+            cg.add(var.set_log_text_sensor(sens))
