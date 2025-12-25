@@ -41,8 +41,12 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   // - de-obfuscate (XOR chain) and validate checksum
 
   const int n = static_cast<int>(data.size());
+  // ENTRY LOG (proves decode_frame_ is actually being called for every callback)
+  ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n,
+           n > 0 ? data[0] : 0, n > 1 ? data[1] : 0);
+
   if (n < 20) {
-    ESP_LOGD(TAG, "RX decode FAIL_SHORT n=%d", n);
+    ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SHORT n=%d", n);
     return false;
   }
 
@@ -50,7 +54,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   constexpr float TOL_MIN = 0.7f;
   constexpr float TOL_MAX = 1.3f;
 
-  // Same timing windows as Somfy.cpp
   const uint32_t tempo_synchro_hw_min = static_cast<uint32_t>(SYMBOL * 4 * TOL_MIN);
   const uint32_t tempo_synchro_hw_max = static_cast<uint32_t>(SYMBOL * 4 * TOL_MAX);
   const uint32_t tempo_synchro_sw_min = static_cast<uint32_t>(4850 * TOL_MIN);
@@ -80,7 +83,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   bool waiting_half_symbol = false;
   uint8_t bit_length = 56;
 
-  // Debug context (only logs; no logic change)
+  // Debug context
   int last_bad_i = -1;
   uint32_t last_bad_duration = 0;
   bool saw_any_sync = false;
@@ -97,7 +100,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
     memset(payload, 0x00, sizeof(payload));
   };
 
-  // Start clean
   reset_to_waiting();
 
   for (int i = 0; i < n; i++) {
@@ -108,7 +110,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
         if (duration > tempo_synchro_hw_min && duration < tempo_synchro_hw_max) {
           ++cpt_synchro_hw;
         } else if (duration > tempo_synchro_sw_min && duration < tempo_synchro_sw_max && cpt_synchro_hw >= 4) {
-          // Found SW sync after enough HW sync -> start receiving
           saw_any_sync = true;
           last_sync_hw = cpt_synchro_hw;
 
@@ -117,7 +118,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
           waiting_half_symbol = false;
           cpt_bits = 0;
 
-          // EXACT Somfy.cpp bit-length selection
           if (cpt_synchro_hw <= 7) bit_length = 56;
           else if (cpt_synchro_hw == 14) bit_length = 56;
           else if (cpt_synchro_hw == 13) bit_length = 80;
@@ -131,7 +131,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
           status = RECEIVING_DATA;
         } else {
-          // Reset sync counter (Somfy.cpp behavior)
           cpt_synchro_hw = 0;
         }
         break;
@@ -151,7 +150,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
             waiting_half_symbol = true;
           }
         } else {
-          // Debug: out-of-range timing inside data
           last_bad_i = i;
           last_bad_duration = duration;
           ESP_LOGD(TAG,
@@ -159,14 +157,11 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
                    last_bad_i, last_bad_duration, waiting_half_symbol ? 1 : 0,
                    cpt_bits, bit_length, last_sync_hw);
 
-          // *** CRITICAL Somfy.cpp BEHAVIOR ***
-          // Bad timing during data: reset and reprocess THIS SAME duration as part of sync search.
           reset_to_waiting();
-          i -= 1;  // re-consume this duration in WAITING_SYNCHRO on next loop iteration
+          i -= 1;
           break;
         }
 
-        // If we completed a frame, validate it. If invalid, keep scanning (Somfy.cpp keeps listening).
         if (cpt_bits >= bit_length) {
           uint8_t frame[10]{0};
           frame[0] = payload[0];
@@ -179,7 +174,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
             frame[9] = payload[9];
           }
 
-          // Checksum first 7 bytes
           uint8_t checksum = 0;
           for (uint8_t k = 0; k < 7; k++) {
             if (k == 1) checksum ^= (frame[k] >> 4);
@@ -190,7 +184,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
           const uint8_t expected = frame[1] & 0x0F;
 
           if (checksum == expected) {
-            // Extra 80-bit checksum (only if 80-bit)
             if (bit_length == 80) {
               const uint8_t want = frame[9] & 0x0F;
               const uint8_t got = calc80Checksum(frame[7], frame[8], frame[9]);
@@ -203,7 +196,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
               }
             }
 
-            // Success
             command = static_cast<Command>(frame[1] >> 4);
             rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
             remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
@@ -211,13 +203,12 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
                           frame[6];
 
             ESP_LOGD(TAG,
-                     "RX decode OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
+                     "decode_frame_ RETURN OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
                      remote_code, (frame[1] >> 4), rolling_code, last_sync_hw, bit_length);
 
             return true;
           }
 
-          // Checksum failed -> keep scanning for the next repeat in this same buffer.
           ESP_LOGD(TAG,
                    "RX decode FAIL_CSUM: cs=%u expected=%u hw_sync=%u bit_length=%u encKey=0x%02X cmdNibble=0x%X",
                    checksum, expected, last_sync_hw, bit_length, frame[0], (frame[1] >> 4));
@@ -231,10 +222,10 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   }
 
   if (!saw_any_sync) {
-    ESP_LOGD(TAG, "RX decode FAIL_SYNC (no SW sync found) n=%d", n);
+    ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SYNC (no SW sync found) n=%d", n);
   } else {
     ESP_LOGD(TAG,
-             "RX decode FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
+             "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
              last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
   }
 
