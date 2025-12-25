@@ -33,8 +33,7 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data,
-                              uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
@@ -43,7 +42,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data,
   constexpr float TOL_MIN = 0.7f;
   constexpr float TOL_MAX = 1.3f;
 
-  // Precomputed timing windows (still computed per-call, but tighter code).
   const uint32_t hw_min   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MIN);
   const uint32_t hw_max   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MAX);
   const uint32_t sw_min   = static_cast<uint32_t>(4850 * TOL_MIN);
@@ -55,104 +53,121 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data,
 
   auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(v < 0 ? -v : v); };
 
-  // Find sync: count HW sync pulses, then detect SW sync.
+  auto calc80Checksum = [](uint8_t b0, uint8_t b1, uint8_t b2) -> uint8_t {
+    uint8_t cs80 = 0;
+    cs80 = (((b0 & 0xF0) >> 4) ^ ((b1 & 0xF0) >> 4));
+    cs80 ^= ((b2 & 0xF0) >> 4);
+    cs80 ^= (b0 & 0x0F);
+    cs80 ^= (b1 & 0x0F);
+    return static_cast<uint8_t>(cs80 & 0x0F);
+  };
+
+  auto try_decode_from = [&](int start, int bit_length) -> bool {
+    if (start < 0 || start >= n)
+      return false;
+
+    uint8_t payload[10]{0};  // enough for 80-bit
+    bool waiting_half = false;
+    uint8_t prev_bit = 0;
+    int bits = 0;
+
+    for (int j = start; j < n && bits < bit_length; j++) {
+      const uint32_t d = absu(data[j]);
+
+      if (!waiting_half && d >= sym_min && d <= sym_max) {
+        prev_bit = 1 - prev_bit;
+        payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
+        bits++;
+        continue;
+      }
+
+      if (d >= half_min && d <= half_max) {
+        if (waiting_half) {
+          waiting_half = false;
+          payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
+          bits++;
+        } else {
+          waiting_half = true;
+        }
+        continue;
+      }
+
+      // Out-of-range timing → this candidate frame is bad
+      return false;
+    }
+
+    if (bits != bit_length)
+      return false;
+
+    // De-obfuscate like Somfy.cpp:
+    uint8_t frame[10]{0};
+    frame[0] = payload[0];
+    for (int i = 1; i < 7; i++)
+      frame[i] = payload[i] ^ payload[i - 1];
+
+    if (bit_length == 80) {
+      frame[7] = payload[7];
+      frame[8] = payload[8];
+      frame[9] = payload[9];
+    }
+
+    // Checksum for first 7 bytes:
+    uint8_t cs = 0;
+    for (uint8_t i = 0; i < 7; i++) {
+      if (i == 1)
+        cs ^= (frame[i] >> 4);
+      else
+        cs ^= frame[i] ^ (frame[i] >> 4);
+    }
+    cs &= 0x0F;
+    if (cs != (frame[1] & 0x0F))
+      return false;
+
+    // Extra 80-bit checksum:
+    if (bit_length == 80) {
+      if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9]))
+        return false;
+    }
+
+    // Extract fields:
+    command = static_cast<Command>(frame[1] >> 4);
+    rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
+    remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
+                  (static_cast<uint32_t>(frame[5]) << 8) |
+                  frame[6];
+    return true;
+  };
+
+  // Somfy.cpp-style: scan through the whole capture for repeated frames.
   int hw_sync = 0;
-  int start = -1;
+
   for (int i = 0; i < n; i++) {
     const uint32_t d = absu(data[i]);
+
     if (d >= hw_min && d <= hw_max) {
       hw_sync++;
       continue;
     }
+
     if (d >= sw_min && d <= sw_max && hw_sync >= 4) {
-      start = i + 1;
-      break;
+      const int start = i + 1;
+
+      // Same frame length decision you already use
+      const int bit_length =
+          (hw_sync == 12 || hw_sync == 13 || hw_sync > 17) ? 80 : 56;
+
+      if (try_decode_from(start, bit_length))
+        return true;
+
+      // Candidate failed -> reset like Somfy.cpp and keep scanning for next repetition
+      hw_sync = 0;
+      continue;
     }
+
     hw_sync = 0;
   }
-  if (start < 0 || start >= n)
-    return false;
 
-  // Decide frame length (same logic, just simplified).
-  const int bit_length =
-      (hw_sync == 12 || hw_sync == 13 || hw_sync > 17) ? 80 : 56;
-
-  uint8_t payload[10]{0};  // enough for 80-bit frames
-  bool waiting_half = false;
-  uint8_t prev_bit = 0;
-  int bits = 0;
-
-  for (int i = start; i < n && bits < bit_length; i++) {
-    const uint32_t d = absu(data[i]);
-
-    if (!waiting_half && d >= sym_min && d <= sym_max) {
-      prev_bit = 1 - prev_bit;
-      payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
-      bits++;
-      continue;
-    }
-
-    if (d >= half_min && d <= half_max) {
-      if (waiting_half) {
-        waiting_half = false;
-        payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
-        bits++;
-      } else {
-        waiting_half = true;
-      }
-      continue;
-    }
-
-    return false;
-  }
-
-  if (bits != bit_length)
-    return false;
-
-  // De-obfuscate:
-  uint8_t frame[10]{0};
-  frame[0] = payload[0];
-  for (int i = 1; i < 7; i++)
-    frame[i] = payload[i] ^ payload[i - 1];
-
-  if (bit_length == 80) {
-    frame[7] = payload[7];
-    frame[8] = payload[8];
-    frame[9] = payload[9];
-  }
-
-  // Checksum first 7 bytes:
-  uint8_t cs = 0;
-  for (uint8_t i = 0; i < 7; i++) {
-    if (i == 1)
-      cs ^= (frame[i] >> 4);
-    else
-      cs ^= frame[i] ^ (frame[i] >> 4);
-  }
-  cs &= 0x0F;
-  if (cs != (frame[1] & 0x0F))
-    return false;
-
-  // Extra 80-bit checksum (same math, no lambda allocation)
-  if (bit_length == 80) {
-    uint8_t cs80 = 0;
-    cs80 = (((frame[7] & 0xF0) >> 4) ^ ((frame[8] & 0xF0) >> 4));
-    cs80 ^= ((frame[9] & 0xF0) >> 4);
-    cs80 ^= (frame[7] & 0x0F);
-    cs80 ^= (frame[8] & 0x0F);
-    cs80 &= 0x0F;
-
-    if ((frame[9] & 0x0F) != cs80)
-      return false;
-  }
-
-  command = static_cast<Command>(frame[1] >> 4);
-  rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-  remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
-                (static_cast<uint32_t>(frame[5]) << 8) |
-                frame[6];
-
-  return true;
+  return false;
 }
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
