@@ -38,11 +38,6 @@ const char *SomfyCover::command_to_string_(Command cmd) {
 }
 
 bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
-  // Decoder based on ESPSomfy-RTS (https://github.com/rstrouse/ESPSomfy-RTS) receive state machine (Somfy.cpp/Somfy.h reference):
-  // - detect >=4 hardware sync pulses (~4*SYMBOL)
-  // - detect software sync (~4850us)
-  // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
-  // - de-obfuscate (XOR chain) and validate checksum
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
@@ -62,7 +57,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
 
-  // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
+  // Find sync: count hardware sync pulses, then detect software sync.
   int hw_sync = 0;
   int start = -1;
   for (int i = 0; i < n; i++) {
@@ -75,19 +70,28 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
       start = i + 1;
       break;
     }
-    // Anything else resets the hardware sync counter.
     hw_sync = 0;
   }
   if (start < 0 || start >= n)
     return false;
 
-  // Decode 56 bits into 7 bytes (MSB first), using the same pulse-width rules as ESPSomfy-RTS.
-  uint8_t payload[7]{0};
+  // Decide frame length (Somfy.cpp logic).
+  int bit_length = 56;
+  if (hw_sync <= 7) bit_length = 56;
+  else if (hw_sync == 14) bit_length = 56;
+  else if (hw_sync == 13) bit_length = 80;      // RS485 / extension style sync
+  else if (hw_sync == 12) bit_length = 80;
+  else if (hw_sync > 17) bit_length = 80;
+  else bit_length = 56;
+
+  const int byte_length = bit_length / 8;  // 7 or 10
+
+  uint8_t payload[10]{0};                  // enough for 80-bit frames
   bool waiting_half_symbol = false;
   uint8_t previous_bit = 0x00;
   int bits = 0;
 
-  for (int i = start; i < n && bits < 56; i++) {
+  for (int i = start; i < n && bits < bit_length; i++) {
     const uint32_t d = absu(data[i]);
 
     if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
@@ -103,23 +107,28 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
         waiting_half_symbol = true;
       }
     } else {
-      // Out-of-range timing: abort.
       return false;
     }
   }
 
-  if (bits != 56)
+  if (bits != bit_length)
     return false;
 
-  // De-obfuscate (XOR chain): decoded[i] = payload[i] ^ payload[i-1], i>=1
-  uint8_t frame[7]{0};
+  // De-obfuscate like Somfy.cpp:
+  // - bytes 0..6 are XOR chained
+  // - for 80-bit frames, last 3 bytes (7..9) are NOT XOR encoded
+  uint8_t frame[10]{0};
   frame[0] = payload[0];
   for (int i = 1; i < 7; i++) {
     frame[i] = payload[i] ^ payload[i - 1];
   }
+  if (bit_length == 80) {
+    frame[7] = payload[7];
+    frame[8] = payload[8];
+    frame[9] = payload[9];
+  }
 
-  // Validate checksum (per ESPSomfy-RTS):
-  // For byte 1 we only want the upper nibble.
+  // Checksum for the first 7 bytes (same as your current code / Somfy.cpp)
   uint8_t checksum = 0;
   for (uint8_t i = 0; i < 7; i++) {
     if (i == 1)
@@ -132,6 +141,25 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   if (checksum != expected)
     return false;
 
+  // Extra 80-bit checksum validation (Somfy.cpp calc80Checksum)
+  if (bit_length == 80) {
+    auto calc80Checksum = [](uint8_t b0, uint8_t b1, uint8_t b2) -> uint8_t {
+      uint8_t cs80 = 0;
+      cs80 = (((b0 & 0xF0) >> 4) ^ ((b1 & 0xF0) >> 4));
+      cs80 ^= ((b2 & 0xF0) >> 4);
+      cs80 ^= (b0 & 0x0F);
+      cs80 ^= (b1 & 0x0F);
+      return cs80 & 0x0F;
+    };
+
+    if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9]))
+      return false;
+
+    // Somfy.cpp also translates extended MY variants here; for cover sync we can treat all of them as MY.
+    // If you want exact mapping later, we can port that tiny translation block too.
+  }
+
+  // Extract fields (Somfy.cpp)
   command = static_cast<Command>(frame[1] >> 4);
   rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
   remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
