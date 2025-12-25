@@ -43,6 +43,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   // - detect software sync (~4850us)
   // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
   // - de-obfuscate (XOR chain) and validate checksum
+
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
@@ -81,76 +82,90 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   if (start < 0 || start >= n)
     return false;
 
-  // Decode 56 bits into 7 bytes (MSB first), using the same pulse-width rules as ESPSomfy-RTS.
-  //
-  // Note: Some remotes/receivers occasionally "merge" two consecutive half-symbols into a ~2*SYMBOL duration
-  // at a point where the ESPSomfy state machine expects a half-symbol. The reference implementation
-  // resets in that case, but in practice we can recover by treating such a pulse as two half-symbols.
-  uint8_t payload[7]{0};
-  bool waiting_half_symbol = false;
-  uint8_t previous_bit = 0x00;
-  int bits = 0;
+  // Two-pass decode: the "bad" remote sometimes produces a 2T pulse when we are waiting for a half-symbol.
+  // That situation is ambiguous; we try both interpretations and use checksum to validate.
+  auto decode_payload = [&](bool mode_merged_halves) -> bool {
+    uint8_t payload[7]{0};
+    bool waiting_half_symbol = false;
+    uint8_t previous_bit = 0x00;
+    int bits = 0;
 
-  for (int i = start; i < n && bits < 56; i++) {
-    const uint32_t d = absu(data[i]);
+    for (int i = start; i < n && bits < 56; i++) {
+      const uint32_t d = absu(data[i]);
 
-    if (d >= tempo_symbol_min && d <= tempo_symbol_max) {
-      if (!waiting_half_symbol) {
-        // Normal 2T symbol -> toggle bit and emit
-        previous_bit = 1 - previous_bit;
-        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-        bits++;
+      if (d >= tempo_symbol_min && d <= tempo_symbol_max) {
+        if (!waiting_half_symbol) {
+          // Normal 2T symbol -> toggle bit and emit
+          previous_bit = 1 - previous_bit;
+          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+          bits++;
+        } else {
+          // Ambiguous case: 2T while we were expecting a 1T half-symbol.
+          if (mode_merged_halves) {
+            // Treat as two merged half-symbols: finish current bit using previous_bit,
+            // and consider ourselves waiting again for the next half-symbol.
+            payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+            bits++;
+            waiting_half_symbol = true;
+          } else {
+            // Treat as a real 2T symbol even though we're in waiting state.
+            previous_bit = 1 - previous_bit;
+            payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+            bits++;
+            waiting_half_symbol = false;
+          }
+        }
+      } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
+        if (waiting_half_symbol) {
+          waiting_half_symbol = false;
+          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+          bits++;
+        } else {
+          waiting_half_symbol = true;
+        }
       } else {
-        // Tolerate merged halves: we were waiting for the 2nd half (1T),
-        // but got a 2T duration. Treat it as:
-        //   - the missing 2nd half of the current bit (emit previous_bit)
-        //   - plus the 1st half of the next bit (stay waiting)
-        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-        bits++;
-        waiting_half_symbol = true;  // still waiting for the next half-symbol
+        // Out-of-range timing: abort this pass.
+        return false;
       }
-    } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
-      if (waiting_half_symbol) {
-        waiting_half_symbol = false;
-        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-        bits++;
-      } else {
-        waiting_half_symbol = true;
-      }
-    } else {
-      return false;
     }
-  }
 
-  if (bits != 56)
-    return false;
+    if (bits != 56)
+      return false;
 
-  // De-obfuscate (XOR chain): decoded[i] = payload[i] ^ payload[i-1], i>=1
-  uint8_t frame[7]{0};
-  frame[0] = payload[0];
-  for (int i = 1; i < 7; i++) {
-    frame[i] = payload[i] ^ payload[i - 1];
-  }
+    // De-obfuscate (XOR chain): decoded[i] = payload[i] ^ payload[i-1], i>=1
+    uint8_t frame[7]{0};
+    frame[0] = payload[0];
+    for (int i = 1; i < 7; i++) {
+      frame[i] = payload[i] ^ payload[i - 1];
+    }
 
-  // Validate checksum (per ESPSomfy-RTS):
-  // For byte 1 we only want the upper nibble.
-  uint8_t checksum = 0;
-  for (uint8_t i = 0; i < 7; i++) {
-    if (i == 1)
-      checksum = checksum ^ (frame[i] >> 4);
-    else
-      checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
-  }
-  checksum &= 0x0F;
-  const uint8_t expected = frame[1] & 0x0F;
-  if (checksum != expected)
-    return false;
+    // Validate checksum (per ESPSomfy-RTS):
+    // For byte 1 we only want the upper nibble.
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < 7; i++) {
+      if (i == 1)
+        checksum = checksum ^ (frame[i] >> 4);
+      else
+        checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
+    }
+    checksum &= 0x0F;
+    const uint8_t expected = frame[1] & 0x0F;
+    if (checksum != expected)
+      return false;
 
-  command = static_cast<Command>(frame[1] >> 4);
-  rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-  remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
+    // Success: populate outputs.
+    command = static_cast<Command>(frame[1] >> 4);
+    rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
+    remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
+    return true;
+  };
 
-  return true;
+  if (decode_payload(true))
+    return true;
+  if (decode_payload(false))
+    return true;
+
+  return false;
 }
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
