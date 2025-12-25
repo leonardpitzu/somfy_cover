@@ -38,12 +38,6 @@ const char *SomfyCover::command_to_string_(Command cmd) {
 }
 
 bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
-  // Decoder based on ESPSomfy-RTS (https://github.com/rstrouse/ESPSomfy-RTS) receive state machine (Somfy.cpp/Somfy.h reference):
-  // - detect >=4 hardware sync pulses (~4*SYMBOL)
-  // - detect software sync (~4850us)
-  // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
-  // - de-obfuscate (XOR chain) and validate checksum
-
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
@@ -63,7 +57,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
 
-  // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
+  // 1) Find sync start exactly like before: >=4 HW sync pulses then one SW sync pulse.
   int hw_sync = 0;
   int start = -1;
   for (int i = 0; i < n; i++) {
@@ -76,71 +70,127 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
       start = i + 1;
       break;
     }
-    // Anything else resets the hardware sync counter.
     hw_sync = 0;
   }
   if (start < 0 || start >= n)
     return false;
 
-  // Two-pass decode: the "bad" remote sometimes produces a 2T pulse when we are waiting for a half-symbol.
-  // That situation is ambiguous; we try both interpretations and use checksum to validate.
-  auto decode_payload = [&](bool mode_merged_halves) -> bool {
-    uint8_t payload[7]{0};
-    bool waiting_half_symbol = false;
-    uint8_t previous_bit = 0x00;
-    int bits = 0;
+  // 2) Robust data decode using a small state search (handles merged/ambiguous timings).
+  struct State {
+    std::array<uint8_t, 7> payload{};
+    bool waiting_half{false};
+    uint8_t prev_bit{0};
+    int bits{0};
+    int idx{0};  // index into data[]
+  };
 
-    for (int i = start; i < n && bits < 56; i++) {
-      const uint32_t d = absu(data[i]);
+  auto emit_bit = [](State &s, uint8_t bit) {
+    s.payload[s.bits / 8] |= static_cast<uint8_t>(bit << (7 - (s.bits % 8)));
+    s.bits++;
+  };
 
-      if (d >= tempo_symbol_min && d <= tempo_symbol_max) {
-        if (!waiting_half_symbol) {
-          // Normal 2T symbol -> toggle bit and emit
-          previous_bit = 1 - previous_bit;
-          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-          bits++;
-        } else {
-          // Ambiguous case: 2T while we were expecting a 1T half-symbol.
-          if (mode_merged_halves) {
-            // Treat as two merged half-symbols: finish current bit using previous_bit,
-            // and consider ourselves waiting again for the next half-symbol.
-            payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-            bits++;
-            waiting_half_symbol = true;
-          } else {
-            // Treat as a real 2T symbol even though we're in waiting state.
-            previous_bit = 1 - previous_bit;
-            payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-            bits++;
-            waiting_half_symbol = false;
-          }
-        }
-      } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
-        if (waiting_half_symbol) {
-          waiting_half_symbol = false;
-          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-          bits++;
-        } else {
-          waiting_half_symbol = true;
-        }
-      } else {
-        // Out-of-range timing: abort this pass.
-        return false;
+  auto do_half = [&](State &s) {
+    if (s.waiting_half) {
+      s.waiting_half = false;
+      emit_bit(s, s.prev_bit);
+    } else {
+      s.waiting_half = true;
+    }
+  };
+
+  auto do_symbol = [&](State &s) {
+    // Only valid as "symbol" when not waiting, in the original state machine.
+    // In our search, we still allow it while waiting as an alternate hypothesis,
+    // because some captures effectively "eat" a boundary.
+    s.prev_bit = 1 - s.prev_bit;
+    emit_bit(s, s.prev_bit);
+    s.waiting_half = false;
+  };
+
+  // Candidate frontier; keep it small.
+  std::vector<State> cur, next;
+  cur.reserve(32);
+  next.reserve(64);
+
+  State s0;
+  s0.idx = start;
+  cur.push_back(s0);
+
+  // We only need enough timings to produce 56 bits; stop when all states are done or too many steps.
+  for (int steps = 0; steps < 400 && !cur.empty(); steps++) {
+    next.clear();
+
+    for (const auto &s : cur) {
+      if (s.bits >= 56) {
+        // Keep completed states
+        next.push_back(s);
+        continue;
       }
+      if (s.idx >= n)
+        continue;
+
+      const uint32_t d = absu(data[s.idx]);
+
+      const bool is_half = (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max);
+      const bool is_sym  = (d >= tempo_symbol_min && d <= tempo_symbol_max);
+
+      // Option A: interpret as half-symbol (1T)
+      if (is_half) {
+        State t = s;
+        t.idx++;
+        do_half(t);
+        if (t.bits <= 56) next.push_back(t);
+      }
+
+      // Option B: interpret as symbol (2T)
+      if (is_sym) {
+        State t = s;
+        t.idx++;
+        do_symbol(t);
+        if (t.bits <= 56) next.push_back(t);
+
+        // Option C: interpret this 2T as "two merged halves" (process half twice)
+        // This specifically fixes remotes that merge transitions.
+        State u = s;
+        u.idx++;
+        do_half(u);
+        do_half(u);
+        if (u.bits <= 56) next.push_back(u);
+      }
+
+      // Option D: if it’s neither half nor symbol, drop it (state dies).
     }
 
-    if (bits != 56)
-      return false;
+    // Prune: keep only a limited number of candidates to avoid explosion.
+    // Heuristic: prefer states closer to 56 bits and with smaller idx (more progress).
+    if (next.size() > 48) {
+      std::sort(next.begin(), next.end(), [](const State &a, const State &b) {
+        if (a.bits != b.bits) return a.bits > b.bits;
+        return a.idx < b.idx;
+      });
+      next.resize(48);
+    }
 
-    // De-obfuscate (XOR chain): decoded[i] = payload[i] ^ payload[i-1], i>=1
+    cur.swap(next);
+
+    // Early exit if we have any finished states with 56 bits.
+    bool any56 = false;
+    for (const auto &s : cur) {
+      if (s.bits == 56) { any56 = true; break; }
+    }
+    if (any56) break;
+  }
+
+  // 3) Validate candidates by checksum; first one that passes is accepted.
+  for (const auto &s : cur) {
+    if (s.bits != 56)
+      continue;
+
     uint8_t frame[7]{0};
-    frame[0] = payload[0];
-    for (int i = 1; i < 7; i++) {
-      frame[i] = payload[i] ^ payload[i - 1];
-    }
+    frame[0] = s.payload[0];
+    for (int i = 1; i < 7; i++)
+      frame[i] = s.payload[i] ^ s.payload[i - 1];
 
-    // Validate checksum (per ESPSomfy-RTS):
-    // For byte 1 we only want the upper nibble.
     uint8_t checksum = 0;
     for (uint8_t i = 0; i < 7; i++) {
       if (i == 1)
@@ -149,21 +199,16 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
         checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
     }
     checksum &= 0x0F;
+
     const uint8_t expected = frame[1] & 0x0F;
     if (checksum != expected)
-      return false;
+      continue;
 
-    // Success: populate outputs.
     command = static_cast<Command>(frame[1] >> 4);
     rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
     remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
     return true;
-  };
-
-  if (decode_payload(true))
-    return true;
-  if (decode_payload(false))
-    return true;
+  }
 
   return false;
 }
