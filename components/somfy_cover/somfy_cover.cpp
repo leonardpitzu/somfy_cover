@@ -41,8 +41,10 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   // - de-obfuscate (XOR chain) and validate checksum
 
   const int n = static_cast<int>(data.size());
-  if (n < 20)
+  if (n < 20) {
+    ESP_LOGD(TAG, "RX decode FAIL_SHORT n=%d", n);
     return false;
+  }
 
   constexpr uint32_t SYMBOL = 640;
   constexpr float TOL_MIN = 0.7f;
@@ -78,6 +80,13 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   bool waiting_half_symbol = false;
   uint8_t bit_length = 56;
 
+  // Debug context (only logs; no logic change)
+  int last_bad_i = -1;
+  uint32_t last_bad_duration = 0;
+  bool saw_any_sync = false;
+  uint8_t last_sync_hw = 0;
+  uint8_t last_sync_bitlen = 0;
+
   auto reset_to_waiting = [&]() {
     status = WAITING_SYNCHRO;
     cpt_synchro_hw = 0;
@@ -100,6 +109,9 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
           ++cpt_synchro_hw;
         } else if (duration > tempo_synchro_sw_min && duration < tempo_synchro_sw_max && cpt_synchro_hw >= 4) {
           // Found SW sync after enough HW sync -> start receiving
+          saw_any_sync = true;
+          last_sync_hw = cpt_synchro_hw;
+
           memset(payload, 0x00, sizeof(payload));
           previous_bit = 0x00;
           waiting_half_symbol = false;
@@ -112,6 +124,10 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
           else if (cpt_synchro_hw == 12) bit_length = 80;
           else if (cpt_synchro_hw > 17) bit_length = 80;
           else bit_length = 56;
+
+          last_sync_bitlen = bit_length;
+
+          ESP_LOGD(TAG, "RX sync ok: hw_sync=%u bit_length=%u start_i=%d n=%d", last_sync_hw, last_sync_bitlen, i + 1, n);
 
           status = RECEIVING_DATA;
         } else {
@@ -135,6 +151,14 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
             waiting_half_symbol = true;
           }
         } else {
+          // Debug: out-of-range timing inside data
+          last_bad_i = i;
+          last_bad_duration = duration;
+          ESP_LOGD(TAG,
+                   "RX decode FAIL_RANGE: i=%d d=%u waiting_half=%d bits=%u/%u hw_sync=%u",
+                   last_bad_i, last_bad_duration, waiting_half_symbol ? 1 : 0,
+                   cpt_bits, bit_length, last_sync_hw);
+
           // *** CRITICAL Somfy.cpp BEHAVIOR ***
           // Bad timing during data: reset and reprocess THIS SAME duration as part of sync search.
           reset_to_waiting();
@@ -163,10 +187,17 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
           }
           checksum &= 0x0F;
 
-          if (checksum == (frame[1] & 0x0F)) {
+          const uint8_t expected = frame[1] & 0x0F;
+
+          if (checksum == expected) {
             // Extra 80-bit checksum (only if 80-bit)
             if (bit_length == 80) {
-              if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9])) {
+              const uint8_t want = frame[9] & 0x0F;
+              const uint8_t got = calc80Checksum(frame[7], frame[8], frame[9]);
+              if (want != got) {
+                ESP_LOGD(TAG,
+                         "RX decode FAIL_CSUM80: want=%u got=%u hw_sync=%u frame7=0x%02X frame8=0x%02X frame9=0x%02X",
+                         want, got, last_sync_hw, frame[7], frame[8], frame[9]);
                 reset_to_waiting();
                 break;
               }
@@ -178,16 +209,33 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
             remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
                           (static_cast<uint32_t>(frame[5]) << 8) |
                           frame[6];
+
+            ESP_LOGD(TAG,
+                     "RX decode OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
+                     remote_code, (frame[1] >> 4), rolling_code, last_sync_hw, bit_length);
+
             return true;
           }
 
           // Checksum failed -> keep scanning for the next repeat in this same buffer.
+          ESP_LOGD(TAG,
+                   "RX decode FAIL_CSUM: cs=%u expected=%u hw_sync=%u bit_length=%u encKey=0x%02X cmdNibble=0x%X",
+                   checksum, expected, last_sync_hw, bit_length, frame[0], (frame[1] >> 4));
+
           reset_to_waiting();
         }
 
         break;
       }
     }
+  }
+
+  if (!saw_any_sync) {
+    ESP_LOGD(TAG, "RX decode FAIL_SYNC (no SW sync found) n=%d", n);
+  } else {
+    ESP_LOGD(TAG,
+             "RX decode FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
+             last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
   }
 
   return false;
