@@ -43,6 +43,9 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   // - detect software sync (~4850us)
   // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
   // - de-obfuscate (XOR chain) and validate checksum
+  const int n = static_cast<int>(data.size());
+  if (n < 20)
+    return false;
 
   constexpr uint32_t SYMBOL = 640;
   constexpr float TOLERANCE_MIN = 0.7f;
@@ -59,43 +62,11 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
 
-  // === NEW: normalize timings so merged ~2T pulses become two 1T half-symbols ===
-  // Some remotes merge consecutive half-symbols into ~1250–1320us pulses; the state machine expects 640us chunks.
-  // Normalize ONLY data pulses (T / 2T). Never touch sync pulses.
-  std::vector<int32_t> norm;
-  norm.reserve(data.size() * 2);
-
-  for (auto t : data) {
-    const uint32_t av = absu(t);
-    const int32_t sign = (t < 0) ? -1 : 1;
-
-    // Keep hardware sync and software sync pulses intact
-    if (av >= tempo_synchro_hw_min) {
-      norm.push_back(t);
-      continue;
-    }
-
-    // Data region: split merged 2T pulses into two 1T pulses
-    if (av >= tempo_symbol_min && av <= tempo_symbol_max) {
-      // ~2T → two half-symbols
-      norm.push_back(sign * static_cast<int32_t>(SYMBOL));
-      norm.push_back(sign * static_cast<int32_t>(SYMBOL));
-    } else {
-      // ~1T or slightly off → keep as-is
-      norm.push_back(t);
-    }
-  }
-
-  const int n = static_cast<int>(norm.size());
-  if (n < 20)
-    return false;
-  // === END NEW ===
-
   // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
   int hw_sync = 0;
   int start = -1;
   for (int i = 0; i < n; i++) {
-    const uint32_t d = absu(norm[i]);   // CHANGED: data[i] -> norm[i]
+    const uint32_t d = absu(data[i]);
     if (d >= tempo_synchro_hw_min && d <= tempo_synchro_hw_max) {
       hw_sync++;
       continue;
@@ -111,18 +82,34 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
     return false;
 
   // Decode 56 bits into 7 bytes (MSB first), using the same pulse-width rules as ESPSomfy-RTS.
+  //
+  // Note: Some remotes/receivers occasionally "merge" two consecutive half-symbols into a ~2*SYMBOL duration
+  // at a point where the ESPSomfy state machine expects a half-symbol. The reference implementation
+  // resets in that case, but in practice we can recover by treating such a pulse as two half-symbols.
   uint8_t payload[7]{0};
   bool waiting_half_symbol = false;
   uint8_t previous_bit = 0x00;
   int bits = 0;
 
   for (int i = start; i < n && bits < 56; i++) {
-    const uint32_t d = absu(norm[i]);   // CHANGED: data[i] -> norm[i]
+    const uint32_t d = absu(data[i]);
 
-    if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
-      previous_bit = 1 - previous_bit;
-      payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
-      bits++;
+    if (d >= tempo_symbol_min && d <= tempo_symbol_max) {
+      if (!waiting_half_symbol) {
+        // Full symbol (2T) with no pending half: toggle the bit and emit.
+        previous_bit = 1 - previous_bit;
+        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+        bits++;
+      } else {
+        // Recovery path: treat this as two half-symbols (T + T).
+        // First half completes the pending half-symbol: emit current previous_bit.
+        waiting_half_symbol = false;
+        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+        bits++;
+        if (bits >= 56) break;
+        // Second half starts a new pending half-symbol.
+        waiting_half_symbol = true;
+      }
     } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
       if (waiting_half_symbol) {
         waiting_half_symbol = false;
