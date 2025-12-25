@@ -45,19 +45,40 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
     return false;
 
   constexpr uint32_t SYMBOL = 640;
-  constexpr float TOL_MIN = 0.7f;
-  constexpr float TOL_MAX = 1.3f;
+  constexpr float TOLERANCE_MIN = 0.7f;
+  constexpr float TOLERANCE_MAX = 1.3f;
 
-  const uint32_t hw_min   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MIN);
-  const uint32_t hw_max   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MAX);
-  const uint32_t sw_min   = static_cast<uint32_t>(4850 * TOL_MIN);
-  const uint32_t sw_max   = static_cast<uint32_t>(4850 * TOL_MAX);
-  const uint32_t half_min = static_cast<uint32_t>(SYMBOL * TOL_MIN);
-  const uint32_t half_max = static_cast<uint32_t>(SYMBOL * TOL_MAX);
-  const uint32_t sym_min  = static_cast<uint32_t>(SYMBOL * 2 * TOL_MIN);
-  const uint32_t sym_max  = static_cast<uint32_t>(SYMBOL * 2 * TOL_MAX);
+  const uint32_t tempo_synchro_hw_min = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MIN);
+  const uint32_t tempo_synchro_hw_max = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MAX);
+  const uint32_t tempo_synchro_sw_min = static_cast<uint32_t>(4850 * TOLERANCE_MIN);
+  const uint32_t tempo_synchro_sw_max = static_cast<uint32_t>(4850 * TOLERANCE_MAX);
+  const uint32_t tempo_half_symbol_min = static_cast<uint32_t>(SYMBOL * TOLERANCE_MIN);
+  const uint32_t tempo_half_symbol_max = static_cast<uint32_t>(SYMBOL * TOLERANCE_MAX);
+  const uint32_t tempo_symbol_min = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MIN);
+  const uint32_t tempo_symbol_max = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MAX);
 
-  auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(v < 0 ? -v : v); };
+  auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
+
+  // Find sync: count hardware sync pulses, then detect software sync.
+  int hw_sync = 0;
+  int start = -1;
+  for (int i = 0; i < n; i++) {
+    const uint32_t d = absu(data[i]);
+    if (d >= tempo_synchro_hw_min && d <= tempo_synchro_hw_max) {
+      hw_sync++;
+      continue;
+    }
+    if (d >= tempo_synchro_sw_min && d <= tempo_synchro_sw_max && hw_sync >= 4) {
+      start = i + 1;
+      break;
+    }
+    hw_sync = 0;
+  }
+  if (start < 0 || start >= n)
+    return false;
+
+  // Decide frame length (Somfy.cpp logic).
+  const int bit_length = (hw_sync == 12 || hw_sync == 13 || hw_sync > 17) ? 80 : 56;
 
   auto calc80Checksum = [](uint8_t b0, uint8_t b1, uint8_t b2) -> uint8_t {
     uint8_t cs80 = 0;
@@ -68,112 +89,77 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
     return static_cast<uint8_t>(cs80 & 0x0F);
   };
 
-  int hw_sync = 0;
+  auto try_decode = [&](uint8_t initial_previous_bit) -> bool {
+    uint8_t payload[10]{0};  // enough for 80-bit frames
+    bool waiting_half_symbol = false;
+    uint8_t previous_bit = initial_previous_bit;
+    int bits = 0;
 
-  // Scan the whole capture (Somfy sends repeats).
-  for (int i = 0; i < n; i++) {
-    const uint32_t d = absu(data[i]);
+    for (int i = start; i < n && bits < bit_length; i++) {
+      const uint32_t d = absu(data[i]);
 
-    // Count HW sync pulses (~4T)
-    if (d >= hw_min && d <= hw_max) {
-      hw_sync++;
-      continue;
-    }
-
-    // SW sync (~4850us) after >=4 HW sync pulses
-    if (d >= sw_min && d <= sw_max && hw_sync >= 4) {
-      const int start = i + 1;
-      if (start >= n) return false;
-
-      // Decide frame length (Somfy.cpp logic)
-      const int bit_length =
-          (hw_sync == 12 || hw_sync == 13 || hw_sync > 17) ? 80 : 56;
-
-      uint8_t payload[10]{0};
-      bool waiting_half_symbol = false;
-      uint8_t previous_bit = 0x00;
-      int bits = 0;
-
-      bool ok = true;
-
-      // Decode bits; on any bad timing, emulate Somfy.cpp:
-      // reset and treat the failing duration as the first pulse of the next search.
-      for (int j = start; j < n && bits < bit_length; j++) {
-        const uint32_t dj = absu(data[j]);
-
-        if (dj >= sym_min && dj <= sym_max && !waiting_half_symbol) {
-          previous_bit = 1 - previous_bit;
-          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits & 7)));
+      if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
+        previous_bit = 1 - previous_bit;
+        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+        bits++;
+      } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
+        if (waiting_half_symbol) {
+          waiting_half_symbol = false;
+          payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
           bits++;
-        } else if (dj >= half_min && dj <= half_max) {
-          if (waiting_half_symbol) {
-            waiting_half_symbol = false;
-            payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits & 7)));
-            bits++;
-          } else {
-            waiting_half_symbol = true;
-          }
         } else {
-          // *** KEY FIX ***
-          // Candidate frame corrupted. Reprocess this same pulse as potential sync.
-          ok = false;
-          hw_sync = 0;
-          i = j - 1;  // outer loop will i++ and land on j
-          break;
+          waiting_half_symbol = true;
         }
+      } else {
+        return false;
       }
-
-      if (!ok) continue;
-      if (bits != bit_length) {
-        hw_sync = 0;
-        continue;
-      }
-
-      // De-obfuscate like Somfy.cpp
-      uint8_t frame[10]{0};
-      frame[0] = payload[0];
-      for (int k = 1; k < 7; k++)
-        frame[k] = payload[k] ^ payload[k - 1];
-      if (bit_length == 80) {
-        frame[7] = payload[7];
-        frame[8] = payload[8];
-        frame[9] = payload[9];
-      }
-
-      // Checksum first 7 bytes
-      uint8_t checksum = 0;
-      for (uint8_t k = 0; k < 7; k++) {
-        if (k == 1)
-          checksum ^= (frame[k] >> 4);
-        else
-          checksum ^= frame[k] ^ (frame[k] >> 4);
-      }
-      checksum &= 0x0F;
-      if (checksum != (frame[1] & 0x0F)) {
-        hw_sync = 0;
-        continue;
-      }
-
-      // Extra 80-bit checksum
-      if (bit_length == 80) {
-        if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9])) {
-          hw_sync = 0;
-          continue;
-        }
-      }
-
-      // Success
-      command = static_cast<Command>(frame[1] >> 4);
-      rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-      remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
-                    (static_cast<uint32_t>(frame[5]) << 8) |
-                    frame[6];
-      return true;
     }
 
-    // Anything else resets HW sync counter (Somfy.cpp behavior)
-    hw_sync = 0;
-  }
+    if (bits != bit_length)
+      return false;
+
+    // De-obfuscate like Somfy.cpp:
+    uint8_t frame[10]{0};
+    frame[0] = payload[0];
+    for (int i = 1; i < 7; i++)
+      frame[i] = payload[i] ^ payload[i - 1];
+
+    if (bit_length == 80) {
+      frame[7] = payload[7];
+      frame[8] = payload[8];
+      frame[9] = payload[9];
+    }
+
+    // Checksum for the first 7 bytes
+    uint8_t checksum = 0;
+    for (uint8_t i = 0; i < 7; i++) {
+      if (i == 1)
+        checksum = checksum ^ (frame[i] >> 4);
+      else
+        checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
+    }
+    checksum &= 0x0F;
+    const uint8_t expected = frame[1] & 0x0F;
+    if (checksum != expected)
+      return false;
+
+    // Extra 80-bit checksum validation
+    if (bit_length == 80) {
+      if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9]))
+        return false;
+    }
+
+    command = static_cast<Command>(frame[1] >> 4);
+    rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
+    remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
+    return true;
+  };
+
+  // Phase retry: try both initial Manchester phases.
+  if (try_decode(0))
+    return true;
+  if (try_decode(1))
+    return true;
 
   return false;
 }
