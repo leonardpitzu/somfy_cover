@@ -2,15 +2,11 @@
 #include "esphome/core/hal.h"
 #include "somfy_cover.h"
 #include <cstdlib>
-#include <vector>
 
 namespace esphome {
 namespace somfy_cover {
 
 static const char *TAG = "somfy_cover.cover";
-
-static const uint32_t SOMFY_SYMBOL_US = 640;
-static const uint32_t SOMFY_SOFTWARE_SYNC_MARK_US = 4550;
 
 const char *SomfyCover::command_to_string_(Command cmd) {
   switch (cmd) {
@@ -37,36 +33,38 @@ const char *SomfyCover::command_to_string_(Command cmd) {
   }
 }
 
-bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+bool SomfyCover::decode_frame_(const remote_base::RawTimings &data,
+                              uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
 
   constexpr uint32_t SYMBOL = 640;
-  constexpr float TOLERANCE_MIN = 0.7f;
-  constexpr float TOLERANCE_MAX = 1.3f;
+  constexpr float TOL_MIN = 0.7f;
+  constexpr float TOL_MAX = 1.3f;
 
-  const uint32_t tempo_synchro_hw_min = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MIN);
-  const uint32_t tempo_synchro_hw_max = static_cast<uint32_t>(SYMBOL * 4 * TOLERANCE_MAX);
-  const uint32_t tempo_synchro_sw_min = static_cast<uint32_t>(4850 * TOLERANCE_MIN);
-  const uint32_t tempo_synchro_sw_max = static_cast<uint32_t>(4850 * TOLERANCE_MAX);
-  const uint32_t tempo_half_symbol_min = static_cast<uint32_t>(SYMBOL * TOLERANCE_MIN);
-  const uint32_t tempo_half_symbol_max = static_cast<uint32_t>(SYMBOL * TOLERANCE_MAX);
-  const uint32_t tempo_symbol_min = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MIN);
-  const uint32_t tempo_symbol_max = static_cast<uint32_t>(SYMBOL * 2 * TOLERANCE_MAX);
+  // Precomputed timing windows (still computed per-call, but tighter code).
+  const uint32_t hw_min   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MIN);
+  const uint32_t hw_max   = static_cast<uint32_t>(SYMBOL * 4 * TOL_MAX);
+  const uint32_t sw_min   = static_cast<uint32_t>(4850 * TOL_MIN);
+  const uint32_t sw_max   = static_cast<uint32_t>(4850 * TOL_MAX);
+  const uint32_t half_min = static_cast<uint32_t>(SYMBOL * TOL_MIN);
+  const uint32_t half_max = static_cast<uint32_t>(SYMBOL * TOL_MAX);
+  const uint32_t sym_min  = static_cast<uint32_t>(SYMBOL * 2 * TOL_MIN);
+  const uint32_t sym_max  = static_cast<uint32_t>(SYMBOL * 2 * TOL_MAX);
 
-  auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
+  auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(v < 0 ? -v : v); };
 
-  // Find sync: count hardware sync pulses, then detect software sync.
+  // Find sync: count HW sync pulses, then detect SW sync.
   int hw_sync = 0;
   int start = -1;
   for (int i = 0; i < n; i++) {
     const uint32_t d = absu(data[i]);
-    if (d >= tempo_synchro_hw_min && d <= tempo_synchro_hw_max) {
+    if (d >= hw_min && d <= hw_max) {
       hw_sync++;
       continue;
     }
-    if (d >= tempo_synchro_sw_min && d <= tempo_synchro_sw_max && hw_sync >= 4) {
+    if (d >= sw_min && d <= sw_max && hw_sync >= 4) {
       start = i + 1;
       break;
     }
@@ -75,94 +73,84 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   if (start < 0 || start >= n)
     return false;
 
-  // Decide frame length (Somfy.cpp logic).
-  int bit_length = 56;
-  if (hw_sync <= 7) bit_length = 56;
-  else if (hw_sync == 14) bit_length = 56;
-  else if (hw_sync == 13) bit_length = 80;      // RS485 / extension style sync
-  else if (hw_sync == 12) bit_length = 80;
-  else if (hw_sync > 17) bit_length = 80;
-  else bit_length = 56;
+  // Decide frame length (same logic, just simplified).
+  const int bit_length =
+      (hw_sync == 12 || hw_sync == 13 || hw_sync > 17) ? 80 : 56;
 
-  const int byte_length = bit_length / 8;  // 7 or 10
-
-  uint8_t payload[10]{0};                  // enough for 80-bit frames
-  bool waiting_half_symbol = false;
-  uint8_t previous_bit = 0x00;
+  uint8_t payload[10]{0};  // enough for 80-bit frames
+  bool waiting_half = false;
+  uint8_t prev_bit = 0;
   int bits = 0;
 
   for (int i = start; i < n && bits < bit_length; i++) {
     const uint32_t d = absu(data[i]);
 
-    if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
-      previous_bit = 1 - previous_bit;
-      payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+    if (!waiting_half && d >= sym_min && d <= sym_max) {
+      prev_bit = 1 - prev_bit;
+      payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
       bits++;
-    } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
-      if (waiting_half_symbol) {
-        waiting_half_symbol = false;
-        payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
+      continue;
+    }
+
+    if (d >= half_min && d <= half_max) {
+      if (waiting_half) {
+        waiting_half = false;
+        payload[bits / 8] |= static_cast<uint8_t>(prev_bit << (7 - (bits & 7)));
         bits++;
       } else {
-        waiting_half_symbol = true;
+        waiting_half = true;
       }
-    } else {
-      return false;
+      continue;
     }
+
+    return false;
   }
 
   if (bits != bit_length)
     return false;
 
-  // De-obfuscate like Somfy.cpp:
-  // - bytes 0..6 are XOR chained
-  // - for 80-bit frames, last 3 bytes (7..9) are NOT XOR encoded
+  // De-obfuscate:
   uint8_t frame[10]{0};
   frame[0] = payload[0];
-  for (int i = 1; i < 7; i++) {
+  for (int i = 1; i < 7; i++)
     frame[i] = payload[i] ^ payload[i - 1];
-  }
+
   if (bit_length == 80) {
     frame[7] = payload[7];
     frame[8] = payload[8];
     frame[9] = payload[9];
   }
 
-  // Checksum for the first 7 bytes (same as your current code / Somfy.cpp)
-  uint8_t checksum = 0;
+  // Checksum first 7 bytes:
+  uint8_t cs = 0;
   for (uint8_t i = 0; i < 7; i++) {
     if (i == 1)
-      checksum = checksum ^ (frame[i] >> 4);
+      cs ^= (frame[i] >> 4);
     else
-      checksum = checksum ^ frame[i] ^ (frame[i] >> 4);
+      cs ^= frame[i] ^ (frame[i] >> 4);
   }
-  checksum &= 0x0F;
-  const uint8_t expected = frame[1] & 0x0F;
-  if (checksum != expected)
+  cs &= 0x0F;
+  if (cs != (frame[1] & 0x0F))
     return false;
 
-  // Extra 80-bit checksum validation (Somfy.cpp calc80Checksum)
+  // Extra 80-bit checksum (same math, no lambda allocation)
   if (bit_length == 80) {
-    auto calc80Checksum = [](uint8_t b0, uint8_t b1, uint8_t b2) -> uint8_t {
-      uint8_t cs80 = 0;
-      cs80 = (((b0 & 0xF0) >> 4) ^ ((b1 & 0xF0) >> 4));
-      cs80 ^= ((b2 & 0xF0) >> 4);
-      cs80 ^= (b0 & 0x0F);
-      cs80 ^= (b1 & 0x0F);
-      return cs80 & 0x0F;
-    };
+    uint8_t cs80 = 0;
+    cs80 = (((frame[7] & 0xF0) >> 4) ^ ((frame[8] & 0xF0) >> 4));
+    cs80 ^= ((frame[9] & 0xF0) >> 4);
+    cs80 ^= (frame[7] & 0x0F);
+    cs80 ^= (frame[8] & 0x0F);
+    cs80 &= 0x0F;
 
-    if ((frame[9] & 0x0F) != calc80Checksum(frame[7], frame[8], frame[9]))
+    if ((frame[9] & 0x0F) != cs80)
       return false;
-
-    // Somfy.cpp also translates extended MY variants here; for cover sync we can treat all of them as MY.
-    // If you want exact mapping later, we can port that tiny translation block too.
   }
 
-  // Extract fields (Somfy.cpp)
   command = static_cast<Command>(frame[1] >> 4);
   rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-  remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
+  remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
+                (static_cast<uint32_t>(frame[5]) << 8) |
+                frame[6];
 
   return true;
 }
