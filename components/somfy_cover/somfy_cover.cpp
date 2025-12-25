@@ -2,6 +2,7 @@
 #include "esphome/core/hal.h"
 #include "somfy_cover.h"
 #include <cstdlib>
+#include <vector>
 
 namespace esphome {
 namespace somfy_cover {
@@ -42,9 +43,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   // - detect software sync (~4850us)
   // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
   // - de-obfuscate (XOR chain) and validate checksum
-  const int n = static_cast<int>(data.size());
-  if (n < 20)
-    return false;
 
   constexpr uint32_t SYMBOL = 640;
   constexpr float TOLERANCE_MIN = 0.7f;
@@ -61,11 +59,36 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   auto absu = [](int32_t v) -> uint32_t { return static_cast<uint32_t>(std::abs(v)); };
 
+  // === NEW: normalize timings so merged ~2T pulses become two 1T half-symbols ===
+  // Some remotes merge consecutive half-symbols into ~1250–1320us pulses; the state machine expects 640us chunks.
+  std::vector<int32_t> norm;
+  norm.reserve(data.size() * 2);
+
+  for (auto t : data) {
+    const uint32_t av = absu(t);
+
+    // Estimate how many SYMBOL chunks this duration represents.
+    // Round to nearest multiple of SYMBOL, clamp to [1..4] as a safety limit.
+    uint32_t reps = (av + (SYMBOL / 2)) / SYMBOL;
+    if (reps < 1) reps = 1;
+    if (reps > 4) reps = 4;
+
+    const int32_t sign = (t < 0) ? -1 : 1;
+    for (uint32_t r = 0; r < reps; r++) {
+      norm.push_back(sign * static_cast<int32_t>(SYMBOL));
+    }
+  }
+
+  const int n = static_cast<int>(norm.size());
+  if (n < 20)
+    return false;
+  // === END NEW ===
+
   // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
   int hw_sync = 0;
   int start = -1;
   for (int i = 0; i < n; i++) {
-    const uint32_t d = absu(data[i]);
+    const uint32_t d = absu(norm[i]);   // CHANGED: data[i] -> norm[i]
     if (d >= tempo_synchro_hw_min && d <= tempo_synchro_hw_max) {
       hw_sync++;
       continue;
@@ -87,7 +110,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   int bits = 0;
 
   for (int i = start; i < n && bits < 56; i++) {
-    const uint32_t d = absu(data[i]);
+    const uint32_t d = absu(norm[i]);   // CHANGED: data[i] -> norm[i]
 
     if (d >= tempo_symbol_min && d <= tempo_symbol_max && !waiting_half_symbol) {
       previous_bit = 1 - previous_bit;
