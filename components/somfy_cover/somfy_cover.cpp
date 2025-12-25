@@ -85,6 +85,10 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
       norm.push_back(t);
     }
   }
+
+  const int n = static_cast<int>(norm.size());
+  if (n < 20)
+    return false;
   // === END NEW ===
 
   // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
