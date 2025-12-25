@@ -150,7 +150,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
       s += buf;
       if (i + 1 < n) s += ",";
     }
-    //ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
+    ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
   }
 
   // Basic de-duplication: Somfy remotes send repeats, and we may receive multiple frames per press.
