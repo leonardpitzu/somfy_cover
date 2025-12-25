@@ -96,19 +96,18 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
     if (d >= tempo_symbol_min && d <= tempo_symbol_max) {
       if (!waiting_half_symbol) {
-        // Full symbol (2T) with no pending half: toggle the bit and emit.
+        // Normal 2T symbol -> toggle bit and emit
         previous_bit = 1 - previous_bit;
         payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
         bits++;
       } else {
-        // Recovery path: treat this as two half-symbols (T + T).
-        // First half completes the pending half-symbol: emit current previous_bit.
-        waiting_half_symbol = false;
+        // Tolerate merged halves: we were waiting for the 2nd half (1T),
+        // but got a 2T duration. Treat it as:
+        //   - the missing 2nd half of the current bit (emit previous_bit)
+        //   - plus the 1st half of the next bit (stay waiting)
         payload[bits / 8] |= static_cast<uint8_t>(previous_bit << (7 - (bits % 8)));
         bits++;
-        if (bits >= 56) break;
-        // Second half starts a new pending half-symbol.
-        waiting_half_symbol = true;
+        waiting_half_symbol = true;  // still waiting for the next half-symbol
       }
     } else if (d >= tempo_half_symbol_min && d <= tempo_half_symbol_max) {
       if (waiting_half_symbol) {
@@ -119,7 +118,6 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
         waiting_half_symbol = true;
       }
     } else {
-      // Out-of-range timing: abort.
       return false;
     }
   }
