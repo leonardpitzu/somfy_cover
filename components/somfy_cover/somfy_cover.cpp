@@ -34,6 +34,12 @@ const char *SomfyCover::command_to_string_(Command cmd) {
 }
 
 bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command) {
+  // Decoder based on ESPSomfy-RTS (https://github.com/rstrouse/ESPSomfy-RTS) receive state machine (Somfy.cpp/Somfy.h reference):
+  // - detect >=4 hardware sync pulses (~4*SYMBOL)
+  // - detect software sync (~4850us)
+  // - decode 56 bits from pulse widths using the "half-symbol / symbol" accumulator
+  // - de-obfuscate (XOR chain) and validate checksum
+  
   const int n = static_cast<int>(data.size());
   if (n < 20)
     return false;
