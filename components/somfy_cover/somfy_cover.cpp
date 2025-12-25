@@ -61,27 +61,30 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   // === NEW: normalize timings so merged ~2T pulses become two 1T half-symbols ===
   // Some remotes merge consecutive half-symbols into ~1250–1320us pulses; the state machine expects 640us chunks.
+  // Normalize ONLY data pulses (T / 2T). Never touch sync pulses.
   std::vector<int32_t> norm;
   norm.reserve(data.size() * 2);
 
   for (auto t : data) {
     const uint32_t av = absu(t);
-
-    // Estimate how many SYMBOL chunks this duration represents.
-    // Round to nearest multiple of SYMBOL, clamp to [1..4] as a safety limit.
-    uint32_t reps = (av + (SYMBOL / 2)) / SYMBOL;
-    if (reps < 1) reps = 1;
-    if (reps > 4) reps = 4;
-
     const int32_t sign = (t < 0) ? -1 : 1;
-    for (uint32_t r = 0; r < reps; r++) {
+
+    // Keep hardware sync and software sync pulses intact
+    if (av >= tempo_synchro_hw_min) {
+      norm.push_back(t);
+      continue;
+    }
+
+    // Data region: split merged 2T pulses into two 1T pulses
+    if (av >= tempo_symbol_min && av <= tempo_symbol_max) {
+      // ~2T → two half-symbols
       norm.push_back(sign * static_cast<int32_t>(SYMBOL));
+      norm.push_back(sign * static_cast<int32_t>(SYMBOL));
+    } else {
+      // ~1T or slightly off → keep as-is
+      norm.push_back(t);
     }
   }
-
-  const int n = static_cast<int>(norm.size());
-  if (n < 20)
-    return false;
   // === END NEW ===
 
   // Find sync: at least 4 hardware sync pulses, then a software sync pulse.
