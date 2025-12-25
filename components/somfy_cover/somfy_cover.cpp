@@ -262,10 +262,11 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
 
   this->last_rx_ms_ = now;
 
-  const bool is_known_remote = std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) != this->receive_remote_codes_.end();
+  //const bool is_known_remote = std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) != this->receive_remote_codes_.end();
+  const bool is_known_remote = this->receive_remote_codes_.empty() || (std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) != this->receive_remote_codes_.end());
   
-  if (!this->receive_remote_codes_.empty() && !is_known_remote)
-    return true;  // ignore other remotes (but we already logged in DEBUG above)
+  //if (!this->receive_remote_codes_.empty() && !is_known_remote)
+    //return true;  // ignore other remotes (but we already logged in DEBUG above)
 
   ESP_LOGD(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code, this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
 
