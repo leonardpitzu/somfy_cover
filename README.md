@@ -174,3 +174,7 @@ The original esphome implementations were "unidirectional" in the sense that the
 The receiver/decoder component was implemented to cover this case based on the RTS decoder component from https://github.com/rstrouse/ESPSomfy-RTS
 
 All credits go to the original authors.
+
+## License
+
+Feel free to reuse the code as you please. I did this strictly for my own purpose and have no time/resources or any means to test it on something else than my original shades. It might have (read it as "it has") bugs but unless i experience them i have no way to fix them :)
