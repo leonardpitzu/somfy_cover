@@ -1,12 +1,17 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
 #include "somfy_cover.h"
-#include <cstdlib>
 
 namespace esphome {
 namespace somfy_cover {
 
 static const char *TAG = "somfy_cover.cover";
+
+bool SomfyCover::is_allowed_remote_(uint32_t code) const {
+  return this->receive_remote_codes_.empty() ||
+         (std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), code) !=
+          this->receive_remote_codes_.end());
+}
 
 const char *SomfyCover::command_to_string_(Command cmd) {
   switch (cmd) {
@@ -238,6 +243,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   if (!raw.empty()) {
     std::string s;
     const size_t n = std::min<size_t>(raw.size(), 20);
+    s.reserve(6 * n);
     for (size_t i = 0; i < n; i++) {
       char buf[16];
       snprintf(buf, sizeof(buf), "%d", (int) raw[i]);
@@ -262,7 +268,7 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
 
   this->last_rx_ms_ = now;
 
-  const bool is_known_remote = this->receive_remote_codes_.empty() || (std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), remote_code) != this->receive_remote_codes_.end());
+    const bool is_known_remote = this->is_allowed_remote_(remote_code);
 
   ESP_LOGD(TAG, "RX: remote_code=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16 "%s", remote_code, this->command_to_string_(cmd), rolling, is_known_remote ? " (known)" : "");
 
