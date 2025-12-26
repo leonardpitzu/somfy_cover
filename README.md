@@ -52,6 +52,10 @@ wifi:
   fast_connect: true
   reboot_timeout: 15min
 
+# set the log level to DEBUG in order to see details regarding detected remotes and transmitter parameters
+logger:
+  level: DEBUG
+
 api:
   reboot_timeout: 0s
 
