@@ -66,7 +66,6 @@ remote_transmitter:
 remote_receiver:
   id: receiver
   pin: GPIO03
-  dump: all
 ```
 
 
