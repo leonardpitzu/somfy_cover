@@ -232,7 +232,13 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   }
 
   // Only do expensive formatting when debug logging is enabled.
-  const bool dbg = (logger::global_logger != nullptr) && (logger::global_logger->level <= logger::LOG_LEVEL_DEBUG);
+  bool dbg = false;
+  #ifdef USE_LOGGER
+    if (logger::global_logger != nullptr) {
+      // DEBUG (and more verbose) enabled when log level is >= 4
+      dbg = logger::global_logger->get_log_level() >= 4;
+    }
+  #endif
 
   if (dbg) {
     ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
