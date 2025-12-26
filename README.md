@@ -69,6 +69,54 @@ remote_receiver:
   dump: all
 ```
 
+
+## Pairing the ESPHome “base remote” with a motor (PROG / programming)
+
+The ESPHome device acts like a **new Somfy RTS remote** identified by `remote_code`.
+Before it can control a given motor, that motor must be **paired/programmed** to accept this new remote.
+That’s what `prog_button` is for.
+
+### Requirements
+
+- Each cover **must** have its own unique `remote_code` (hex) unless you intentionally want **group control**.
+- Keep `storage_key` stable. It stores the Somfy rolling code in flash; changing it (or flashing to a fresh device without it) can desync the motor.
+
+### How it works
+
+1. Put the motor into *programming mode* using an **already paired physical remote**:
+   - Press and hold the physical remote’s **PROG** button (typically ~2 seconds) until the motor “jogs” (brief up/down).
+   - (Some motors have a small **P2/PROG** button on the head instead.)
+2. Within the programming window (usually a short period), press the matching **Prog …** button in Home Assistant for that cover.
+3. The motor should “jog” again to confirm pairing.
+4. Now use **Open/Close/Stop** from Home Assistant — the motor will accept commands from this ESPHome remote.
+
+### Defining the PROG buttons in ESPHome
+
+`prog_button` on the cover points to a normal ESPHome `button:` entity. Example:
+
+```yaml
+cover:
+  - platform: somfy_cover
+    id: livingroom_door
+    name: "Living Room Door"
+    storage_key: KeyLivingDoor
+    remote_code: 0x088331
+    prog_button: program_livingroom_door
+    # ...
+
+button:
+  - platform: template
+    id: program_livingroom_door
+    name: "Prog Living Room Door"
+    entity_category: config
+```
+
+### Notes / gotchas
+
+- Pairing is per motor: press the **Prog** button for the specific cover you’re programming.
+- Don’t spam PROG. Treat it like a configuration action.
+- To pair a new remote you need to first put the motor of the shade in pairing mode using an already paired remote.
+
 ## Detecting remote IDs (one-time setup)
 
 Create a text sensor that will display the last decoded remote ID and command:
