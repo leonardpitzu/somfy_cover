@@ -16,7 +16,7 @@
 // Libraries for SomfyRemote
 #include "NVSRollingCodeStorage.h"
 
-#define COVER_OPEN 1.0f
+#define COVER_OPEN   1.0f
 #define COVER_CLOSED 0.0f
 
 namespace esphome {
@@ -113,6 +113,7 @@ protected:
   uint32_t rx_start_ms_{0};
   float rx_start_pos_{0.0f};
   uint32_t rx_last_publish_ms_{0};
+  float rx_last_published_pos_{-1.0f};
 
   // Set via the constructor
   NVSRollingCodeStorage *storage_;
