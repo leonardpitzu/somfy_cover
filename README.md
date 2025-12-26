@@ -1,60 +1,45 @@
 # ESPHome Somfy cover remote
-This is an external component for [ESPHOME](https://esphome.io/), to control Somfy RTS covers from for example [Home Assisant](https://www.home-assistant.io/).
+
+This repository provides an **external ESPHome component** to control Somfy RTS shades using a CC1101 RF module.
+
+It supports:
+- **Transmitting** Somfy RTS commands from ESPHome/Home Assistant
+- **Receiving/decoding** Somfy RTS frames so Home Assistant stays in sync when you use a physical remote
 
 ## Required hardware
-- ESP32
-- CC1101 RF module
 
-## Setup
-Use the following ESPHome yaml as a base for your Somfy controller. Add one or more covers, depending on your needs.
-A shade can be controlled by either this controller or by physical remotes. For the state of the shade to be correctly refleced in HA each shade needs to have the remote control id's listed that control the shade.
+- ESP8266 / ESP32 / RP2040 (see ESPHome supported platforms)
+- CC1101 RF module (433 MHz)
+- 433 MHz antenna (strongly recommended)
+
+## Installation (external_components)
+
+```yaml
+external_components:
+  source: github://leonardpitzu/somfy_cover@main
+  components: [somfy_cover]
+  refresh: 600s
 ```
-allowed_remotes:
-  - 0x112233
-  - 0x445566
-```
-##  Basic how to guide:
- - generate a random ID for the new (this) remote control
- - pair this remote with the motor of the shade
- - open the web interface of this controller
- - press a button on the remote control that controls the shade
- - copy-paste the remote's id in ```allowed_remotes``` from the "Detected Remote" sensor in the web interface (or directly form HA)
- - recompile & flash/update
- - enjoy
 
-The "Detected Remote" sensor whows 3 values at once, e.g.
-```0x123456 MY 0x0123``` - this means Remote ID | Button from the remote pressed | rolling code value
+## Minimal working configuration
 
-## Generate remote code 
-The remote code is a three byte hex code.
-For example, use the website: https://www.browserling.com/tools/random-hex  
-Set to 6 digits and add `0x` in front of the generated hex number.
+This is a known-good baseline. Adjust GPIOs to your board/wiring. The pinout in this example is for the ESP32S3 (https://wiki.seeedstudio.com/xiao_esp32s3_getting_started/)
 
-## Pair the cover
-Put your cover in program mode with another remote, then use the `Prog x` button to pair with the ESP. From then on the cover should respond to the ESPHome Somfy controller. You can also connect multiple covers by pairing then one by one with the same `Program x` button.
-
-## Repeating command setting
-The *Somfy_Remote_Lib* library defaults to sending a command four times. Some devices do not handle this well and should only reveive the command one time. For these devices the optional parameter `repeat_command_count` can be set in the yaml for the cover.
-
-In order to see more information set the log level to ```DEBUG```
-
-```
+```yaml
 substitutions:
   devicename: shades
   devicelabel: Shades
 
+esphome:
+  name: ${devicename}
+
 logger:
-  level: NONE
+  # Set to DEBUG temporarily when you want to see RX decode details.
+  level: INFO
 
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  fast_connect: true
-  reboot_timeout: 15min
-
-# set the log level to DEBUG in order to see details regarding detected remotes and transmitter parameters
-logger:
-  level: DEBUG
 
 api:
   reboot_timeout: 0s
@@ -62,54 +47,12 @@ api:
 ota:
   - platform: esphome
 
-button:
-  - platform: restart
-    name: "Restart"
-    icon: mdi:restart
-    entity_category: diagnostic
-
-text_sensor:
-  - platform: wifi_info
-    ip_address:
-      name: "IP Address"
-      disabled_by_default: true
-      entity_category: diagnostic
-      icon: mdi:ip
-
-external_components:
-  source: github://leonardpitzu/somfy_cover@main
-  components: [somfy_cover]
-  refresh: 600s
-
-
-esphome:
-  comment: $devicelabel
-  name: $devicename
-  platformio_options:
-    board_build.flash_mode: dio
-
-esp32:
-  board: esp32-s3-devkitc-1
-  framework:
-    type: esp-idf
-
-web_server:
-  port: 80
-  log: false
-  local: true
-  version: 3
-
-spi:
-  clk_pin: GPIO07
-  mosi_pin: GPIO09
-  miso_pin: GPIO08
-
 cc1101:
   frequency: 433.42MHz
   cs_pin: GPIO6
 
 remote_transmitter:
-  id: "transmitter"
+  id: transmitter
   non_blocking: true
   pin: GPIO04
   carrier_duty_percent: 100%
@@ -121,64 +64,73 @@ remote_transmitter:
       - cc1101.begin_rx
 
 remote_receiver:
-  id: "receiver"
+  id: receiver
   pin: GPIO03
+  dump: all
+```
 
+## Detecting remote IDs (one-time setup)
+
+Create a text sensor that will display the last decoded remote ID and command:
+
+```yaml
 text_sensor:
   - platform: template
-    id: detected_remote
-    name: "Detected Remote"
+    id: somfy_rx_last
+    name: "Detected Somfy Remote"
+```
 
+Then add your covers. The key options are:
+
+- `detected_remote`: where decoded frames are published (for discovery)
+- `allowed_remotes`: list of physical remotes allowed to control/sync this cover
+
+```yaml
 cover:
   - platform: somfy_cover
-    id: room1
-    name: "Room 1"
+    id: livingroom_door
+    name: "Living Room Door"
     device_class: shutter
-    open_duration: 55s
-    close_duration: 55s
-    storage_key: KeyRoom1
-    remote_code: 0xabcde
-    prog_button: program_room1
-    remote_transmitter: transmitter
-    remote_receiver: receiver
-    detected_remote: detected_remote
-    allowed_remotes:
-      - 0x112233
-      - 0x445566
-  - platform: somfy_cover
-    id: room2
-    name: "Room 2"
-    device_class: shutter
-    open_duration: 55s
-    close_duration: 55s
-    storage_key: KeyRoom2
-    remote_code: 0xabcdf
-    prog_button: program_room2
-    remote_transmitter: transmitter
-    remote_receiver: receiver
-    detected_remote: detected_remote
-    allowed_remotes:
-      - 0x778899
+    open_duration: 40s
+    close_duration: 40s
 
-button:
-  - platform: template
-    id: "program_room1"
-    name: "Prog Room 1"
-    entity_category: config
-  - platform: template
-    id: "program_room2"
-    name: "Prog Room 2"
-    entity_category: config
+    storage_key: KeyLivingDoor
+
+    # The transmitter identity for this ESPHome device (hex)
+    remote_code: 0x088331
+
+    prog_button: program_livingroom_door
+    remote_transmitter: transmitter
+    remote_receiver: receiver
+
+    # Always updated on successful decode (use this to learn remotes)
+    detected_remote: somfy_rx_last
+
+    # Physical remotes that should be allowed to sync/control this cover
+    allowed_remotes:
+      - 0x92FB39
+      # - 0xA1B2C3
 ```
+
+### Workflow
+
+1. Set `logger.level: DEBUG` temporarily (optional, for more RX detail)
+2. Press a button on your physical remote
+3. Watch `text_sensor.detected_somfy_remote` in Home Assistant / ESPHome logs
+4. Copy the shown `0x......` remote ID into `allowed_remotes`
+5. Recompile and flash (usually a one-time operation)
 
 ## Credits
 
-This is based on the work of https://github.com/HarmEllis/esphome-somfy-cover-remote and https://github.com/fawick/somfy_cover_2025.12
-The original esphome implementations were "unidirectional" in the sense that the shades were controlled correctly but the changes in the shade position triggered by physical remotes were not synced back to HA.
-The receiver/decoder component was implemented to cover this case based on the RTS decoder component from https://github.com/rstrouse/ESPSomfy-RTS
+This project builds on prior work:
+- https://github.com/HarmEllis/esphome-somfy-cover-remote
+- https://github.com/fawick/somfy_cover_2025.12
+
+The receiver/decoder logic is based on the reference implementation from:
+- https://github.com/rstrouse/ESPSomfy-RTS
 
 All credits go to the original authors.
 
 ## License
 
-Feel free to reuse the code as you please. I did this strictly for my own purpose and have no time/resources or any means to test it on something else than my original shades. It might have (read it as "it has") bugs but unless i experience them i have no way to fix them :)
+Feel free to reuse the code as you please. This is provided as-is; I may fix bugs I encounter, but I cannot guarantee support for every possible edge case.
