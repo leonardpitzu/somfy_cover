@@ -1,6 +1,8 @@
 #include "esphome/core/log.h"
 #include "esphome/core/hal.h"
+#include "esphome/components/logger/logger.h"
 #include "somfy_cover.h"
+#include <cmath>
 
 namespace esphome {
 namespace somfy_cover {
@@ -8,9 +10,7 @@ namespace somfy_cover {
 static const char *TAG = "somfy_cover.cover";
 
 bool SomfyCover::is_allowed_remote_(uint32_t code) const {
-  return this->receive_remote_codes_.empty() ||
-         (std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), code) !=
-          this->receive_remote_codes_.end());
+  return this->receive_remote_codes_.empty() || (std::find(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), code) != this->receive_remote_codes_.end());
 }
 
 const char *SomfyCover::command_to_string_(Command cmd) {
@@ -47,8 +47,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
   const int n = static_cast<int>(data.size());
   // ENTRY LOG (proves decode_frame_ is actually being called for every callback)
-  ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n,
-           n > 0 ? data[0] : 0, n > 1 ? data[1] : 0);
+  ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n, n > 0 ? data[0] : 0, n > 1 ? data[1] : 0);
 
   if (n < 20) {
     ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SHORT n=%d", n);
@@ -157,10 +156,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
         } else {
           last_bad_i = i;
           last_bad_duration = duration;
-          ESP_LOGD(TAG,
-                   "RX decode FAIL_RANGE: i=%d d=%u waiting_half=%d bits=%u/%u hw_sync=%u",
-                   last_bad_i, last_bad_duration, waiting_half_symbol ? 1 : 0,
-                   cpt_bits, bit_length, last_sync_hw);
+          ESP_LOGD(TAG, "RX decode FAIL_RANGE: i=%d d=%u waiting_half=%d bits=%u/%u hw_sync=%u", last_bad_i, last_bad_duration, waiting_half_symbol ? 1 : 0, cpt_bits, bit_length, last_sync_hw);
 
           reset_to_waiting();
           i -= 1;
@@ -193,9 +189,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
               const uint8_t want = frame[9] & 0x0F;
               const uint8_t got = calc80Checksum(frame[7], frame[8], frame[9]);
               if (want != got) {
-                ESP_LOGD(TAG,
-                         "RX decode FAIL_CSUM80: want=%u got=%u hw_sync=%u frame7=0x%02X frame8=0x%02X frame9=0x%02X",
-                         want, got, last_sync_hw, frame[7], frame[8], frame[9]);
+                ESP_LOGD(TAG, "RX decode FAIL_CSUM80: want=%u got=%u hw_sync=%u frame7=0x%02X frame8=0x%02X frame9=0x%02X", want, got, last_sync_hw, frame[7], frame[8], frame[9]);
                 reset_to_waiting();
                 break;
               }
@@ -203,20 +197,14 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
             command = static_cast<Command>(frame[1] >> 4);
             rolling_code = (static_cast<uint16_t>(frame[2]) << 8) | frame[3];
-            remote_code = (static_cast<uint32_t>(frame[4]) << 16) |
-                          (static_cast<uint32_t>(frame[5]) << 8) |
-                          frame[6];
+            remote_code = (static_cast<uint32_t>(frame[4]) << 16) | (static_cast<uint32_t>(frame[5]) << 8) | frame[6];
 
-            ESP_LOGD(TAG,
-                     "decode_frame_ RETURN OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
-                     remote_code, (frame[1] >> 4), rolling_code, last_sync_hw, bit_length);
+            ESP_LOGD(TAG, "decode_frame_ RETURN OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u", remote_code, (frame[1] >> 4), rolling_code, last_sync_hw, bit_length);
 
             return true;
           }
 
-          ESP_LOGD(TAG,
-                   "RX decode FAIL_CSUM: cs=%u expected=%u hw_sync=%u bit_length=%u encKey=0x%02X cmdNibble=0x%X",
-                   checksum, expected, last_sync_hw, bit_length, frame[0], (frame[1] >> 4));
+          ESP_LOGD(TAG, "RX decode FAIL_CSUM: cs=%u expected=%u hw_sync=%u bit_length=%u encKey=0x%02X cmdNibble=0x%X", checksum, expected, last_sync_hw, bit_length, frame[0], (frame[1] >> 4));
 
           reset_to_waiting();
         }
@@ -229,9 +217,7 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
   if (!saw_any_sync) {
     ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SYNC (no SW sync found) n=%d", n);
   } else {
-    ESP_LOGD(TAG,
-             "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
-             last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
+    ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)", last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
   }
 
   return false;
@@ -239,32 +225,86 @@ bool SomfyCover::decode_frame_(const remote_base::RawTimings &data, uint32_t &re
 
 bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   const auto &raw = data.get_raw_data();
-  ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
-  if (!raw.empty()) {
-    std::string s;
-    const size_t n = std::min<size_t>(raw.size(), 20);
-    s.reserve(6 * n);
-    for (size_t i = 0; i < n; i++) {
-      char buf[16];
-      snprintf(buf, sizeof(buf), "%d", (int) raw[i]);
-      s += buf;
-      if (i + 1 < n) s += ",";
-    }
-    ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
-  }
-
   // Basic de-duplication: Somfy remotes send repeats, and we may receive multiple frames per press.
   const uint32_t now = millis();
   if (now - this->last_rx_ms_ < 150) {
     return false;
   }
 
+  // Only do expensive formatting when debug logging is enabled.
+  const bool dbg = (logger::global_logger != nullptr) && (logger::global_logger->level <= logger::LOG_LEVEL_DEBUG);
+
+  if (dbg) {
+    ESP_LOGD(TAG, "RX callback for '%s': raw_len=%u", this->name_.c_str(), (unsigned) raw.size());
+    if (!raw.empty()) {
+      std::string s;
+      const size_t n2 = std::min<size_t>(raw.size(), 20);
+      s.reserve(6 * n2);
+      for (size_t j = 0; j < n2; j++) {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", (int) raw[j]);
+        s += buf;
+        if (j + 1 < n2) s += ",";
+      }
+      ESP_LOGD(TAG, "RX first timings: %s", s.c_str());
+    }
+  }
+
+
+
+  // Cache decode across cover instances: the same RF frame is delivered to each cover listener.
+  // This avoids decoding the identical raw buffer N times per button press.
+  struct RxCache {
+    uint32_t ms{0};
+    uint16_t len{0};
+    int32_t sig[12]{0};
+    bool valid{false};
+    uint32_t remote{0};
+    uint16_t rolling{0};
+    Command cmd{Command::My};
+  };
+  static RxCache cache;
+
+  auto sig_match = [&](const remote_base::RawTimings &r) -> bool {
+    if (!cache.valid) return false;
+    if (cache.len != r.size()) return false;
+    const size_t m = std::min<size_t>(r.size(), 12);
+    for (size_t k = 0; k < m; k++) {
+      if (cache.sig[k] != r[k]) return false;
+    }
+    return true;
+  };
+
   uint32_t remote_code = 0;
   uint16_t rolling = 0;
   Command cmd = Command::My;
 
-  if (!this->decode_frame_(data.get_raw_data(), remote_code, rolling, cmd))
+  bool decoded = false;
+  if (sig_match(raw) && (now - cache.ms) < 50) {
+    remote_code = cache.remote;
+    rolling = cache.rolling;
+    cmd = cache.cmd;
+    decoded = true;
+  } else {
+    decoded = this->decode_frame_(data.get_raw_data(), remote_code, rolling, cmd);
+    if (decoded) {
+      cache.ms = now;
+      cache.len = static_cast<uint16_t>(raw.size());
+      const size_t m = std::min<size_t>(raw.size(), 12);
+      for (size_t k = 0; k < m; k++) cache.sig[k] = raw[k];
+      for (size_t k = m; k < 12; k++) cache.sig[k] = 0;
+      cache.remote = remote_code;
+      cache.rolling = rolling;
+      cache.cmd = cmd;
+      cache.valid = true;
+    } else {
+      cache.valid = false;
+   }
+  }
+
+  if (!decoded)
     return false;
+
 
   this->last_rx_ms_ = now;
 
@@ -281,43 +321,44 @@ bool SomfyCover::on_receive(remote_base::RemoteReceiveData data) {
   if (!is_known_remote)
     return true;
 
-// Keep HA UI in sync without transmitting anything.
-// We simulate movement using the configured open/close durations so HA doesn't jump instantly.
-// NOTE: We *do not* rely on TimeBasedCover's internal movement state here, because this RX update is
-// driven externally (physical remote) and we only want UI synchronization.
-auto start_rx_move = [&](cover::CoverOperation op) {
-  const uint32_t now_ms = millis();
-  this->rx_sync_active_ = true;
-  this->rx_operation_ = op;
-  this->rx_start_ms_ = now_ms;
-  this->rx_start_pos_ = this->position;
-  this->rx_last_publish_ms_ = 0;
-  this->current_operation = op;
-  this->publish_state();  // show "opening/closing" immediately (position stays as-is for now)
-};
+  // Keep HA UI in sync without transmitting anything.
+  // We simulate movement using the configured open/close durations so HA doesn't jump instantly.
+  // NOTE: We *do not* rely on TimeBasedCover's internal movement state here, because this RX update is
+  // driven externally (physical remote) and we only want UI synchronization.
+  auto start_rx_move = [&](cover::CoverOperation op) {
+    const uint32_t now_ms = millis();
+    this->rx_sync_active_ = true;
+    this->rx_operation_ = op;
+    this->rx_start_ms_ = now_ms;
+    this->rx_start_pos_ = this->position;
+    this->rx_last_publish_ms_ = 0;
+    this->rx_last_published_pos_ = -1.0f;
+    this->current_operation = op;
+    this->publish_state();  // show "opening/closing" immediately (position stays as-is for now)
+  };
 
-switch (cmd) {
-  case Command::Up:
-  case Command::MyUp:
-    start_rx_move(cover::COVER_OPERATION_OPENING);
-    break;
+  switch (cmd) {
+    case Command::Up:
+    case Command::MyUp:
+      start_rx_move(cover::COVER_OPERATION_OPENING);
+      break;
 
-  case Command::Down:
-  case Command::MyDown:
-    start_rx_move(cover::COVER_OPERATION_CLOSING);
-    break;
+    case Command::Down:
+    case Command::MyDown:
+      start_rx_move(cover::COVER_OPERATION_CLOSING);
+      break;
 
-  case Command::My:
-  case Command::UpDown:
-    // Stop: keep current position, just stop movement
-    this->rx_sync_active_ = false;
-    this->current_operation = cover::COVER_OPERATION_IDLE;
-    this->publish_state();
-    break;
+    case Command::My:
+    case Command::UpDown:
+      // Stop: keep current position, just stop movement
+      this->rx_sync_active_ = false;
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->publish_state();
+      break;
 
-  default:
-    break;
-}
+    default:
+      break;
+  }
 
   return true;
 }
@@ -387,6 +428,7 @@ void SomfyCover::loop() {
       this->position = (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? COVER_OPEN : COVER_CLOSED;
       this->rx_sync_active_ = false;
       this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->rx_last_published_pos_ = this->position;
       this->publish_state();
       return;
     }
@@ -409,14 +451,19 @@ void SomfyCover::loop() {
     this->position = new_pos;
 
     // Publish at a modest rate to keep Wi-Fi/HA traffic low, but smooth enough for UI.
-    if (this->rx_last_publish_ms_ == 0 || (now_ms - this->rx_last_publish_ms_) >= 250) {
+    // Also avoid publishing tiny position deltas that don't matter visually.
+    const bool time_ok = (this->rx_last_publish_ms_ == 0) || ((now_ms - this->rx_last_publish_ms_) >= 250);
+    const bool delta_ok = (this->rx_last_published_pos_ < 0.0f) || (std::fabs(this->position - this->rx_last_published_pos_) >= 0.01f);
+    if (time_ok && delta_ok) {
       this->rx_last_publish_ms_ = now_ms;
+      this->rx_last_published_pos_ = this->position;
       this->publish_state();
     }
 
     if (progress >= 1.0f) {
       this->rx_sync_active_ = false;
       this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->rx_last_published_pos_ = this->position;
       this->publish_state();
     }
     return;
