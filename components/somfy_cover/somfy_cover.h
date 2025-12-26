@@ -130,6 +130,8 @@ protected:
   Automation<> *automationTriggerStop_;
   SomfyCoverAction<> *actionTriggerStop_;
 
+  
+  bool is_allowed_remote_(uint32_t code) const;
   void send_command(Command command);
 
   bool decode_frame_(const remote_base::RawTimings &data, uint32_t &remote_code, uint16_t &rolling_code, Command &command);
