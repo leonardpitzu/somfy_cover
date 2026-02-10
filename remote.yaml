@@ -1,0 +1,100 @@
+substitutions:
+  devicename: shades
+  devicelabel: Shades
+
+packages:
+  common: !include packages/common.yaml
+
+external_components:
+  source: github://leonardpitzu/somfy_cover@main
+  components: [somfy_cover]
+  refresh: 600s
+
+logger:
+  # Set to DEBUG temporarily when you want to see RX decode details.
+  level: INFO
+
+esphome:
+  comment: $devicelabel
+
+esp32:
+  variant: esp32s3
+
+web_server:
+  port: 80
+  log: false
+  local: true
+  version: 3
+
+spi:
+  clk_pin: GPIO07
+  mosi_pin: GPIO09
+  miso_pin: GPIO08
+
+cc1101:
+  frequency: 433.42MHz
+  cs_pin: GPIO6
+
+remote_transmitter:
+  id: transmitter
+  non_blocking: true
+  pin: GPIO04
+  carrier_duty_percent: 100%
+  on_transmit:
+    then:
+      - cc1101.begin_tx
+  on_complete:
+    then:
+      - cc1101.begin_rx
+
+remote_receiver:
+  id: receiver
+  pin: GPIO03
+  dump: all
+
+text_sensor:
+  - platform: template
+    id: somfy_rx_last
+    name: "Detected Somfy Remote"
+
+cover:
+  - platform: somfy_cover
+    id: livingroom_door
+    name: "Living Room Door"
+    device_class: shutter
+    open_duration: 40s
+    close_duration: 40s
+    storage_key: KeyLivingDoor
+    remote_code: 0x335577
+    prog_button: program_livingroom_door
+    remote_transmitter: transmitter
+    remote_receiver: receiver
+    detected_remote: somfy_rx_last
+    allowed_remotes:
+      - 0x112233
+      - 0xABCDEF
+  - platform: somfy_cover
+    id: livingroom_door
+    name: "Living Room Window"
+    device_class: shutter
+    open_duration: 40s
+    close_duration: 40s
+    storage_key: KeyLivingWindow
+    remote_code: 0x887766
+    prog_button: program_livingroom_window
+    remote_transmitter: transmitter
+    remote_receiver: receiver
+    detected_remote: somfy_rx_last
+    allowed_remotes:
+      - 0x334455
+      - 0xAABBCC
+
+button:
+  - platform: template
+    id: "program_livingroom_door"
+    name: "Prog Living Room Door"
+    entity_category: config
+  - platform: template
+    id: "program_livingroom_window"
+    name: "Prog Living Room Window"
+    entity_category: config
