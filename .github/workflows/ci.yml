@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Weekly build to catch breakage from ESPHome updates
+    - cron: "0 6 * * 1"
+
+jobs:
+  ruff:
+    name: Lint (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - name: Check for errors
+        run: ruff check .
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: pip install -r requirements_test.txt
+      - name: Run tests
+        run: pytest tests/ -v --cov=components/somfy_cover --cov-report=term-missing
+
+  esphome-compile:
+    name: ESPHome Compile (${{ matrix.fixture }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        fixture:
+          - test_basic
+          - test_rx
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install ESPHome
+        run: pip install esphome
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-${{ runner.os }}-${{ hashFiles('components/**') }}
+          restore-keys: pio-${{ runner.os }}-
+      - name: Compile ${{ matrix.fixture }}
+        run: esphome compile tests/fixtures/${{ matrix.fixture }}.yaml

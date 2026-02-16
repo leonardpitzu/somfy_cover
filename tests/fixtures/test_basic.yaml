@@ -1,0 +1,31 @@
+# Minimal ESPHome config to compile-test the somfy_cover component (TX only).
+esphome:
+  name: test-somfy-basic
+
+esp32:
+  board: esp32dev
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+
+remote_transmitter:
+  id: transmitter
+  pin: GPIO4
+  carrier_duty_percent: 100%
+
+button:
+  - platform: template
+    id: prog_button
+    name: "Prog Button"
+
+cover:
+  - platform: somfy_cover
+    name: "Test Cover"
+    open_duration: 40s
+    close_duration: 40s
+    storage_key: TestKey
+    remote_code: 0x123456
+    prog_button: prog_button
+    remote_transmitter: transmitter
