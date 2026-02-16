@@ -5,6 +5,8 @@ esphome:
 esp32:
   board: esp32dev
 
+logger:
+
 external_components:
   - source:
       type: local
