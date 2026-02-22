@@ -180,4 +180,4 @@ All credits go to the original authors.
 
 ## License
 
-Feel free to reuse the code as you please. This is provided as-is; I may fix bugs I encounter, but I cannot guarantee support for every possible edge case.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
