@@ -2,8 +2,8 @@
 
 #include "somfy_hub_rts.h"
 #include "NVSRollingCodeStorage.h"
+#include "somfy_time_based_cover.h"
 #include "esphome/components/button/button.h"
-#include "esphome/components/time_based/cover/time_based_cover.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include <array>
@@ -43,7 +43,7 @@ public:
   }
 };
 
-class SomfyCover : public time_based::TimeBasedCover {
+class SomfyCover : public SomfyTimeBasedCover {
 public:
   void setup() override;
   void loop() override;

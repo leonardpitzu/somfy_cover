@@ -109,7 +109,7 @@ void SomfyIohcCover::setup() {
   this->has_built_in_endstop_ = true;
   this->assumed_state_ = true;
 
-  TimeBasedCover::setup();
+  SomfyTimeBasedCover::setup();
 }
 
 void SomfyIohcCover::loop() {
@@ -175,7 +175,7 @@ void SomfyIohcCover::loop() {
   }
 #endif  // USE_SOMFY_IOHC_RX
 
-  TimeBasedCover::loop();
+  SomfyTimeBasedCover::loop();
 }
 
 void SomfyIohcCover::dump_config() {
@@ -195,13 +195,13 @@ void SomfyIohcCover::dump_config() {
 }
 
 cover::CoverTraits SomfyIohcCover::get_traits() {
-  auto traits = TimeBasedCover::get_traits();
+  auto traits = SomfyTimeBasedCover::get_traits();
   traits.set_supports_tilt(false);
   return traits;
 }
 
 void SomfyIohcCover::control(const cover::CoverCall &call) {
-  TimeBasedCover::control(call);
+  SomfyTimeBasedCover::control(call);
 }
 
 // ---------------------------------------------------------------------------

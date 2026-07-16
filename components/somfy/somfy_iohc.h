@@ -7,7 +7,7 @@
 #include "somfy_hub_iohc.h"
 #include "NVSRollingCodeStorage.h"
 #include "esphome/components/button/button.h"
-#include "esphome/components/time_based/cover/time_based_cover.h"
+#include "somfy_time_based_cover.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include <algorithm>
@@ -67,7 +67,7 @@ enum class IohcMode : uint8_t {
   MODE_2W,   // Two-way (unicast, challenge/response authenticated)
 };
 
-class SomfyIohcCover : public time_based::TimeBasedCover {
+class SomfyIohcCover : public SomfyTimeBasedCover {
  public:
   void setup() override;
   void loop() override;

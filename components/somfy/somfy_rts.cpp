@@ -120,7 +120,7 @@ void SomfyCover::setup() {
   this->has_built_in_endstop_ = true;
   this->assumed_state_ = true;
 
-  TimeBasedCover::setup();
+  SomfyTimeBasedCover::setup();
 }
 
 // ---------------------------------------------------------------------------
@@ -192,19 +192,19 @@ void SomfyCover::loop() {
   }
 #endif  // USE_SOMFY_COVER_RX
 
-  TimeBasedCover::loop();
+  SomfyTimeBasedCover::loop();
 }
 
 void SomfyCover::dump_config() { ESP_LOGCONFIG(TAG, "Somfy RTS cover"); }
 
 cover::CoverTraits SomfyCover::get_traits() {
-  auto traits = TimeBasedCover::get_traits();
+  auto traits = SomfyTimeBasedCover::get_traits();
   traits.set_supports_tilt(false);
   return traits;
 }
 
 void SomfyCover::control(const cover::CoverCall &call) {
-  TimeBasedCover::control(call);
+  SomfyTimeBasedCover::control(call);
 }
 
 // ---------------------------------------------------------------------------

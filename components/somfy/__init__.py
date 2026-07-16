@@ -5,7 +5,7 @@ from esphome.const import CONF_ID, CONF_TYPE, PLATFORM_ESP32
 
 CODEOWNERS = ["@LeonardPitzu"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["button", "time_based"]
+AUTO_LOAD = ["button"]
 MULTI_CONF = True
 
 somfy_ns = cg.esphome_ns.namespace("somfy")
