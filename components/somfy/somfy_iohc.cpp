@@ -9,6 +9,7 @@
 #ifdef USE_SOMFY_IOHC_RX
 #include "esphome/components/text_sensor/text_sensor.h"
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #endif
 
@@ -22,6 +23,9 @@ namespace {
 // Window over which an identical (src, main_param) command is treated as part of
 // the remote's repeat burst rather than a fresh press.
 constexpr uint32_t RX_DEDUP_WINDOW_MS = 1500;
+// Throttle for the RX-driven position animation: at most one state publish per
+// interval, and only when the position actually moved.
+constexpr uint32_t RX_SYNC_PUBLISH_INTERVAL_MS = 250;
 // Cap how many payload bytes we render to hex (foreign EXECUTE frames are short).
 constexpr size_t RX_HEX_MAX_BYTES = 16;
 
@@ -86,7 +90,17 @@ void SomfyIohcCover::setup() {
   });
 
   // Wire up time-based cover triggers
-  this->bind_command_triggers_([this] { this->open(); }, [this] { this->close(); }, [this] { this->stop(); });
+  this->open_action_ = std::make_unique<SomfyIohcAction<>>([this] { this->open(); });
+  this->open_automation_ = std::make_unique<Automation<>>(this->get_open_trigger());
+  this->open_automation_->add_action(this->open_action_.get());
+
+  this->close_action_ = std::make_unique<SomfyIohcAction<>>([this] { this->close(); });
+  this->close_automation_ = std::make_unique<Automation<>>(this->get_close_trigger());
+  this->close_automation_->add_action(this->close_action_.get());
+
+  this->stop_action_ = std::make_unique<SomfyIohcAction<>>([this] { this->stop(); });
+  this->stop_automation_ = std::make_unique<Automation<>>(this->get_stop_trigger());
+  this->stop_automation_->add_action(this->stop_action_.get());
 
   this->prog_button_->add_on_press_callback([this]() { this->program(); });
 
@@ -417,6 +431,77 @@ void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
       // Unknown / position command: leave UI untouched (discovery already logged).
       break;
   }
+}
+
+void SomfyIohcCover::start_rx_sync(cover::CoverOperation op) {
+  this->rx_sync_active_ = true;
+  this->rx_operation_ = op;
+  this->rx_start_ms_ = millis();
+  this->rx_start_pos_ = this->position;
+  this->rx_last_publish_ms_ = 0;
+  this->rx_last_published_pos_ = -1.0f;
+  this->current_operation = op;
+  this->publish_state();
+}
+
+void SomfyIohcCover::stop_rx_sync() {
+  this->rx_sync_active_ = false;
+  this->current_operation = cover::COVER_OPERATION_IDLE;
+  this->publish_state();
+}
+
+void SomfyIohcCover::loop() {
+  if (this->rx_sync_active_) {
+    const uint32_t now_ms = millis();
+    const bool opening = this->rx_operation_ == cover::COVER_OPERATION_OPENING;
+
+    const uint32_t full_dur_ms = opening ? this->open_duration_ : this->close_duration_;
+    const float target = opening ? cover::COVER_OPEN : cover::COVER_CLOSED;
+
+    // Only the remaining travel takes time, so a half-open cover reaches the
+    // end stop in half the configured duration.
+    float remaining = std::fabs(target - this->rx_start_pos_);
+    if (remaining < 0.0f)
+      remaining = 0.0f;
+    if (remaining > 1.0f)
+      remaining = 1.0f;
+
+    const uint32_t dur_ms = static_cast<uint32_t>(static_cast<float>(full_dur_ms) * remaining);
+    if (dur_ms == 0) {
+      this->position = target;
+      this->rx_last_published_pos_ = this->position;
+      this->stop_rx_sync();
+      return;
+    }
+
+    const uint32_t elapsed = now_ms - this->rx_start_ms_;
+    const float progress = (elapsed >= dur_ms) ? 1.0f : (static_cast<float>(elapsed) / static_cast<float>(dur_ms));
+
+    float new_pos = this->rx_start_pos_ + (target - this->rx_start_pos_) * progress;
+    if (new_pos < cover::COVER_CLOSED)
+      new_pos = cover::COVER_CLOSED;
+    if (new_pos > cover::COVER_OPEN)
+      new_pos = cover::COVER_OPEN;
+    this->position = new_pos;
+
+    const bool time_ok =
+        (this->rx_last_publish_ms_ == 0) || ((now_ms - this->rx_last_publish_ms_) >= RX_SYNC_PUBLISH_INTERVAL_MS);
+    const bool delta_ok =
+        (this->rx_last_published_pos_ < 0.0f) || (std::fabs(this->position - this->rx_last_published_pos_) >= 0.01f);
+    if (time_ok && delta_ok) {
+      this->rx_last_publish_ms_ = now_ms;
+      this->rx_last_published_pos_ = this->position;
+      this->publish_state();
+    }
+
+    if (progress >= 1.0f) {
+      this->rx_last_published_pos_ = this->position;
+      this->stop_rx_sync();
+    }
+    return;
+  }
+
+  SomfyTimeBasedCover::loop();
 }
 
 #endif  // USE_SOMFY_IOHC_RX

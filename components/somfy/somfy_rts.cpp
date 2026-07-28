@@ -1,4 +1,7 @@
 #include "somfy_rts.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "esphome/core/log.h"
 #ifdef USE_SOMFY_COVER_RX
 #include "esphome/components/text_sensor/text_sensor.h"
@@ -258,3 +261,5 @@ void SomfyCover::send_command(RtsCommand command) {
 
 } // namespace somfy
 } // namespace esphome
+
+#endif  // USE_SOMFY_RTS

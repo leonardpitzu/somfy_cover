@@ -1,5 +1,9 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "esphome/core/component.h"
 #include "esphome/components/remote_transmitter/remote_transmitter.h"
 #include <array>
@@ -117,3 +121,5 @@ class SomfyRtsHub : public Component
 
 }  // namespace somfy
 }  // namespace esphome
+
+#endif  // USE_SOMFY_RTS

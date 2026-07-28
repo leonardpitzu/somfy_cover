@@ -65,9 +65,25 @@ enum class IohcMode : uint8_t {
   MODE_2W,   // Two-way (unicast, challenge/response authenticated)
 };
 
+/// Action wrapper that runs a plain callback when a cover trigger fires.
+template<typename... Ts> class SomfyIohcAction : public Action<Ts...> {
+ public:
+  explicit SomfyIohcAction(std::function<void()> callback) : callback_(std::move(callback)) {}
+  void play(Ts... x) override {
+    if (this->callback_)
+      this->callback_();
+  }
+
+ protected:
+  std::function<void()> callback_;
+};
+
 class SomfyIohcCover : public SomfyTimeBasedCover {
  public:
   void setup() override;
+#ifdef USE_SOMFY_IOHC_RX
+  void loop() override;
+#endif
   void dump_config() override;
 
   // Configuration setters
@@ -115,6 +131,14 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Rolling code storage
   std::unique_ptr<NVSRollingCodeStorage> storage_;
 
+  // Cover trigger wiring (open/close/stop -> radio commands)
+  std::unique_ptr<Automation<>> open_automation_;
+  std::unique_ptr<Automation<>> close_automation_;
+  std::unique_ptr<Automation<>> stop_automation_;
+  std::unique_ptr<SomfyIohcAction<>> open_action_;
+  std::unique_ptr<SomfyIohcAction<>> close_action_;
+  std::unique_ptr<SomfyIohcAction<>> stop_action_;
+
   // Commands
   void open();
   void close();
@@ -149,6 +173,17 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   uint16_t rx_dedup_param_{0};
   uint32_t rx_dedup_ms_{0};
   bool rx_dedup_valid_{false};
+
+  // Physical-remote UI animation state.
+  bool rx_sync_active_{false};
+  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
+  uint32_t rx_start_ms_{0};
+  float rx_start_pos_{0.0f};
+  uint32_t rx_last_publish_ms_{0};
+  float rx_last_published_pos_{-1.0f};
+
+  void start_rx_sync(cover::CoverOperation op);
+  void stop_rx_sync();
 
   bool is_allowed_remote_(uint32_t code) const;
   // Decode the MainParameter from a CMD_EXECUTE packet (foreign remote command).

@@ -1,4 +1,7 @@
 #include "somfy_hub_rts.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "esphome/core/log.h"
 #ifdef USE_SOMFY_COVER_RX
 #include "esphome/components/logger/logger.h"
@@ -431,3 +434,5 @@ bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
 
 }  // namespace somfy
 }  // namespace esphome
+
+#endif  // USE_SOMFY_RTS

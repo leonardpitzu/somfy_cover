@@ -1,5 +1,9 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "somfy_hub_rts.h"
 #include "NVSRollingCodeStorage.h"
 #include "somfy_time_based_cover.h"
@@ -119,3 +123,5 @@ protected:
 
 } // namespace somfy
 } // namespace esphome
+
+#endif  // USE_SOMFY_RTS
