@@ -15,6 +15,7 @@ from somfy.cover import (
     CONF_TARGET_NODE,
     IOHC_MODE_1W,
     IOHC_MODE_2W,
+    iohc_uses_rx,
     uses_rx,
     validate_iohc_config,
 )
@@ -39,6 +40,34 @@ class TestUsesRxForIohc:
     ])
     def test_detection(self, config, expected):
         assert uses_rx(config) is expected
+
+
+class TestIohcUsesRx:
+    """2W is bidirectional by definition, so RX is compiled in whether or not
+    the cover opts in. 1W is broadcast-only and mirrors the RTS opt-in."""
+
+    @pytest.mark.parametrize("config,expected", [
+        ({CONF_IOHC_MODE: IOHC_MODE_2W}, True),
+        ({CONF_IOHC_MODE: IOHC_MODE_2W, CONF_ALLOWED_REMOTES: []}, True),
+        ({CONF_IOHC_MODE: IOHC_MODE_1W}, False),
+        ({CONF_IOHC_MODE: IOHC_MODE_1W, CONF_ALLOWED_REMOTES: [0x112233]}, True),
+        ({CONF_IOHC_MODE: IOHC_MODE_1W, CONF_DETECTED_REMOTE: "sensor_id"}, True),
+        ({}, False),
+    ], ids=[
+        "2w-bare-still-gets-rx",
+        "2w-empty-allowed-still-gets-rx",
+        "1w-bare-no-rx",
+        "1w-allowed-opts-in",
+        "1w-detected-opts-in",
+        "no-mode-defaults-to-1w",
+    ])
+    def test_gating(self, config, expected):
+        assert iohc_uses_rx(config) is expected
+
+    def test_rts_helper_is_unaffected(self):
+        """uses_rx() stays protocol-agnostic -- only the iohc wrapper knows about
+        modes -- so an RTS cover can never be given RX by accident."""
+        assert uses_rx({CONF_IOHC_MODE: IOHC_MODE_2W}) is False
 
 
 # ---------------------------------------------------------------------------

@@ -44,8 +44,22 @@ jobs:
           cache-dependency-path: requirements_test.txt
       - name: Install test dependencies
         run: pip install -r requirements_test.txt
+      # Floor is a ratchet against regression, not a target. Much of cover.py is
+      # async to_code() codegen that only the ESPHome compile jobs exercise.
       - name: Run tests
-        run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing
+        run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing --cov-fail-under=50
+
+  cpp-tests:
+    name: Host tests (C++)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # Compiles the real component sources against stubs in tests/cpp/stubs.
+      # Covers cover state-sync and protocol maths, which an `esphome compile`
+      # cannot: a firmware build succeeding says nothing about behaviour.
+      - name: Run C++ suites
+        run: tests/cpp/run.sh
 
   esphome-compile:
     name: ESPHome Compile (${{ matrix.fixture }})
@@ -56,6 +70,7 @@ jobs:
         fixture:
           - test_rts_tx_only
           - test_rts_rx
+          - test_iohc_1w
           - test_iohc_2w
     steps:
       - uses: actions/checkout@v7

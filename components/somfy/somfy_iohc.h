@@ -7,6 +7,7 @@
 #include "somfy_hub_iohc.h"
 #include "NVSRollingCodeStorage.h"
 #include "esphome/components/button/button.h"
+#include "rx_sync_animator.h"
 #include "somfy_time_based_cover.h"
 #include "esphome/core/component.h"
 #include <algorithm>
@@ -175,12 +176,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   bool rx_dedup_valid_{false};
 
   // Physical-remote UI animation state.
-  bool rx_sync_active_{false};
-  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
-  uint32_t rx_start_ms_{0};
-  float rx_start_pos_{0.0f};
-  uint32_t rx_last_publish_ms_{0};
-  float rx_last_published_pos_{-1.0f};
+  RxSyncAnimator rx_sync_;
 
   void start_rx_sync(cover::CoverOperation op);
   void stop_rx_sync();

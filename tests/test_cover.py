@@ -102,7 +102,7 @@ class TestImports:
         "CONF_SOMFY_STORAGE_KEY", "CONF_SOMFY_STORAGE_NAMESPACE",
         "IOHC_MODE_1W", "IOHC_MODE_2W",
         "COMMON_COVER_FIELDS",
-        "validate_iohc_config", "validate_rts_config", "uses_rx",
+        "validate_iohc_config", "validate_rts_config", "uses_rx", "iohc_uses_rx",
         "find_hub_config", "FINAL_VALIDATE_SCHEMA",
     ]
 

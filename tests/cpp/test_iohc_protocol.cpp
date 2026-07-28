@@ -1,10 +1,10 @@
 // Host-side golden-vector tests for the io-homecontrol protocol core.
 //
 // Builds and runs on the developer machine (no ESP32/ESPHome/mbedTLS needed).
-// AES-128-ECB is provided by macOS CommonCrypto as a trusted oracle so the
-// test validates our framing/CRC/checksum/IV/MAC math, not an AES impl.
+// AES-128-ECB comes from the platform crypto library as a trusted oracle, so
+// the test validates our framing/CRC/checksum/IV/MAC math, not an AES impl.
 //
-// Build & run:  tests/cpp/run.sh   (or see that script for the clang++ line)
+// Build & run:  tests/cpp/run.sh   (or see that script for the compiler line)
 //
 // Golden vectors are sourced from and cross-checked against the reference
 // implementation Velocet/iown-homecontrol (scripts/Iown-ioCrypto.py + aes.py),
@@ -12,17 +12,23 @@
 
 #include "../../components/somfy/iohc_protocol.h"
 
+#ifdef __APPLE__
 #include <CommonCrypto/CommonCryptor.h>
+#else
+#include <openssl/evp.h>
+#endif
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 using namespace esphome::somfy;
 
-// --- AES oracle (CommonCrypto, AES-128-ECB, no padding) --------------------
+// --- AES oracle (AES-128-ECB, single block, no padding) --------------------
+#ifdef __APPLE__
 static void aes128_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
   size_t moved = 0;
   CCCryptorStatus s = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, key,
@@ -32,6 +38,22 @@ static void aes128_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[
     std::exit(2);
   }
 }
+#else
+static void aes128_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  int len = 0;
+  bool ok = ctx != nullptr && EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, key, nullptr) == 1;
+  if (ok) {
+    EVP_CIPHER_CTX_set_padding(ctx, 0);
+    ok = EVP_EncryptUpdate(ctx, out, &len, in, 16) == 1 && len == 16;
+  }
+  EVP_CIPHER_CTX_free(ctx);
+  if (!ok) {
+    std::fprintf(stderr, "AES oracle failure (OpenSSL)\n");
+    std::exit(2);
+  }
+}
+#endif
 
 // --- tiny test harness -----------------------------------------------------
 static int g_failures = 0;

@@ -77,6 +77,18 @@ def uses_rx(config):
     return bool(config.get(CONF_ALLOWED_REMOTES))
 
 
+def iohc_uses_rx(config):
+    """Return True if an iohc cover needs the RX state-sync code compiled in.
+
+    io-homecontrol 2W is bidirectional by definition -- the node reports back --
+    so RX is always built in for it. 1W is a broadcast-only protocol like RTS,
+    so there RX is opt-in via allowed_remotes/detected_remote.
+    """
+    if config.get(CONF_IOHC_MODE, IOHC_MODE_1W) == IOHC_MODE_2W:
+        return True
+    return uses_rx(config)
+
+
 def validate_rts_config(config, hub_config):
     """Validate an RTS cover against the hub it references.
 
@@ -255,10 +267,10 @@ async def _to_code_iohc(config):
     else:
         cg.add(var.set_mode(IohcMode.MODE_1W))
 
-    # RX state-sync (mirrors the RTS allowed_remotes/detected_remote feature).
-    # Compiled in only when actually requested, so plain TX-only iohc covers
-    # pull in no extra code or the text_sensor dependency.
-    if uses_rx(config):
+    # RX state-sync. Always on for 2W (bidirectional by definition); for 1W it
+    # mirrors the RTS allowed_remotes/detected_remote opt-in, so plain TX-only
+    # 1W covers pull in no extra code or the text_sensor dependency.
+    if iohc_uses_rx(config):
         cg.add_define("USE_SOMFY_IOHC_RX")
         for code in config.get(CONF_ALLOWED_REMOTES, []):
             cg.add(var.add_receive_remote_code(code))
