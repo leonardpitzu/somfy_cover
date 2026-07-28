@@ -1,19 +1,17 @@
 #pragma once
 
-#include "esphome/core/defines.h"
-
-#ifdef USE_SOMFY_RTS
-
 #include "somfy_hub_rts.h"
 #include "NVSRollingCodeStorage.h"
 #include "somfy_time_based_cover.h"
 #include "esphome/components/button/button.h"
+#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
-#include <algorithm>
 #include <array>
-#include <cstdint>
+#include <cinttypes>
+#include <cstddef>
+#include <functional>
 #include <memory>
-#include <vector>
+#include <algorithm>
 
 #ifdef USE_SOMFY_COVER_RX
 namespace esphome {
@@ -26,9 +24,29 @@ class TextSensor;
 namespace esphome {
 namespace somfy {
 
+struct CoverPosition {
+  static constexpr float OPEN = 1.0f;
+  static constexpr float CLOSED = 0.0f;
+  static constexpr float UNKNOWN = -1.0f;
+  static constexpr float MIN_PUBLISH_DELTA = 0.01f;
+};
+
+// Helper class to attach cover functions to the time based cover triggers
+template <typename... Ts> class SomfyCoverAction : public Action<Ts...> {
+public:
+  std::function<void(Ts...)> callback;
+  explicit SomfyCoverAction(std::function<void(Ts...)> callback)
+      : callback(callback) {}
+  void play(Ts... x) override {
+    if (callback)
+      callback(x...);
+  }
+};
+
 class SomfyCover : public SomfyTimeBasedCover {
 public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
 
   void set_hub(SomfyRtsHub *hub) { this->hub_ = hub; }
@@ -47,7 +65,11 @@ public:
   void set_storage_key(const char *key) { this->storage_key_ = key; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
 
+  cover::CoverTraits get_traits() override;
+
 protected:
+  void control(const cover::CoverCall &call) override;
+
   // Hub reference (owns radio)
   SomfyRtsHub *hub_{nullptr};
 
@@ -65,6 +87,12 @@ protected:
 #ifdef USE_SOMFY_COVER_RX
   std::vector<uint32_t> receive_remote_codes_;
   text_sensor::TextSensor *log_text_sensor_{nullptr};
+  bool rx_sync_active_{false};
+  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
+  uint32_t rx_start_ms_{0};
+  float rx_start_pos_{CoverPosition::CLOSED};
+  uint32_t rx_last_publish_ms_{0};
+  float rx_last_published_pos_{CoverPosition::UNKNOWN};
 
   // RX handler (registered on hub)
   void on_rts_frame_(const RtsDecodedFrame &frame);
@@ -79,9 +107,15 @@ protected:
   void close();
   void stop();
   void program();
+
+  // Automations
+  std::unique_ptr<Automation<>> automationTriggerUp_{nullptr};
+  std::unique_ptr<SomfyCoverAction<>> actionTriggerUp_{nullptr};
+  std::unique_ptr<Automation<>> automationTriggerDown_{nullptr};
+  std::unique_ptr<SomfyCoverAction<>> actionTriggerDown_{nullptr};
+  std::unique_ptr<Automation<>> automationTriggerStop_{nullptr};
+  std::unique_ptr<SomfyCoverAction<>> actionTriggerStop_{nullptr};
 };
 
 } // namespace somfy
 } // namespace esphome
-
-#endif  // USE_SOMFY_RTS

@@ -1,9 +1,5 @@
 #pragma once
 
-#include "esphome/core/defines.h"
-
-#ifdef USE_SOMFY_RTS
-
 #include "esphome/core/component.h"
 #include "esphome/components/remote_transmitter/remote_transmitter.h"
 #include <array>
@@ -57,15 +53,11 @@ struct RtsTiming {
   static constexpr uint32_t RX_DEDUP_WINDOW_MS = 150;
   static constexpr uint32_t RX_CACHE_WINDOW_MS = 50;
   static constexpr size_t RX_CACHE_SIGNATURE_LEN = 12;
+  static constexpr uint32_t RX_PUBLISH_INTERVAL_MS = 250;
 };
 
 // Callback type for RX frame notifications
 using RtsRxCallback = std::function<void(const RtsDecodedFrame &frame)>;
-
-#ifdef USE_SOMFY_COVER_RX
-// Human-readable name of an RTS command ("UP", "DOWN", …, "UNKNOWN").
-const char *rts_command_name(RtsCommand cmd);
-#endif
 
 /// RTS radio hub — owns the remote_transmitter (and optionally remote_receiver).
 /// Devices register for RX callbacks and call send_frame() for TX.
@@ -76,6 +68,7 @@ class SomfyRtsHub : public Component
 {
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
 
   // Configuration
@@ -109,15 +102,6 @@ class SomfyRtsHub : public Component
  protected:
   remote_transmitter::RemoteTransmitterComponent *remote_transmitter_{nullptr};
 
-  // TX scratch buffers. Kept per-hub (not function-local statics) so multiple
-  // hubs cannot clobber each other, and reused across frames so a transmit does
-  // not reallocate.
-  remote_base::RawTimings tx_timings_;
-  remote_base::RawTimings tx_sync_;
-  remote_base::RawTimings tx_first_sync_;
-  remote_base::RawTimings tx_gap_;
-  remote_base::RawTimings tx_data_;
-
 #ifdef USE_SOMFY_COVER_RX
   remote_receiver::RemoteReceiverComponent *remote_receiver_{nullptr};
   std::vector<RtsRxCallback> rx_callbacks_;
@@ -125,22 +109,11 @@ class SomfyRtsHub : public Component
   // RX dedup state
   uint32_t last_rx_ms_{0};
 
-  // Decode cache: the receiver hands us the same burst several times, so a
-  // matching signature within a short window skips a full re-decode.
-  struct RxCache {
-    uint32_t ms{0};
-    uint16_t len{0};
-    int32_t sig[RtsTiming::RX_CACHE_SIGNATURE_LEN]{0};
-    bool valid{false};
-    RtsDecodedFrame frame{};
-  };
-  RxCache rx_cache_;
-
   bool decode_frame_(const remote_base::RawTimings &data, RtsDecodedFrame &decoded, bool debug_log = false);
+  static const char *command_to_string_(RtsCommand cmd);
 #endif
+
 };
 
 }  // namespace somfy
 }  // namespace esphome
-
-#endif  // USE_SOMFY_RTS
