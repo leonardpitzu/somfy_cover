@@ -55,6 +55,11 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
+      # The protocol test uses OpenSSL as an independent AES oracle on Linux
+      # (CommonCrypto on macOS). Installed explicitly rather than relying on
+      # whatever the runner image happens to ship.
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
       # Compiles the real component sources against stubs in tests/cpp/stubs.
       # Covers cover state-sync and protocol maths, which an `esphome compile`
       # cannot: a firmware build succeeding says nothing about behaviour.

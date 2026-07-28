@@ -17,7 +17,12 @@ CXX="${CXX:-c++}"
 CXXFLAGS=(-std=c++17 -O1 -Wall -Wextra)
 # The components follow ESPHome's C++20-leaning style and its non-virtual
 # component destructors; neither is a defect worth failing the suite over.
-COMPONENT_WARNINGS=(-Wno-c++20-extensions -Wno-delete-non-abstract-non-virtual-dtor)
+# The spellings differ between compilers, and both reject the other's.
+if "$CXX" --version 2>&1 | grep -qi clang; then
+  COMPONENT_WARNINGS=(-Wno-c++20-extensions -Wno-delete-non-abstract-non-virtual-dtor)
+else
+  COMPONENT_WARNINGS=(-Wno-delete-non-virtual-dtor)
+fi
 
 # Single token, so a plain string works and sidesteps bash 3.2's unbound-variable
 # error on empty array expansion under `set -u`.

@@ -157,8 +157,9 @@ static void test_publishes_are_throttled() {
   int publishes = 0;
   run_for(anim, now, 5000, &publishes);  // 250 loop iterations at 50 Hz
 
+  const int max_publishes = static_cast<int>(5000 / RxSyncAnimator::PUBLISH_INTERVAL_MS) + 1;
   check(publishes > 0, "publishes something while travelling");
-  check(publishes <= 5000 / RxSyncAnimator::PUBLISH_INTERVAL_MS + 1, "at most one publish per interval");
+  check(publishes <= max_publishes, "at most one publish per interval");
 }
 
 /// A second start() must fully reset the animation, including publish throttling.

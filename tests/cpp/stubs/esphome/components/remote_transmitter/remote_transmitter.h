@@ -3,6 +3,8 @@
 #include "esphome/components/remote_base/remote_base.h"
 #include "esphome/core/component.h"
 
+#include <cstdint>
+
 namespace esphome {
 namespace remote_transmitter {
 

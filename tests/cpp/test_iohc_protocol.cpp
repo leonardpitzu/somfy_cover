@@ -12,7 +12,14 @@
 
 #include "../../components/somfy/iohc_protocol.h"
 
-#ifdef __APPLE__
+// Pick the platform crypto library for the oracle. Define
+// SOMFY_TEST_AES_OPENSSL to force the OpenSSL path, which is what CI uses --
+// that way the branch can be verified from a macOS dev box too.
+#if defined(__APPLE__) && !defined(SOMFY_TEST_AES_OPENSSL)
+#define SOMFY_TEST_AES_COMMONCRYPTO 1
+#endif
+
+#ifdef SOMFY_TEST_AES_COMMONCRYPTO
 #include <CommonCrypto/CommonCryptor.h>
 #else
 #include <openssl/evp.h>
@@ -28,7 +35,7 @@
 using namespace esphome::somfy;
 
 // --- AES oracle (AES-128-ECB, single block, no padding) --------------------
-#ifdef __APPLE__
+#ifdef SOMFY_TEST_AES_COMMONCRYPTO
 static void aes128_ecb(const uint8_t key[16], const uint8_t in[16], uint8_t out[16]) {
   size_t moved = 0;
   CCCryptorStatus s = CCCrypt(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode, key,

@@ -3,6 +3,7 @@
 #include "esphome/core/helpers.h"
 
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <string>
 

@@ -2,6 +2,8 @@
 
 #include "esphome/core/hal.h"
 
+#include <cstdint>
+
 namespace esphome {
 
 class Application {
