@@ -1,6 +1,7 @@
 import esphome.codegen as cg
-from esphome.components import button, cover, text_sensor
 import esphome.config_validation as cv
+import esphome.final_validate as fv
+from esphome.components import button, cover, text_sensor
 from esphome.const import (
     CONF_CLOSE_DURATION,
     CONF_ID,
@@ -9,15 +10,19 @@ from esphome.const import (
     PLATFORM_ESP32,
 )
 
-somfy_ns = cg.esphome_ns.namespace("somfy")
+from . import (
+    CONF_REMOTE_RECEIVER,
+    DOMAIN,
+    SomfyIohcHub,
+    SomfyRtsHub,
+    somfy_ns,
+)
 
 CODEOWNERS = ["@LeonardPitzu"]
 DEPENDENCIES = ["esp32"]
 
 SomfyCover = somfy_ns.class_("SomfyCover", cover.Cover, cg.Component)
 SomfyIohcCover = somfy_ns.class_("SomfyIohcCover", cover.Cover, cg.Component)
-SomfyRtsHub = somfy_ns.class_("SomfyRtsHub", cg.Component)
-SomfyIohcHub = somfy_ns.class_("SomfyIohcHub", cg.Component)
 # IohcMode is a C++ `enum class`, so codegen must scope it (IohcMode::MODE_1W).
 IohcMode = somfy_ns.enum("IohcMode", is_class=True)
 
@@ -32,7 +37,6 @@ CONF_PROG_BUTTON = "prog_button"
 # RTS-specific
 CONF_ALLOWED_REMOTES = "allowed_remotes"
 CONF_DETECTED_REMOTE = "detected_remote"
-CONF_REMOTE_RECEIVER = "remote_receiver"
 
 # iohc-specific
 CONF_ENCRYPTION_KEY = "encryption_key"
@@ -70,28 +74,36 @@ def uses_rx(config):
     """
     if config.get(CONF_DETECTED_REMOTE):
         return True
-    if config.get(CONF_ALLOWED_REMOTES):
-        return True
-    return False
+    return bool(config.get(CONF_ALLOWED_REMOTES))
 
 
-def validate_rts_config(config):
-    """Validate RTS cover config: allowed_remotes/detected_remote require remote_receiver.
+def validate_rts_config(config, hub_config):
+    """Validate an RTS cover against the hub it references.
 
-    Note: This cannot be wired into the cover schema because remote_receiver
-    lives on the hub config, not the cover config. The actual enforcement is
-    done at compile time via the USE_SOMFY_COVER_RX define.
+    ``allowed_remotes`` / ``detected_remote`` only do anything when the hub owns
+    a ``remote_receiver``; without one the RX code is not compiled in at all.
+    ``hub_config`` is the referenced hub's config, or None when it cannot be
+    resolved (in which case validation is skipped rather than guessed at).
     """
-    has_receiver = CONF_REMOTE_RECEIVER in config
-    has_allowed = bool(config.get(CONF_ALLOWED_REMOTES))
-    has_detected = CONF_DETECTED_REMOTE in config
+    if not uses_rx(config):
+        return config
+    if hub_config is None or CONF_REMOTE_RECEIVER in hub_config:
+        return config
+    raise cv.Invalid(
+        f"'{CONF_ALLOWED_REMOTES}' and '{CONF_DETECTED_REMOTE}' need the somfy "
+        f"hub to have a '{CONF_REMOTE_RECEIVER}' configured"
+    )
 
-    if (has_allowed or has_detected) and not has_receiver:
-        raise cv.Invalid(
-            f"'{CONF_REMOTE_RECEIVER}' is required when "
-            f"'{CONF_ALLOWED_REMOTES}' or '{CONF_DETECTED_REMOTE}' is set"
-        )
-    return config
+
+def find_hub_config(full_config, hub_id):
+    """Return the somfy hub config with the given id, or None if absent."""
+    hubs = full_config.get(DOMAIN) or []
+    if isinstance(hubs, dict):  # not MULTI_CONF (shouldn't happen, be lenient)
+        hubs = [hubs]
+    for hub in hubs:
+        if str(hub.get(CONF_ID)) == str(hub_id):
+            return hub
+    return None
 
 
 # Common fields shared by both RTS and iohc covers
@@ -158,6 +170,20 @@ CONFIG_SCHEMA = cv.All(
     ),
     cv.only_on([PLATFORM_ESP32]),
 )
+
+
+def _final_validate(config):
+    # remote_receiver lives on the hub, so this cross-component check can only
+    # run once the whole config is known. Without it a cover configured with
+    # allowed_remotes against a receiver-less hub fails later with a cryptic C++
+    # compile error instead of a config message.
+    if config[CONF_TYPE] == TYPE_RTS:
+        hub_config = find_hub_config(fv.full_config.get(), config[CONF_SOMFY_ID])
+        validate_rts_config(config, hub_config)
+    return config
+
+
+FINAL_VALIDATE_SCHEMA = _final_validate
 
 
 async def to_code(config):

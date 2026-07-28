@@ -1,14 +1,18 @@
 #include "somfy_hub_rts.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "esphome/core/log.h"
 #ifdef USE_SOMFY_COVER_RX
 #include "esphome/components/logger/logger.h"
+#include <algorithm>
+#include <cinttypes>
 #endif
-#include <cmath>
 
 namespace esphome {
 namespace somfy {
 
-static const char *TAG = "somfy.rts.hub";
+static const char *const TAG = "somfy.rts.hub";
 
 // ---------------------------------------------------------------------------
 // Frame struct (internal to TX/RX encoding, not exposed in header)
@@ -35,8 +39,6 @@ void SomfyRtsHub::setup() {
   }
 #endif
 }
-
-void SomfyRtsHub::loop() {}
 
 void SomfyRtsHub::dump_config() {
   ESP_LOGCONFIG(TAG, "Somfy RTS Hub:");
@@ -86,18 +88,15 @@ static void build_gap(remote_base::RawTimings &t) {
 }
 
 void SomfyRtsHub::send_frame(const std::array<uint8_t, 7> &frame_bytes, uint8_t repeat_count) {
-  static remote_base::RawTimings tx;
-  static remote_base::RawTimings sync;
-  static remote_base::RawTimings first_sync;
-  static remote_base::RawTimings gap;
-  static remote_base::RawTimings data;
-
-  // Build invariant parts once
-  if (sync.empty()) {
-    build_sync(sync, RtsTiming::REPEAT_FRAME_SYNC_COUNT);
-    build_sync(first_sync, RtsTiming::FIRST_FRAME_SYNC_COUNT);
-    build_gap(gap);
+  // Build invariant parts once per hub
+  if (this->tx_sync_.empty()) {
+    build_sync(this->tx_sync_, RtsTiming::REPEAT_FRAME_SYNC_COUNT);
+    build_sync(this->tx_first_sync_, RtsTiming::FIRST_FRAME_SYNC_COUNT);
+    build_gap(this->tx_gap_);
   }
+
+  auto &data = this->tx_data_;
+  auto &tx = this->tx_timings_;
 
   // Build data every frame (rolling code changes).
   const size_t expected_data_timings = static_cast<size_t>(RtsFrame::SHORT_FRAME_BITS) * 2;
@@ -106,22 +105,22 @@ void SomfyRtsHub::send_frame(const std::array<uint8_t, 7> &frame_bytes, uint8_t 
   data.clear();
   build_data(data, frame_bytes);
 
-  const size_t first_frame_size = first_sync.size() + data.size() + gap.size();
-  const size_t repeated_frame_size = sync.size() + data.size() + gap.size();
+  const size_t first_frame_size = this->tx_first_sync_.size() + data.size() + this->tx_gap_.size();
+  const size_t repeated_frame_size = this->tx_sync_.size() + data.size() + this->tx_gap_.size();
   const size_t required = first_frame_size + repeated_frame_size * static_cast<size_t>(repeat_count);
   if (tx.capacity() < required)
     tx.reserve(required);
 
   tx.clear();
 
-  tx.insert(tx.end(), first_sync.begin(), first_sync.end());
+  tx.insert(tx.end(), this->tx_first_sync_.begin(), this->tx_first_sync_.end());
   tx.insert(tx.end(), data.begin(), data.end());
-  tx.insert(tx.end(), gap.begin(), gap.end());
+  tx.insert(tx.end(), this->tx_gap_.begin(), this->tx_gap_.end());
 
   for (int i = 0; i < repeat_count; i++) {
-    tx.insert(tx.end(), sync.begin(), sync.end());
+    tx.insert(tx.end(), this->tx_sync_.begin(), this->tx_sync_.end());
     tx.insert(tx.end(), data.begin(), data.end());
-    tx.insert(tx.end(), gap.begin(), gap.end());
+    tx.insert(tx.end(), this->tx_gap_.begin(), this->tx_gap_.end());
   }
 
   auto call = this->remote_transmitter_->transmit();
@@ -135,7 +134,7 @@ void SomfyRtsHub::send_frame(const std::array<uint8_t, 7> &frame_bytes, uint8_t 
 
 #ifdef USE_SOMFY_COVER_RX
 
-const char *SomfyRtsHub::command_to_string_(RtsCommand cmd) {
+const char *rts_command_name(RtsCommand cmd) {
   switch (cmd) {
     case RtsCommand::My:      return "MY";
     case RtsCommand::Up:      return "UP";
@@ -153,7 +152,8 @@ const char *SomfyRtsHub::command_to_string_(RtsCommand cmd) {
 bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedFrame &decoded_frame, bool debug_log) {
   const int n = static_cast<int>(data.size());
   if (debug_log) {
-    ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n, n > 0 ? data[0] : 0, n > 1 ? data[1] : 0);
+    ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n, n > 0 ? static_cast<int>(data[0]) : 0,
+             n > 1 ? static_cast<int>(data[1]) : 0);
   }
 
   if (n < 20) {
@@ -264,7 +264,8 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
           last_bad_duration = duration;
           if (debug_log) {
             ESP_LOGD(TAG, "RX decode FAIL_RANGE: i=%d d=%u waiting_half=%d bits=%u/%u hw_sync=%u", last_bad_i,
-                     last_bad_duration, waiting_half_symbol ? 1 : 0, cpt_bits, bit_length, last_sync_hw);
+                     static_cast<unsigned>(last_bad_duration), waiting_half_symbol ? 1 : 0, cpt_bits, bit_length,
+                     last_sync_hw);
           }
 
           reset_to_waiting();
@@ -315,8 +316,8 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
 
             if (debug_log) {
               ESP_LOGD(TAG, "decode_frame_ RETURN OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
-                       decoded_frame.remote_code, (frame.bytes[1] >> 4), decoded_frame.rolling_code, last_sync_hw,
-                       bit_length);
+                       static_cast<unsigned>(decoded_frame.remote_code), (frame.bytes[1] >> 4),
+                       decoded_frame.rolling_code, last_sync_hw, bit_length);
             }
 
             return true;
@@ -341,7 +342,7 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
       ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SYNC (no SW sync found) n=%d", n);
     } else {
       ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
-               last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
+               last_sync_hw, last_sync_bitlen, last_bad_i, static_cast<unsigned>(last_bad_duration));
     }
   }
 
@@ -369,14 +370,7 @@ bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
   }
 
   // Cache decode across callbacks
-  struct RxCache {
-    uint32_t ms{0};
-    uint16_t len{0};
-    int32_t sig[RtsTiming::RX_CACHE_SIGNATURE_LEN]{0};
-    bool valid{false};
-    RtsDecodedFrame frame{};
-  };
-  static RxCache cache;
+  auto &cache = this->rx_cache_;
 
   auto sig_match = [&](const remote_base::RawTimings &r) -> bool {
     if (!cache.valid) return false;
@@ -416,7 +410,7 @@ bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
 
   if (dbg) {
     ESP_LOGD(TAG, "RX decoded: remote=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16,
-             decoded.remote_code, command_to_string_(decoded.command), decoded.rolling_code);
+             decoded.remote_code, rts_command_name(decoded.command), decoded.rolling_code);
   }
 
   // Dispatch to all registered callbacks
@@ -431,3 +425,5 @@ bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
 
 }  // namespace somfy
 }  // namespace esphome
+
+#endif  // USE_SOMFY_RTS

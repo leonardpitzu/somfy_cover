@@ -20,6 +20,10 @@ def _install_esphome_mocks():
     cv.Invalid = Invalid
     esphome.config_validation = cv
 
+    # --- esphome.final_validate (cross-component validation hook) ---
+    final_validate = MagicMock()
+    esphome.final_validate = final_validate
+
     # --- esphome.const (only the symbols our modules actually import) ---
     const = MagicMock()
     const.CONF_CLOSE_DURATION = "close_duration"
@@ -38,6 +42,7 @@ def _install_esphome_mocks():
         "esphome.codegen": esphome.codegen,
         "esphome.config_validation": cv,
         "esphome.const": const,
+        "esphome.final_validate": final_validate,
         "esphome.components": components,
         "esphome.components.button": components.button,
         "esphome.components.remote_transmitter": components.remote_transmitter,

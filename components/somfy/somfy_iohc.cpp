@@ -9,22 +9,16 @@
 #ifdef USE_SOMFY_IOHC_RX
 #include "esphome/components/text_sensor/text_sensor.h"
 #include <cinttypes>
-#include <cmath>
 #include <cstdio>
 #endif
 
 namespace esphome {
 namespace somfy {
 
-static const char *TAG = "somfy.iohc";
+static const char *const TAG = "somfy.iohc";
 
 #ifdef USE_SOMFY_IOHC_RX
 namespace {
-// Cover position bounds + publish throttling for RX-driven UI animation.
-constexpr float RX_POS_OPEN = 1.0f;
-constexpr float RX_POS_CLOSED = 0.0f;
-constexpr float RX_MIN_PUBLISH_DELTA = 0.01f;
-constexpr uint32_t RX_PUBLISH_INTERVAL_MS = 250;
 // Window over which an identical (src, main_param) command is treated as part of
 // the remote's repeat burst rather than a fresh press.
 constexpr uint32_t RX_DEDUP_WINDOW_MS = 1500;
@@ -92,17 +86,7 @@ void SomfyIohcCover::setup() {
   });
 
   // Wire up time-based cover triggers
-  this->automation_open_ = std::make_unique<Automation<>>(this->get_open_trigger());
-  this->action_open_ = std::make_unique<IohcAction<>>([this]() { this->open(); });
-  this->automation_open_->add_action(this->action_open_.get());
-
-  this->automation_close_ = std::make_unique<Automation<>>(this->get_close_trigger());
-  this->action_close_ = std::make_unique<IohcAction<>>([this]() { this->close(); });
-  this->automation_close_->add_action(this->action_close_.get());
-
-  this->automation_stop_ = std::make_unique<Automation<>>(this->get_stop_trigger());
-  this->action_stop_ = std::make_unique<IohcAction<>>([this]() { this->stop(); });
-  this->automation_stop_->add_action(this->action_stop_.get());
+  this->bind_command_triggers_([this] { this->open(); }, [this] { this->close(); }, [this] { this->stop(); });
 
   this->prog_button_->add_on_press_callback([this]() { this->program(); });
 
@@ -112,78 +96,12 @@ void SomfyIohcCover::setup() {
   SomfyTimeBasedCover::setup();
 }
 
-void SomfyIohcCover::loop() {
-#ifdef USE_SOMFY_IOHC_RX
-  if (this->rx_sync_active_) {
-    const uint32_t now_ms = millis();
-
-    const uint32_t full_dur_ms = (this->rx_operation_ == cover::COVER_OPERATION_OPENING)
-                                     ? this->open_duration_
-                                     : this->close_duration_;
-    float remaining = 1.0f;
-    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
-      remaining = RX_POS_OPEN - this->rx_start_pos_;
-    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
-      remaining = this->rx_start_pos_ - RX_POS_CLOSED;
-    }
-    if (remaining < 0.0f) remaining = 0.0f;
-    if (remaining > 1.0f) remaining = 1.0f;
-
-    const uint32_t dur_ms = static_cast<uint32_t>(static_cast<float>(full_dur_ms) * remaining);
-
-    if (dur_ms == 0) {
-      this->position = (this->rx_operation_ == cover::COVER_OPERATION_OPENING) ? RX_POS_OPEN : RX_POS_CLOSED;
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->rx_last_published_pos_ = this->position;
-      this->publish_state();
-      return;
-    }
-
-    const uint32_t elapsed = now_ms - this->rx_start_ms_;
-    float progress = (elapsed >= dur_ms) ? 1.0f : (static_cast<float>(elapsed) / static_cast<float>(dur_ms));
-
-    float new_pos = this->rx_start_pos_;
-    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
-      new_pos = this->rx_start_pos_ + (RX_POS_OPEN - this->rx_start_pos_) * progress;
-    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
-      new_pos = this->rx_start_pos_ + (RX_POS_CLOSED - this->rx_start_pos_) * progress;
-    }
-
-    if (new_pos < RX_POS_CLOSED) new_pos = RX_POS_CLOSED;
-    if (new_pos > RX_POS_OPEN) new_pos = RX_POS_OPEN;
-
-    this->position = new_pos;
-
-    const bool time_ok = (this->rx_last_publish_ms_ == 0) ||
-                         ((now_ms - this->rx_last_publish_ms_) >= RX_PUBLISH_INTERVAL_MS);
-    const bool delta_ok = (this->rx_last_published_pos_ < RX_POS_CLOSED) ||
-                          (std::fabs(this->position - this->rx_last_published_pos_) >= RX_MIN_PUBLISH_DELTA);
-    if (time_ok && delta_ok) {
-      this->rx_last_publish_ms_ = now_ms;
-      this->rx_last_published_pos_ = this->position;
-      this->publish_state();
-    }
-
-    if (progress >= 1.0f) {
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->rx_last_published_pos_ = this->position;
-      this->publish_state();
-    }
-    return;
-  }
-#endif  // USE_SOMFY_IOHC_RX
-
-  SomfyTimeBasedCover::loop();
-}
-
 void SomfyIohcCover::dump_config() {
   ESP_LOGCONFIG(TAG, "Somfy iohc cover:");
-  ESP_LOGCONFIG(TAG, "  Node ID: 0x%06X", this->node_id_);
+  ESP_LOGCONFIG(TAG, "  Node ID: 0x%06" PRIX32, this->node_id_);
   ESP_LOGCONFIG(TAG, "  Mode: %s", this->mode_ == IohcMode::MODE_2W ? "2W (bidirectional)" : "1W (broadcast)");
   if (this->mode_ == IohcMode::MODE_2W) {
-    ESP_LOGCONFIG(TAG, "  Target node: 0x%06X", this->target_node_);
+    ESP_LOGCONFIG(TAG, "  Target node: 0x%06" PRIX32, this->target_node_);
   }
   ESP_LOGCONFIG(TAG, "  Storage: %s/%s", this->storage_namespace_, this->storage_key_);
   ESP_LOGCONFIG(TAG, "  Custom key: %s", this->has_custom_key_ ? "yes" : "no (transfer key)");
@@ -194,22 +112,12 @@ void SomfyIohcCover::dump_config() {
 #endif
 }
 
-cover::CoverTraits SomfyIohcCover::get_traits() {
-  auto traits = SomfyTimeBasedCover::get_traits();
-  traits.set_supports_tilt(false);
-  return traits;
-}
-
-void SomfyIohcCover::control(const cover::CoverCall &call) {
-  SomfyTimeBasedCover::control(call);
-}
-
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
 
 void SomfyIohcCover::open() {
-  ESP_LOGD(TAG, "OPEN node=0x%06X mode=%s", this->node_id_,
+  ESP_LOGD(TAG, "OPEN node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
     this->send_2w_command(iohc_cmd::MP_OPEN);
@@ -218,7 +126,7 @@ void SomfyIohcCover::open() {
 }
 
 void SomfyIohcCover::close() {
-  ESP_LOGD(TAG, "CLOSE node=0x%06X mode=%s", this->node_id_,
+  ESP_LOGD(TAG, "CLOSE node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
     this->send_2w_command(iohc_cmd::MP_CLOSE);
@@ -227,7 +135,7 @@ void SomfyIohcCover::close() {
 }
 
 void SomfyIohcCover::stop() {
-  ESP_LOGD(TAG, "STOP node=0x%06X mode=%s", this->node_id_,
+  ESP_LOGD(TAG, "STOP node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
     this->send_2w_command(iohc_cmd::MP_STOP);
@@ -236,8 +144,8 @@ void SomfyIohcCover::stop() {
 }
 
 void SomfyIohcCover::program() {
-  ESP_LOGI(TAG, "PROG (pair): node=0x%06X -> dest=BROADCAST(0x%06X) repeat=%d",
-           this->node_id_, iohc::BROADCAST_ADDR, this->repeat_count_);
+  ESP_LOGI(TAG, "PROG (pair): node=0x%06" PRIX32 " -> dest=BROADCAST(0x%06" PRIX32 ") repeat=%d", this->node_id_,
+           static_cast<uint32_t>(iohc::BROADCAST_ADDR), this->repeat_count_);
 
   // Step 1: CMD_REMOVE_CONTROLLER (0x39) carries a single data byte (0x00).
   uint8_t remove_data[1] = {0x00};
@@ -280,7 +188,7 @@ void SomfyIohcCover::send_1w_command(uint16_t main_param) {
       0x00,  // FP1
       0x00,  // FP2
   };
-  ESP_LOGD(TAG, "TX EXECUTE 1W: src=0x%06X dst=BROADCAST mp=0x%04X", this->node_id_, main_param);
+  ESP_LOGD(TAG, "TX EXECUTE 1W: src=0x%06" PRIX32 " dst=BROADCAST mp=0x%04X", this->node_id_, main_param);
   auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, sizeof(data), iohc::BROADCAST_ADDR);
   this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
 }
@@ -310,7 +218,7 @@ void SomfyIohcCover::send_2w_command(uint16_t main_param) {
 
 void SomfyIohcCover::on_2w_result_(bool success, const IohcDecodedPacket *response) {
   if (success) {
-    ESP_LOGD(TAG, "2W command acknowledged by 0x%06X", this->target_node_);
+    ESP_LOGD(TAG, "2W command acknowledged by 0x%06" PRIX32, this->target_node_);
     if (response && response->data_len > 0) {
       // Parse status byte if present (CMD 0xFE: first data byte is status code)
       if (response->cmd == 0xFE && response->data_len >= 1) {
@@ -323,7 +231,7 @@ void SomfyIohcCover::on_2w_result_(bool success, const IohcDecodedPacket *respon
       }
     }
   } else {
-    ESP_LOGW(TAG, "2W command to 0x%06X failed (no response)", this->target_node_);
+    ESP_LOGW(TAG, "2W command to 0x%06" PRIX32 " failed (no response)", this->target_node_);
   }
 }
 
@@ -397,7 +305,7 @@ std::vector<uint8_t> SomfyIohcCover::build_1w_frame(uint8_t cmd, const uint8_t *
   frame.push_back(static_cast<uint8_t>(crc & 0xFF));
   frame.push_back(static_cast<uint8_t>((crc >> 8) & 0xFF));
 
-  ESP_LOGD(TAG, "1W frame cmd=0x%02X dst=0x%06X seq=%u crc=0x%04X ctrl0=0x%02X (%u B)", cmd, dest_node,
+  ESP_LOGD(TAG, "1W frame cmd=0x%02X dst=0x%06" PRIX32 " seq=%u crc=0x%04X ctrl0=0x%02X (%u B)", cmd, dest_node,
            sequence, crc, frame[0], static_cast<unsigned>(frame.size()));
   return frame;
 }
@@ -453,8 +361,8 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
   if (this->mode_ == IohcMode::MODE_2W && pkt.src_node != this->target_node_)
     return;
 
-  ESP_LOGD(TAG, "RX for node 0x%06X: src=0x%06X cmd=0x%02X rssi=%.1f",
-           this->node_id_, pkt.src_node, pkt.cmd, pkt.rssi);
+  ESP_LOGD(TAG, "RX for node 0x%06" PRIX32 ": src=0x%06" PRIX32 " cmd=0x%02X rssi=%.1f", this->node_id_,
+           pkt.src_node, pkt.cmd, pkt.rssi);
 }
 
 #ifdef USE_SOMFY_IOHC_RX
@@ -494,29 +402,16 @@ bool SomfyIohcCover::rx_is_duplicate_(uint32_t src, uint16_t main_param) {
 }
 
 void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
-  auto start_rx_move = [this](cover::CoverOperation op) {
-    this->rx_sync_active_ = true;
-    this->rx_operation_ = op;
-    this->rx_start_ms_ = millis();
-    this->rx_start_pos_ = this->position;
-    this->rx_last_publish_ms_ = 0;
-    this->rx_last_published_pos_ = -1.0f;
-    this->current_operation = op;
-    this->publish_state();
-  };
-
   switch (main_param) {
     case iohc_cmd::MP_OPEN:
-      start_rx_move(cover::COVER_OPERATION_OPENING);
+      this->start_rx_sync(cover::COVER_OPERATION_OPENING);
       break;
     case iohc_cmd::MP_CLOSE:
-      start_rx_move(cover::COVER_OPERATION_CLOSING);
+      this->start_rx_sync(cover::COVER_OPERATION_CLOSING);
       break;
     case iohc_cmd::MP_STOP:
     case iohc_cmd::MP_MY:
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->publish_state();
+      this->stop_rx_sync();
       break;
     default:
       // Unknown / position command: leave UI untouched (discovery already logged).

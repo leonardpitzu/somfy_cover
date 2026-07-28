@@ -1,12 +1,14 @@
 import esphome.codegen as cg
 import esphome.config_validation as cv
-from esphome.components import remote_transmitter, remote_receiver
+from esphome.components import remote_receiver, remote_transmitter
 from esphome.const import CONF_ID, CONF_TYPE, PLATFORM_ESP32
 
 CODEOWNERS = ["@LeonardPitzu"]
 DEPENDENCIES = ["esp32"]
 AUTO_LOAD = ["button"]
 MULTI_CONF = True
+
+DOMAIN = "somfy"
 
 somfy_ns = cg.esphome_ns.namespace("somfy")
 SomfyRtsHub = somfy_ns.class_("SomfyRtsHub", cg.Component)
@@ -55,6 +57,7 @@ async def to_code(config):
     if typ == TYPE_RTS:
         var = cg.new_Pvariable(config[CONF_ID])
         await cg.register_component(var, config)
+        cg.add_define("USE_SOMFY_RTS")
 
         tx = await cg.get_variable(config[CONF_REMOTE_TRANSMITTER])
         cg.add(var.set_remote_transmitter(tx))

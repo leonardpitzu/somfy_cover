@@ -1,0 +1,69 @@
+# Minimal ESPHome config to compile-test the somfy iohc cover (2W, with RX sync).
+esphome:
+  name: test-somfy-iohc
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+
+logger:
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+
+spi:
+  clk_pin: GPIO07
+  mosi_pin: GPIO09
+  miso_pin: GPIO08
+
+cc1101:
+  id: cc1101_radio
+  cs_pin: GPIO6
+  gdo0_pin: GPIO04
+  frequency: 868.95MHz
+  modulation_type: 2-FSK
+  symbol_rate: 38400
+  fsk_deviation: 19.2kHz
+  filter_bandwidth: 100kHz
+  manchester: false
+  packet_mode: true
+  packet_length: 0
+  crc_enable: false
+  sync_mode: "16/16"
+  sync1: 0xFF
+  sync0: 0x33
+  num_preamble: 4
+
+somfy:
+  - id: iohc_radio
+    type: iohc
+    cc1101_id: cc1101_radio
+
+button:
+  - platform: template
+    id: prog_button
+    name: "Prog Button"
+
+text_sensor:
+  - platform: template
+    id: detected
+    name: "Detected iohc Remote"
+
+cover:
+  - platform: somfy
+    type: iohc
+    name: "Test iohc Cover"
+    open_duration: 25s
+    close_duration: 25s
+    storage_key: TestKey
+    remote_code: 0xAABBCC
+    prog_button: prog_button
+    somfy_id: iohc_radio
+    mode: 2w
+    target_node: 0xDEADBE
+    encryption_key: "000102030405060708090A0B0C0D0E0F"
+    detected_remote: detected
+    allowed_remotes:
+      - 0x112233

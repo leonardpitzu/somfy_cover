@@ -1,7 +1,7 @@
 """Tests for iohc 2W (bidirectional) config validation."""
 
+import esphome.config_validation as cv
 import pytest
-
 from somfy.cover import (
     CONF_ENCRYPTION_KEY,
     CONF_IOHC_MODE,
@@ -9,9 +9,6 @@ from somfy.cover import (
     IOHC_MODE_2W,
     validate_iohc_config,
 )
-
-import esphome.config_validation as cv
-
 
 # ---------------------------------------------------------------------------
 # Happy paths

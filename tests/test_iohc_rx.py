@@ -7,7 +7,6 @@ the iohc validator stays neutral about the RX fields.
 """
 
 import pytest
-
 from somfy.cover import (
     CONF_ALLOWED_REMOTES,
     CONF_DETECTED_REMOTE,
@@ -19,7 +18,6 @@ from somfy.cover import (
     uses_rx,
     validate_iohc_config,
 )
-
 
 # ---------------------------------------------------------------------------
 # uses_rx() gates whether RX-sync code is compiled for an iohc cover

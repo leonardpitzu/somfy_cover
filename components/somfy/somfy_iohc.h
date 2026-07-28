@@ -8,11 +8,9 @@
 #include "NVSRollingCodeStorage.h"
 #include "esphome/components/button/button.h"
 #include "somfy_time_based_cover.h"
-#include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <vector>
 
@@ -70,7 +68,6 @@ enum class IohcMode : uint8_t {
 class SomfyIohcCover : public SomfyTimeBasedCover {
  public:
   void setup() override;
-  void loop() override;
   void dump_config() override;
 
   // Configuration setters
@@ -96,14 +93,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void set_log_text_sensor(text_sensor::TextSensor *ts) { this->log_text_sensor_ = ts; }
 #endif
 
-  void set_open_duration(uint32_t ms) { this->open_duration_ = ms; }
-  void set_close_duration(uint32_t ms) { this->close_duration_ = ms; }
-
-  cover::CoverTraits get_traits() override;
-
  protected:
-  void control(const cover::CoverCall &call) override;
-
   // Hub reference (owns radio)
   SomfyIohcHub *hub_{nullptr};
   button::Button *prog_button_{nullptr};
@@ -151,12 +141,6 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // RX state-sync: keep HA in sync with physical io-homecontrol remotes.
   std::vector<uint32_t> receive_remote_codes_;
   text_sensor::TextSensor *log_text_sensor_{nullptr};
-  bool rx_sync_active_{false};
-  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
-  uint32_t rx_start_ms_{0};
-  float rx_start_pos_{0.0f};
-  uint32_t rx_last_publish_ms_{0};
-  float rx_last_published_pos_{-1.0f};
 
   // Repeat-burst suppression: a physical remote transmits the same frame several
   // times back-to-back (and the CC1101 hands us each copy separately). Collapse
@@ -175,22 +159,6 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Drive the HA UI animation in response to a recognised foreign command.
   void handle_rx_command_(uint16_t main_param);
 #endif
-
-  // Action helper for time-based cover triggers
-  template<typename... Ts> class IohcAction : public Action<Ts...> {
-   public:
-    std::function<void(Ts...)> callback;
-    explicit IohcAction(std::function<void(Ts...)> cb) : callback(cb) {}
-    void play(Ts... x) override { if (callback) callback(x...); }
-  };
-
-  // Automations
-  std::unique_ptr<Automation<>> automation_open_;
-  std::unique_ptr<Automation<>> automation_close_;
-  std::unique_ptr<Automation<>> automation_stop_;
-  std::unique_ptr<IohcAction<>> action_open_;
-  std::unique_ptr<IohcAction<>> action_close_;
-  std::unique_ptr<IohcAction<>> action_stop_;
 };
 
 }  // namespace somfy

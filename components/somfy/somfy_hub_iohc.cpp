@@ -5,13 +5,16 @@
 #include "iohc_protocol.h"
 #include "esphome/core/log.h"
 #include "esphome/core/helpers.h"
+#include <cinttypes>
 #include <cstring>
+// AES on ESP32/ESP-IDF needs the IDF mbedTLS config selected before the header.
+#define MBEDTLS_CONFIG_FILE "mbedtls/esp_config.h"
 #include <mbedtls/aes.h>
 
 namespace esphome {
 namespace somfy {
 
-static const char *TAG = "somfy.iohc.hub";
+static const char *const TAG = "somfy.iohc.hub";
 
 // ---------------------------------------------------------------------------
 // Shared helpers
@@ -27,10 +30,6 @@ void aes128_ecb_encrypt(const uint8_t key[16], const uint8_t plaintext[16], uint
   mbedtls_aes_setkey_enc(&ctx, key, 128);
   mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, plaintext, ciphertext);
   mbedtls_aes_free(&ctx);
-}
-
-void compute_2w_checksum(const uint8_t *data, size_t len, uint8_t &chk1, uint8_t &chk2) {
-  iohc_proto::rolling_checksum(data, len, chk1, chk2);
 }
 
 void compute_2w_response(const uint8_t key[16], const uint8_t *frame_data, size_t frame_len,
@@ -89,14 +88,14 @@ void SomfyIohcHub::transmit_packet(const std::vector<uint8_t> &frame, uint8_t re
   // hand the CC1101 a fixed-length packet (no variable-length prefix byte goes
   // on air). The hardware sync word (0x7FD9) supplies the leading 16 sync bits;
   // the codec emits the remaining 4 sync bits + the UART-framed frame.
-  std::vector<uint8_t> payload;
+  auto &payload = this->tx_payload_;
   iohc_proto::uart_encode(frame.data(), frame.size(), payload);
   this->cc1101_->set_packet_length(static_cast<uint8_t>(payload.size()));
 
-  ESP_LOGD(TAG, "TX 1W logical (%u B): %s", static_cast<unsigned>(frame.size()),
-           format_hex_pretty(frame).c_str());
-  ESP_LOGV(TAG, "TX 1W on-air (%u B): %s", static_cast<unsigned>(payload.size()),
-           format_hex_pretty(payload).c_str());
+  ESP_LOGD(TAG, "TX 1W: %u logical / %u on-air bytes, %d repeats", static_cast<unsigned>(frame.size()),
+           static_cast<unsigned>(payload.size()), repeat_count);
+  ESP_LOGV(TAG, "TX 1W logical: %s", format_hex_pretty(frame).c_str());
+  ESP_LOGV(TAG, "TX 1W on-air: %s", format_hex_pretty(payload).c_str());
 
   for (int i = 0; i < repeat_count; i++) {
     auto err = this->cc1101_->transmit_packet(payload);
@@ -109,8 +108,6 @@ void SomfyIohcHub::transmit_packet(const std::vector<uint8_t> &frame, uint8_t re
   // Restore the fixed-length RX capture window before resuming reception.
   this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW);
   this->cc1101_->begin_rx();
-  ESP_LOGD(TAG, "TX 1W: %u logical / %u on-air bytes, %d repeats", frame.size(), payload.size(),
-           repeat_count);
 }
 
 void SomfyIohcHub::begin_rx() {
@@ -196,7 +193,7 @@ void SomfyIohcHub::send_2w_command(uint32_t src_node, uint32_t dest_node, uint8_
   this->start_2w_listen();
   this->send_2w_frame_(src_node, dest_node, cmd, data, data_len);
 
-  ESP_LOGD(TAG, "2W session started: src=0x%06X dst=0x%06X cmd=0x%02X", src_node, dest_node, cmd);
+  ESP_LOGD(TAG, "2W session started: src=0x%06" PRIX32 " dst=0x%06" PRIX32 " cmd=0x%02X", src_node, dest_node, cmd);
 }
 
 // ---------------------------------------------------------------------------
@@ -281,7 +278,7 @@ void SomfyIohcHub::send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
   // 2W frames are sent once on the current channel (868.95 MHz = ch1)
   this->configure_radio_2w(1);
   // Apply the same UART-8N1 physical encoding + fixed-length packet as 1W.
-  std::vector<uint8_t> payload;
+  auto &payload = this->tx_payload_;
   iohc_proto::uart_encode(frame.data(), frame.size(), payload);
   this->cc1101_->set_packet_length(static_cast<uint8_t>(payload.size()));
   auto err = this->cc1101_->transmit_packet(payload);
@@ -290,7 +287,8 @@ void SomfyIohcHub::send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
   }
   this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW);
   this->cc1101_->begin_rx();
-  ESP_LOGD(TAG, "TX 2W: cmd=0x%02X %u logical / %u on-air bytes", cmd, frame.size(), payload.size());
+  ESP_LOGD(TAG, "TX 2W: cmd=0x%02X %u logical / %u on-air bytes", cmd, static_cast<unsigned>(frame.size()),
+           static_cast<unsigned>(payload.size()));
 }
 
 // ---------------------------------------------------------------------------
@@ -302,7 +300,7 @@ void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
   // The CC1101 captures a fixed-size window of raw on-air bytes after the
   // hardware sync match (0x7FD9). Strip the io-homecontrol UART 8N1 framing to
   // recover the logical frame bytes (this is what the documented captures show).
-  std::vector<uint8_t> packet;
+  auto &packet = this->rx_frame_;
   iohc_proto::uart_decode(raw.data(), raw.size(), packet);
 
   // ctrl0 low 5 bits = frame length excluding ctrl0 and the trailing 2-byte
@@ -338,8 +336,8 @@ void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
   pkt.rssi = rssi;
   pkt.lqi = lqi;
 
-  ESP_LOGD(TAG, "RX: src=0x%06X dst=0x%06X cmd=0x%02X rssi=%.1f len=%u",
-           pkt.src_node, pkt.dest_node, pkt.cmd, rssi, packet.size());
+  ESP_LOGD(TAG, "RX: src=0x%06" PRIX32 " dst=0x%06" PRIX32 " cmd=0x%02X rssi=%.1f len=%u", pkt.src_node,
+           pkt.dest_node, pkt.cmd, rssi, static_cast<unsigned>(packet.size()));
 
   // Handle 2W session packets
   this->handle_2w_packet_(pkt);
@@ -371,7 +369,7 @@ void SomfyIohcHub::handle_2w_packet_(const IohcDecodedPacket &pkt) {
       // Expecting 0x3C (Challenge Request) from actuator
       if (pkt.cmd == iohc::CMD_CHALLENGE_REQUEST && pkt.data_len >= 6) {
         memcpy(this->session_.challenge, pkt.data, 6);
-        ESP_LOGD(TAG, "2W: Challenge received from 0x%06X", pkt.src_node);
+        ESP_LOGD(TAG, "2W: Challenge received from 0x%06" PRIX32, pkt.src_node);
 
         // Compute response from the original frame payload (dest+src+cmd+data)
         uint8_t response[6];

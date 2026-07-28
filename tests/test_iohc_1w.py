@@ -1,7 +1,6 @@
 """Tests for iohc 1W (one-way) specific behaviour."""
 
 import pytest
-
 from somfy.cover import (
     CONF_ENCRYPTION_KEY,
     CONF_IOHC_MODE,

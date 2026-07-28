@@ -56,6 +56,7 @@ jobs:
         fixture:
           - test_rts_tx_only
           - test_rts_rx
+          - test_iohc_2w
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
