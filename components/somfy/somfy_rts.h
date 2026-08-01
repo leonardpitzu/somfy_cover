@@ -6,6 +6,7 @@
 
 #include "somfy_hub_rts.h"
 #include "NVSRollingCodeStorage.h"
+#include "rx_sync_animator.h"
 #include "somfy_time_based_cover.h"
 #include "esphome/components/button/button.h"
 #include "esphome/core/automation.h"
@@ -15,6 +16,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <vector>
 #include <algorithm>
 
 #ifdef USE_SOMFY_COVER_RX
@@ -27,13 +29,6 @@ class TextSensor;
 
 namespace esphome {
 namespace somfy {
-
-struct CoverPosition {
-  static constexpr float OPEN = 1.0f;
-  static constexpr float CLOSED = 0.0f;
-  static constexpr float UNKNOWN = -1.0f;
-  static constexpr float MIN_PUBLISH_DELTA = 0.01f;
-};
 
 // Helper class to attach cover functions to the time based cover triggers
 template <typename... Ts> class SomfyCoverAction : public Action<Ts...> {
@@ -91,16 +86,15 @@ protected:
 #ifdef USE_SOMFY_COVER_RX
   std::vector<uint32_t> receive_remote_codes_;
   text_sensor::TextSensor *log_text_sensor_{nullptr};
-  bool rx_sync_active_{false};
-  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
-  uint32_t rx_start_ms_{0};
-  float rx_start_pos_{CoverPosition::CLOSED};
-  uint32_t rx_last_publish_ms_{0};
-  float rx_last_published_pos_{CoverPosition::UNKNOWN};
+
+  // Physical-remote UI animation state.
+  RxSyncAnimator rx_sync_;
 
   // RX handler (registered on hub)
   void on_rts_frame_(const RtsDecodedFrame &frame);
   bool is_allowed_remote_(uint32_t code) const;
+  void start_rx_sync_(cover::CoverOperation op);
+  void stop_rx_sync_();
 #endif
 
   // TX

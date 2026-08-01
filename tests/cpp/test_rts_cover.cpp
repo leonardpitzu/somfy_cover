@@ -94,10 +94,13 @@ constexpr uint32_t TRAVEL_MS = 10000;
 class TestCover : public somfy::SomfyCover {
  public:
   using SomfyCover::close;
+  using SomfyCover::control;
   using SomfyCover::on_rts_frame_;
   using SomfyCover::open;
-  using SomfyCover::rx_sync_active_;
+  using SomfyCover::rx_sync_;
   using SomfyCover::stop;
+
+  bool rx_active() const { return this->rx_sync_.active(); }
 };
 
 somfy::RtsDecodedFrame make_frame(uint32_t remote_code, somfy::RtsCommand command) {
@@ -106,6 +109,24 @@ somfy::RtsDecodedFrame make_frame(uint32_t remote_code, somfy::RtsCommand comman
   frame.command = command;
   frame.rolling_code = 0x0042;
   return frame;
+}
+
+/// Turn a transmitted buffer into what the receiver reports off the air.
+///
+/// The encoder emits one entry per Manchester half-symbol, so two consecutive
+/// half-symbols at the same level appear as two entries; on the air they are a
+/// single pulse of twice the length. Feeding the raw TX buffer to the decoder
+/// therefore does not exercise the demodulator, it just yields an all-zero
+/// frame that happens to satisfy the checksum.
+remote_base::RawTimings as_received(const remote_base::RawTimings &transmitted) {
+  remote_base::RawTimings air;
+  for (const int32_t value : transmitted) {
+    if (!air.empty() && ((air.back() < 0) == (value < 0)))
+      air.back() += value;
+    else
+      air.push_back(value);
+  }
+  return air;
 }
 
 struct Rig {
@@ -181,7 +202,8 @@ static void test_tx_mandatory_rx_optional() {
 }
 
 /// setup() must register the cover on the hub, otherwise decoded frames never
-/// reach it. Verified through the hub's real receive entry point.
+/// reach it. Doubles as the encoder/decoder round trip: a frame this component
+/// transmits must come back out of its own demodulator unchanged.
 static void test_setup_registers_cover_on_hub() {
   printf("Hub -> cover wiring\n");
 
@@ -190,8 +212,10 @@ static void test_setup_registers_cover_on_hub() {
   g_millis += 1000;
 
   const int before = rig.detected.publish_count;
-  rig.hub.on_receive(remote_base::RemoteReceiveData(rig.tx.last_data.get_data()));
+  rig.hub.on_receive(remote_base::RemoteReceiveData(as_received(rig.tx.last_data.get_data())));
   check(rig.detected.publish_count > before, "a frame decoded by the hub reaches the cover registered in setup()");
+  check(rig.detected.last_state.find("123456") != std::string::npos, "the transmitted remote code survives the round trip");
+  check(rig.detected.last_state.find("UP") != std::string::npos, "the transmitted command survives the round trip");
 }
 
 /// The regression guard: a frame from an allow-listed remote must drive the HA
@@ -205,18 +229,18 @@ static void test_rx_frame_syncs_ha_state() {
 
   rig.receive(REMOTE_CODE, somfy::RtsCommand::Up);
 
-  check(rig.cover.rx_sync_active_, "UP frame starts the RX animation");
+  check(rig.cover.rx_active(), "UP frame starts the RX animation");
   check(rig.cover.current_operation == cover::COVER_OPERATION_OPENING, "entity reports OPENING");
   check(rig.cover.publish_count > publishes_before, "state is published immediately");
 
   // Half open with a 10 s full travel => 5 s of remaining travel.
   rig.advance(2500);
   check_close(rig.cover.position, 0.75f, 0.05f, "position advances while the motor runs");
-  check(rig.cover.rx_sync_active_, "animation still running mid-travel");
+  check(rig.cover.rx_active(), "animation still running mid-travel");
 
   rig.advance(3000);
   check_close(rig.cover.position, 1.0f, 0.001f, "position lands on the open end stop");
-  check(!rig.cover.rx_sync_active_, "animation finishes");
+  check(!rig.cover.rx_active(), "animation finishes");
   check(rig.cover.current_operation == cover::COVER_OPERATION_IDLE, "entity returns to IDLE");
   check_close(rig.cover.last_published_position, 1.0f, 0.001f, "final position is published to HA");
 }
@@ -233,7 +257,7 @@ static void test_rx_close_from_open() {
 
   rig.advance(5000);
   check_close(rig.cover.position, 0.5f, 0.05f, "half-way closed after half the full travel");
-  check(rig.cover.rx_sync_active_, "still closing");
+  check(rig.cover.rx_active(), "still closing");
 
   rig.advance(5200);
   check_close(rig.cover.position, 0.0f, 0.001f, "position lands on the closed end stop");
@@ -248,14 +272,14 @@ static void test_rx_stop_halts_animation() {
   rig.cover.position = 0.0f;
 
   rig.receive(REMOTE_CODE, somfy::RtsCommand::Up);
-  check(rig.cover.rx_sync_active_, "UP frame starts the RX animation");
+  check(rig.cover.rx_active(), "UP frame starts the RX animation");
 
   rig.advance(3000);
   const float mid = rig.cover.position;
   check(mid > 0.1f && mid < 0.9f, "cover is part-way open");
 
   rig.receive(REMOTE_CODE, somfy::RtsCommand::My);
-  check(!rig.cover.rx_sync_active_, "MY frame stops the RX animation");
+  check(!rig.cover.rx_active(), "MY frame stops the RX animation");
   check(rig.cover.current_operation == cover::COVER_OPERATION_IDLE, "entity reports IDLE after stop");
 
   rig.advance(3000);
@@ -292,7 +316,7 @@ static void test_foreign_remote_reported_but_ignored() {
   check(rig.detected.publish_count == 1, "foreign frame is published for discovery");
   check(rig.detected.last_state.find("ABCDEF") != std::string::npos, "discovery text carries the remote code");
   check(rig.detected.last_state.find("UP") != std::string::npos, "discovery text names the command");
-  check(!rig.cover.rx_sync_active_, "foreign frame does not start an animation");
+  check(!rig.cover.rx_active(), "foreign frame does not start an animation");
   check(rig.cover.publish_count == publishes_before, "foreign frame does not touch entity state");
   check_close(rig.cover.position, 0.5f, 0.001f, "position unchanged by a foreign frame");
 }
@@ -305,6 +329,68 @@ static void test_traits() {
   auto traits = rig.cover.get_traits();
   check(!traits.get_supports_tilt(), "tilt is not advertised");
   check(traits.get_is_assumed_state(), "assumed state is advertised");
+}
+
+/// A press makes the remote send the same frame several times, ~143 ms apart,
+/// and the receiver hands us each copy. Repeats must collapse, but the next
+/// press must be acted on immediately however fast it follows — a time-based
+/// mute cannot do both, because its dead time is longer than the repeat period.
+static void test_repeat_burst_collapses_but_new_press_gets_through() {
+  printf("RX burst suppression\n");
+
+  Rig rig;
+  rig.cover.position = 0.0f;
+
+  // Borrow the encoder to produce a real on-air burst for an allow-listed remote.
+  rig.cover.open();
+  const auto up_burst = as_received(rig.tx.last_data.get_data());
+
+  rig.hub.on_receive(remote_base::RemoteReceiveData(up_burst));
+  check(rig.cover.rx_active(), "first copy of the burst starts the animation");
+
+  const int cover_publishes = rig.cover.publish_count;
+  const int discovery_publishes = rig.detected.publish_count;
+
+  for (int repeat = 0; repeat < 4; repeat++) {
+    g_millis += 143;  // measured RTS repeat-frame period
+    rig.hub.on_receive(remote_base::RemoteReceiveData(up_burst));
+  }
+  check(rig.cover.publish_count == cover_publishes, "repeats do not restart the animation");
+  check(rig.detected.publish_count == discovery_publishes, "repeats are not re-reported for discovery");
+
+  // Same remote, next rolling code, well inside the old 150 ms dead time.
+  rig.cover.stop();
+  const auto my_burst = as_received(rig.tx.last_data.get_data());
+  g_millis += 20;
+  rig.hub.on_receive(remote_base::RemoteReceiveData(my_burst));
+
+  check(!rig.cover.rx_active(), "a following press is acted on, not swallowed");
+  check(rig.cover.current_operation == cover::COVER_OPERATION_IDLE, "MY from the remote stops the entity");
+}
+
+/// While the animation runs it owns current_operation, so a Home Assistant
+/// command has to cancel it — otherwise the entity keeps travelling to the end
+/// stop and drifts away from what the motor is actually doing.
+static void test_ha_command_cancels_remote_animation() {
+  printf("HA command vs. physical remote\n");
+
+  Rig rig;
+  rig.cover.position = 0.0f;
+
+  rig.receive(REMOTE_CODE, somfy::RtsCommand::Up);
+  rig.advance(2000);
+  check(rig.cover.rx_active(), "remote animation is running");
+
+  const float at_stop = rig.cover.position;
+  cover::CoverCall call;
+  call.set_command_stop();
+  rig.cover.control(call);
+
+  check(!rig.cover.rx_active(), "HA command cancels the remote animation");
+  check(rig.cover.current_operation == cover::COVER_OPERATION_IDLE, "entity reports IDLE");
+
+  rig.advance(4000);
+  check_close(rig.cover.position, at_stop, 0.01f, "position no longer drifts to the end stop");
 }
 
 int main() {
@@ -325,6 +411,10 @@ int main() {
   test_foreign_remote_reported_but_ignored();
   printf("\n");
   test_traits();
+  printf("\n");
+  test_repeat_burst_collapses_but_new_press_gets_through();
+  printf("\n");
+  test_ha_command_cancels_remote_animation();
 
   printf("\n%d/%d checks passed\n", g_passed, g_checks);
   return g_passed == g_checks ? 0 : 1;

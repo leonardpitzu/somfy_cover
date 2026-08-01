@@ -5,13 +5,24 @@
 #include "esphome/core/log.h"
 #ifdef USE_SOMFY_COVER_RX
 #include "esphome/components/logger/logger.h"
+#include "esphome/core/hal.h"
+#include <cinttypes>
 #endif
-#include <cmath>
 
 namespace esphome {
 namespace somfy {
 
 static const char *TAG = "somfy.rts.hub";
+
+#ifdef USE_SOMFY_COVER_RX
+namespace {
+// A press makes the remote repeat the same frame for a few hundred ms. Any copy
+// carrying the rolling code we just dispatched within this window is a repeat;
+// a genuine second press always advances the rolling code, so it is never
+// swallowed no matter how quickly it follows.
+constexpr uint32_t RX_BURST_WINDOW_MS = 1500;
+}  // namespace
+#endif
 
 // ---------------------------------------------------------------------------
 // Frame struct (internal to TX/RX encoding, not exposed in header)
@@ -138,7 +149,7 @@ void SomfyRtsHub::send_frame(const std::array<uint8_t, 7> &frame_bytes, uint8_t 
 
 #ifdef USE_SOMFY_COVER_RX
 
-const char *SomfyRtsHub::command_to_string_(RtsCommand cmd) {
+const char *rts_command_name(RtsCommand cmd) {
   switch (cmd) {
     case RtsCommand::My:      return "MY";
     case RtsCommand::Up:      return "UP";
@@ -156,7 +167,8 @@ const char *SomfyRtsHub::command_to_string_(RtsCommand cmd) {
 bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedFrame &decoded_frame, bool debug_log) {
   const int n = static_cast<int>(data.size());
   if (debug_log) {
-    ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n, n > 0 ? data[0] : 0, n > 1 ? data[1] : 0);
+    ESP_LOGD(TAG, "decode_frame_ ENTER n=%d first=%d second=%d", n, n > 0 ? static_cast<int>(data[0]) : 0,
+             n > 1 ? static_cast<int>(data[1]) : 0);
   }
 
   if (n < 20) {
@@ -266,8 +278,8 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
           last_bad_i = i;
           last_bad_duration = duration;
           if (debug_log) {
-            ESP_LOGD(TAG, "RX decode FAIL_RANGE: i=%d d=%u waiting_half=%d bits=%u/%u hw_sync=%u", last_bad_i,
-                     last_bad_duration, waiting_half_symbol ? 1 : 0, cpt_bits, bit_length, last_sync_hw);
+            ESP_LOGD(TAG, "RX decode FAIL_RANGE: i=%d d=%" PRIu32 " waiting_half=%d bits=%u/%u hw_sync=%u",
+                     last_bad_i, last_bad_duration, waiting_half_symbol ? 1 : 0, cpt_bits, bit_length, last_sync_hw);
           }
 
           reset_to_waiting();
@@ -317,7 +329,9 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
                                         (static_cast<uint32_t>(frame.bytes[5]) << 8) | frame.bytes[6];
 
             if (debug_log) {
-              ESP_LOGD(TAG, "decode_frame_ RETURN OK: remote=0x%06X cmd=0x%X rolling=0x%04X hw_sync=%u bit_length=%u",
+              ESP_LOGD(TAG,
+                       "decode_frame_ RETURN OK: remote=0x%06" PRIX32 " cmd=0x%X rolling=0x%04" PRIX16
+                       " hw_sync=%u bit_length=%u",
                        decoded_frame.remote_code, (frame.bytes[1] >> 4), decoded_frame.rolling_code, last_sync_hw,
                        bit_length);
             }
@@ -343,7 +357,9 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
     if (!saw_any_sync) {
       ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_SYNC (no SW sync found) n=%d", n);
     } else {
-      ESP_LOGD(TAG, "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%u)",
+      ESP_LOGD(TAG,
+               "decode_frame_ RETURN FAIL_END (saw_sync hw_sync=%u bit_length=%u last_bad_i=%d last_bad_d=%" PRIu32
+               ")",
                last_sync_hw, last_sync_bitlen, last_bad_i, last_bad_duration);
     }
   }
@@ -351,14 +367,24 @@ bool SomfyRtsHub::decode_frame_(const remote_base::RawTimings &data, RtsDecodedF
   return false;
 }
 
-bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
-  const auto &raw = data.get_raw_data();
+bool SomfyRtsHub::rx_is_duplicate_(uint32_t remote_code, uint16_t rolling_code) {
   const uint32_t now = millis();
 
-  // Basic de-duplication
-  if (now - this->last_rx_ms_ < RtsTiming::RX_DEDUP_WINDOW_MS) {
-    return false;
+  if (this->rx_last_valid_ && remote_code == this->rx_last_remote_ && rolling_code == this->rx_last_rolling_ &&
+      (now - this->rx_last_ms_) < RX_BURST_WINDOW_MS) {
+    this->rx_last_ms_ = now;  // extend the window across the whole burst
+    return true;
   }
+
+  this->rx_last_valid_ = true;
+  this->rx_last_remote_ = remote_code;
+  this->rx_last_rolling_ = rolling_code;
+  this->rx_last_ms_ = now;
+  return false;
+}
+
+bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
+  const auto &raw = data.get_raw_data();
 
   bool dbg = false;
 #ifdef USE_LOGGER
@@ -371,55 +397,16 @@ bool SomfyRtsHub::on_receive(remote_base::RemoteReceiveData data) {
     ESP_LOGD(TAG, "RX callback: raw_len=%u", (unsigned) raw.size());
   }
 
-  // Cache decode across callbacks
-  struct RxCache {
-    uint32_t ms{0};
-    uint16_t len{0};
-    int32_t sig[RtsTiming::RX_CACHE_SIGNATURE_LEN]{0};
-    bool valid{false};
-    RtsDecodedFrame frame{};
-  };
-  static RxCache cache;
-
-  auto sig_match = [&](const remote_base::RawTimings &r) -> bool {
-    if (!cache.valid) return false;
-    if (cache.len != r.size()) return false;
-    const size_t m = std::min<size_t>(r.size(), RtsTiming::RX_CACHE_SIGNATURE_LEN);
-    for (size_t k = 0; k < m; k++) {
-      if (cache.sig[k] != r[k]) return false;
-    }
-    return true;
-  };
-
   RtsDecodedFrame decoded;
-  bool ok = false;
-
-  if (sig_match(raw) && (now - cache.ms) < RtsTiming::RX_CACHE_WINDOW_MS) {
-    decoded = cache.frame;
-    ok = true;
-  } else {
-    ok = this->decode_frame_(raw, decoded, dbg);
-    if (ok) {
-      cache.ms = now;
-      cache.len = static_cast<uint16_t>(raw.size());
-      const size_t m = std::min<size_t>(raw.size(), RtsTiming::RX_CACHE_SIGNATURE_LEN);
-      for (size_t k = 0; k < m; k++) cache.sig[k] = raw[k];
-      for (size_t k = m; k < RtsTiming::RX_CACHE_SIGNATURE_LEN; k++) cache.sig[k] = 0;
-      cache.frame = decoded;
-      cache.valid = true;
-    } else {
-      cache.valid = false;
-    }
-  }
-
-  if (!ok)
+  if (!this->decode_frame_(raw, decoded, dbg))
     return false;
 
-  this->last_rx_ms_ = now;
+  if (this->rx_is_duplicate_(decoded.remote_code, decoded.rolling_code))
+    return true;
 
   if (dbg) {
     ESP_LOGD(TAG, "RX decoded: remote=0x%06" PRIX32 " cmd=%s rolling=0x%04" PRIX16,
-             decoded.remote_code, command_to_string_(decoded.command), decoded.rolling_code);
+             decoded.remote_code, rts_command_name(decoded.command), decoded.rolling_code);
   }
 
   // Dispatch to all registered callbacks

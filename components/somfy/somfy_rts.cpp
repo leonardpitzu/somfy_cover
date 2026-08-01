@@ -5,8 +5,8 @@
 #include "esphome/core/log.h"
 #ifdef USE_SOMFY_COVER_RX
 #include "esphome/components/text_sensor/text_sensor.h"
+#include "esphome/core/hal.h"
 #endif
-#include <cmath>
 #include <cinttypes>
 
 namespace esphome {
@@ -21,67 +21,51 @@ static const char *TAG = "somfy.rts";
 #ifdef USE_SOMFY_COVER_RX
 
 void SomfyCover::on_rts_frame_(const RtsDecodedFrame &frame) {
-  const bool is_known = this->is_allowed_remote_(frame.remote_code);
-
-  // Update text sensor (always, for discovery)
+  // Publish to the discovery text sensor regardless of the allow-list, so an
+  // unknown remote can be learned.
   if (this->log_text_sensor_ != nullptr) {
-    static const auto cmd_names = [](RtsCommand c) -> const char * {
-      switch (c) {
-        case RtsCommand::My:      return "MY";
-        case RtsCommand::Up:      return "UP";
-        case RtsCommand::Down:    return "DOWN";
-        case RtsCommand::MyUp:    return "MY_UP";
-        case RtsCommand::MyDown:  return "MY_DOWN";
-        case RtsCommand::UpDown:  return "UP_DOWN";
-        case RtsCommand::Prog:    return "PROG";
-        case RtsCommand::SunFlag: return "SUN_FLAG";
-        case RtsCommand::Flag:    return "FLAG";
-        default:                  return "UNKNOWN";
-      }
-    };
     char buf[96];
     snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04" PRIX16,
-             frame.remote_code, cmd_names(frame.command), frame.rolling_code);
+             frame.remote_code, rts_command_name(frame.command), frame.rolling_code);
     this->log_text_sensor_->publish_state(buf);
   }
 
-  if (!is_known)
+  if (!this->is_allowed_remote_(frame.remote_code))
     return;
-
-  // Keep HA UI in sync — simulate movement using configured durations
-  auto start_rx_move = [&](cover::CoverOperation op) {
-    const uint32_t now_ms = millis();
-    this->rx_sync_active_ = true;
-    this->rx_operation_ = op;
-    this->rx_start_ms_ = now_ms;
-    this->rx_start_pos_ = this->position;
-    this->rx_last_publish_ms_ = 0;
-    this->rx_last_published_pos_ = CoverPosition::UNKNOWN;
-    this->current_operation = op;
-    this->publish_state();
-  };
 
   switch (frame.command) {
     case RtsCommand::Up:
     case RtsCommand::MyUp:
-      start_rx_move(cover::COVER_OPERATION_OPENING);
+      this->start_rx_sync_(cover::COVER_OPERATION_OPENING);
       break;
 
     case RtsCommand::Down:
     case RtsCommand::MyDown:
-      start_rx_move(cover::COVER_OPERATION_CLOSING);
+      this->start_rx_sync_(cover::COVER_OPERATION_CLOSING);
       break;
 
     case RtsCommand::My:
     case RtsCommand::UpDown:
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->publish_state();
+      this->stop_rx_sync_();
       break;
 
     default:
       break;
   }
+}
+
+// The motor reports nothing back, so the position is dead-reckoned from the
+// configured travel durations for as long as we believe it is moving.
+void SomfyCover::start_rx_sync_(cover::CoverOperation op) {
+  this->rx_sync_.start(op == cover::COVER_OPERATION_OPENING, this->position, millis());
+  this->current_operation = op;
+  this->publish_state();
+}
+
+void SomfyCover::stop_rx_sync_() {
+  this->rx_sync_.stop();
+  this->current_operation = cover::COVER_OPERATION_IDLE;
+  this->publish_state();
 }
 
 bool SomfyCover::is_allowed_remote_(uint32_t code) const {
@@ -132,63 +116,14 @@ void SomfyCover::setup() {
 
 void SomfyCover::loop() {
 #ifdef USE_SOMFY_COVER_RX
-  if (this->rx_sync_active_) {
-    const uint32_t now_ms = millis();
+  if (this->rx_sync_.active()) {
+    const uint32_t full_duration_ms = this->rx_sync_.opening() ? this->open_duration_ : this->close_duration_;
+    const RxSyncUpdate update = this->rx_sync_.update(millis(), full_duration_ms);
 
-    const uint32_t full_dur_ms = (this->rx_operation_ == cover::COVER_OPERATION_OPENING)
-                                     ? this->open_duration_
-                                     : this->close_duration_;
-    float remaining = 1.0f;
-    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
-      remaining = CoverPosition::OPEN - this->rx_start_pos_;
-    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
-      remaining = this->rx_start_pos_ - CoverPosition::CLOSED;
-    }
-    if (remaining < 0.0f) remaining = 0.0f;
-    if (remaining > 1.0f) remaining = 1.0f;
-
-    const uint32_t dur_ms = static_cast<uint32_t>(static_cast<float>(full_dur_ms) * remaining);
-
-    if (dur_ms == 0) {
-      this->position = (this->rx_operation_ == cover::COVER_OPERATION_OPENING)
-                            ? CoverPosition::OPEN
-                            : CoverPosition::CLOSED;
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->rx_last_published_pos_ = this->position;
-      this->publish_state();
-      return;
-    }
-
-    const uint32_t elapsed = now_ms - this->rx_start_ms_;
-    float progress = (elapsed >= dur_ms) ? 1.0f : (static_cast<float>(elapsed) / static_cast<float>(dur_ms));
-
-    float new_pos = this->rx_start_pos_;
-    if (this->rx_operation_ == cover::COVER_OPERATION_OPENING) {
-      new_pos = this->rx_start_pos_ + (CoverPosition::OPEN - this->rx_start_pos_) * progress;
-    } else if (this->rx_operation_ == cover::COVER_OPERATION_CLOSING) {
-      new_pos = this->rx_start_pos_ + (CoverPosition::CLOSED - this->rx_start_pos_) * progress;
-    }
-
-    if (new_pos < CoverPosition::CLOSED) new_pos = CoverPosition::CLOSED;
-    if (new_pos > CoverPosition::OPEN) new_pos = CoverPosition::OPEN;
-
-    this->position = new_pos;
-
-    const bool time_ok = (this->rx_last_publish_ms_ == 0) ||
-                         ((now_ms - this->rx_last_publish_ms_) >= RtsTiming::RX_PUBLISH_INTERVAL_MS);
-    const bool delta_ok = (this->rx_last_published_pos_ < CoverPosition::CLOSED) ||
-                          (std::fabs(this->position - this->rx_last_published_pos_) >= CoverPosition::MIN_PUBLISH_DELTA);
-    if (time_ok && delta_ok) {
-      this->rx_last_publish_ms_ = now_ms;
-      this->rx_last_published_pos_ = this->position;
-      this->publish_state();
-    }
-
-    if (progress >= 1.0f) {
-      this->rx_sync_active_ = false;
-      this->current_operation = cover::COVER_OPERATION_IDLE;
-      this->rx_last_published_pos_ = this->position;
+    this->position = update.position;
+    if (update.finished) {
+      this->stop_rx_sync_();
+    } else if (update.publish) {
       this->publish_state();
     }
     return;
@@ -207,6 +142,16 @@ cover::CoverTraits SomfyCover::get_traits() {
 }
 
 void SomfyCover::control(const cover::CoverCall &call) {
+#ifdef USE_SOMFY_COVER_RX
+  // A command from Home Assistant supersedes a physical-remote animation. The
+  // animator owns current_operation while it runs, so hand a clean IDLE state to
+  // the base machine rather than letting it resume from a stale travel clock.
+  if (this->rx_sync_.active()) {
+    this->rx_sync_.stop();
+    this->current_operation = cover::COVER_OPERATION_IDLE;
+  }
+#endif
+
   SomfyTimeBasedCover::control(call);
 }
 

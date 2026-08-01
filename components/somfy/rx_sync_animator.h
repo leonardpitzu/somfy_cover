@@ -26,6 +26,9 @@ struct RxSyncUpdate {
 /// This owns only the arithmetic and the publish throttling. The caller owns
 /// the entity and decides when to actually publish, which keeps the logic
 /// testable on a host without any of the ESPHome cover machinery.
+///
+/// RTS is the only consumer verified against real hardware, so it is the
+/// reference behaviour here; do not retune this to suit io-homecontrol.
 class RxSyncAnimator {
  public:
   static constexpr float POSITION_OPEN = 1.0f;

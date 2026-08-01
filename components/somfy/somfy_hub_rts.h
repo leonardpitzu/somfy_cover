@@ -53,15 +53,15 @@ struct RtsTiming {
 
   static constexpr uint8_t FIRST_FRAME_SYNC_COUNT = 2;
   static constexpr uint8_t REPEAT_FRAME_SYNC_COUNT = 7;
-
-  static constexpr uint32_t RX_DEDUP_WINDOW_MS = 150;
-  static constexpr uint32_t RX_CACHE_WINDOW_MS = 50;
-  static constexpr size_t RX_CACHE_SIGNATURE_LEN = 12;
-  static constexpr uint32_t RX_PUBLISH_INTERVAL_MS = 250;
 };
 
 // Callback type for RX frame notifications
 using RtsRxCallback = std::function<void(const RtsDecodedFrame &frame)>;
+
+#ifdef USE_SOMFY_COVER_RX
+// Human-readable name of an RTS command ("UP", "DOWN", ..., "UNKNOWN").
+const char *rts_command_name(RtsCommand cmd);
+#endif
 
 /// RTS radio hub — owns the remote_transmitter (and optionally remote_receiver).
 /// Devices register for RX callbacks and call send_frame() for TX.
@@ -110,11 +110,15 @@ class SomfyRtsHub : public Component
   remote_receiver::RemoteReceiverComponent *remote_receiver_{nullptr};
   std::vector<RtsRxCallback> rx_callbacks_;
 
-  // RX dedup state
-  uint32_t last_rx_ms_{0};
+  // Last frame accepted, used to collapse a remote's repeat burst.
+  uint32_t rx_last_remote_{0};
+  uint16_t rx_last_rolling_{0};
+  uint32_t rx_last_ms_{0};
+  bool rx_last_valid_{false};
 
   bool decode_frame_(const remote_base::RawTimings &data, RtsDecodedFrame &decoded, bool debug_log = false);
-  static const char *command_to_string_(RtsCommand cmd);
+  // True when this frame is another copy of the press we already dispatched.
+  bool rx_is_duplicate_(uint32_t remote_code, uint16_t rolling_code);
 #endif
 
 };
