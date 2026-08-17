@@ -70,6 +70,28 @@ bool build_key_transfer_frame_1w(uint32_t src_node, uint32_t dest_node,
                                  uint16_t sequence, uint8_t ctrl1,
                                  std::vector<uint8_t> &out);
 
+// Extract the big-endian rolling sequence from the decoded data portion of an
+// ordinary 1W frame. The final eight bytes are sequence[2] || MAC[6], regardless
+// of the command payload length.
+bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequence);
+
+// Collapses repeated RF copies of one logical frame while preserving rapid new
+// presses of the same button. Sequence-aware frames compare their rolling
+// sequence; legacy/fallback frames compare their main parameter.
+class RxBurstDeduplicator {
+ public:
+  bool is_duplicate(uint32_t now_ms, uint32_t src, uint16_t main_param,
+                    uint16_t sequence, bool has_sequence, uint32_t window_ms);
+
+ private:
+  uint32_t src_{0};
+  uint16_t main_param_{0};
+  uint16_t sequence_{0};
+  uint32_t seen_ms_{0};
+  bool has_sequence_{false};
+  bool valid_{false};
+};
+
 // --- Physical layer (UART-8N1) codec -------------------------------------
 //
 // io-homecontrol modulates 2-FSK at 38400 baud, but the bit stream is *not*

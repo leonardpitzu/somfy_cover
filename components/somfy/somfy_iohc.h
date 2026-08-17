@@ -4,6 +4,7 @@
 
 #ifdef USE_SOMFY_IOHC
 
+#include "iohc_protocol.h"
 #include "somfy_hub_iohc.h"
 #include "NVSRollingCodeStorage.h"
 #include "esphome/components/button/button.h"
@@ -55,9 +56,14 @@ static constexpr uint8_t BUTTON_ACTION_OPEN = 0x00;
 static constexpr uint8_t BUTTON_ACTION_CLOSE = 0x01;
 static constexpr uint8_t BUTTON_ACTION_STOP_MY = 0x02;
 
-// Delays are measured from the end of one local six-copy transmit burst. They
-// reproduce the approximately 300 ms EXECUTE-to-event and 100 ms event-to-event
-// start times of the physical remote without blocking ESPHome's main loop.
+// A dedicated HA MY action first sends a lone D200 stop, waits for the motor to
+// settle, and only then reproduces the native three-frame MY press. This gives
+// MY unambiguous "go to favourite" semantics regardless of the motor's state.
+static constexpr uint32_t MY_PRESTOP_SETTLE_MS = 500;
+// These delays are measured from the end of one local six-copy transmit burst.
+// They reproduce the approximately 300 ms EXECUTE-to-event and 100 ms
+// event-to-event start times of the physical remote without blocking ESPHome's
+// main loop.
 static constexpr uint32_t MY_EVENT_DELAY_MS = 220;
 static constexpr uint32_t MY_RELEASE_DELAY_MS = 25;
 
@@ -202,13 +208,12 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   std::vector<uint32_t> receive_remote_codes_;
   text_sensor::TextSensor *log_text_sensor_{nullptr};
 
-  // Repeat-burst suppression: a physical remote transmits the same frame several
-  // times back-to-back (and the CC1101 hands us each copy separately). Collapse
-  // identical (src, main_param) pairs seen within a short window.
-  uint32_t rx_dedup_src_{0};
-  uint16_t rx_dedup_param_{0};
-  uint32_t rx_dedup_ms_{0};
-  bool rx_dedup_valid_{false};
+  // Repeat-burst suppression: a physical remote transmits the same frame
+  // several times back-to-back (and the CC1101 hands us each copy separately).
+  // Sequence-aware matching collapses RF copies without swallowing a rapid new
+  // press of the same button.
+  iohc_proto::RxBurstDeduplicator rx_deduplicator_;
+  uint32_t rx_event_counter_{0};
 
   // Physical-remote UI animation state.
   RxSyncAnimator rx_sync_;
@@ -220,9 +225,6 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   bool is_allowed_remote_(uint32_t code) const;
   // Decode the MainParameter from a CMD_EXECUTE packet (foreign remote command).
   static bool decode_execute_param_(const IohcDecodedPacket &pkt, uint16_t &main_param);
-  // True if this (src, main_param) is a duplicate of the previous one inside the
-  // dedup window (i.e. part of the remote's repeat burst).
-  bool rx_is_duplicate_(uint32_t src, uint16_t main_param);
   // Drive the HA UI animation in response to a recognised foreign command.
   void handle_rx_command_(uint16_t main_param);
 #endif

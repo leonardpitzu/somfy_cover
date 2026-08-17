@@ -102,6 +102,13 @@ int main() {
          "STOP data is 01 43 D2 00 00 00");
   expect(stop_frame[15] == 0x05 && stop_frame[16] == 0x99,
          "STOP sequence is in the captured position");
+  uint16_t received_sequence = 0;
+  expect(iohc_proto::extract_sequence_1w(stop_frame.data() + 9, stop_frame.size() - 11,
+                                         received_sequence) &&
+             received_sequence == 0x0599,
+         "extract rolling sequence from decoded STOP data");
+  expect(!iohc_proto::extract_sequence_1w(stop_frame.data() + 9, 7, received_sequence),
+         "reject decoded 1W data too short to contain sequence and MAC");
   expect(iohc_proto::crc16(stop_frame.data(), stop_frame.size()) == 0,
          "STOP CRC residue is zero");
 
@@ -151,6 +158,23 @@ int main() {
   iohc_proto::uart_encode(my_press_frame.data(), my_press_frame.size(), my_encoded);
   expect(my_encoded.size() == 35 && my_encoded[0] == 0x99,
          "27-byte MY event encodes to the expected CC1101 FIFO length");
+
+  iohc_proto::RxBurstDeduplicator rx_dedup;
+  expect(!rx_dedup.is_duplicate(1000, 0x61620C, 0xD200, 0x1000, true, 1500),
+         "first physical-remote frame is a new event");
+  expect(rx_dedup.is_duplicate(1050, 0x61620C, 0xD200, 0x1000, true, 1500),
+         "same rolling sequence is collapsed as an RF burst copy");
+  expect(!rx_dedup.is_duplicate(1100, 0x61620C, 0xD200, 0x1001, true, 1500),
+         "new rolling sequence preserves a rapid repeated button press");
+  expect(rx_dedup.is_duplicate(1150, 0x61620C, 0xD200, 0x1001, true, 1500),
+         "copies of the rapid repeated press are still collapsed");
+  expect(!rx_dedup.is_duplicate(2651, 0x61620C, 0xD200, 0x1001, true, 1500),
+         "same sequence outside the burst window is treated as a new event");
+
+  iohc_proto::RxBurstDeduplicator fallback_dedup;
+  expect(!fallback_dedup.is_duplicate(1000, 0x61620C, 0x0000, 0, false, 1500) &&
+             fallback_dedup.is_duplicate(1050, 0x61620C, 0x0000, 0, false, 1500),
+         "frames without a sequence retain timed main-parameter deduplication");
 
   RxSyncAnimator my_opening;
   my_opening.start_to(0.42f, 0.0f, 1000);

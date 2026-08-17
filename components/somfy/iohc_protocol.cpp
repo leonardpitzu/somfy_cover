@@ -220,6 +220,34 @@ bool build_key_transfer_frame_1w(uint32_t src_node, uint32_t dest_node,
   return true;
 }
 
+bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequence) {
+  constexpr size_t SEQUENCE_AND_MAC_LEN = 8;
+  if (data == nullptr || data_len < SEQUENCE_AND_MAC_LEN)
+    return false;
+  const size_t offset = data_len - SEQUENCE_AND_MAC_LEN;
+  sequence = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+  return true;
+}
+
+bool RxBurstDeduplicator::is_duplicate(uint32_t now_ms, uint32_t src, uint16_t main_param,
+                                       uint16_t sequence, bool has_sequence, uint32_t window_ms) {
+  const bool same_frame = has_sequence && this->has_sequence_
+                              ? sequence == this->sequence_
+                              : !has_sequence && !this->has_sequence_ && main_param == this->main_param_;
+  if (this->valid_ && src == this->src_ && same_frame && (now_ms - this->seen_ms_) < window_ms) {
+    this->seen_ms_ = now_ms;  // extend the window across the whole RF burst
+    return true;
+  }
+
+  this->valid_ = true;
+  this->src_ = src;
+  this->main_param_ = main_param;
+  this->sequence_ = sequence;
+  this->has_sequence_ = has_sequence;
+  this->seen_ms_ = now_ms;
+  return false;
+}
+
 void uart_encode(const uint8_t *logical, size_t len, std::vector<uint8_t> &out) {
   out.clear();
   BitWriter bw(out);

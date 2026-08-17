@@ -211,9 +211,9 @@ cover:
 
 - 1W commands (open/close/stop/MY) are sent on **868.95 MHz**. Ordinary commands use the virtual controller's private AES key; the public transfer key is used only to install that key during pairing.
 - The component handles CRC-16 (Kermit) and AES-128 HMAC in software.
-- STOP and MY are intentionally distinct transmissions even though both begin with the same authenticated `CMD_EXECUTE` main parameter `0xD200`. STOP sends that frame alone, which stops movement but does not recall MY when idle. MY reproduces the real remote's complete short-press sequence: `0xD200`, then `cmd=0x20` payloads `02 FF 01 43 02 0C 00 00` and `02 FF 01 43 02 05 FF 00`, each with its own rolling code and MAC. The motor therefore decides from its real state whether MY stops active movement or recalls the stored favourite; RF behavior does not depend on Home Assistant's estimated position.
-- `my_position` only tells Home Assistant where to animate the 1W position estimate after an idle MY request; it is not used to choose the RF command.
-- `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery.
+- STOP and MY are intentionally distinct transmissions even though both use the authenticated `CMD_EXECUTE` main parameter `0xD200`. STOP sends that frame alone, which stops movement but does not recall MY when idle. A dedicated MY action sends that safe stop-only frame first, waits 500 ms for the motor to settle, and then reproduces the real remote's complete short-press sequence: `0xD200`, followed by `cmd=0x20` payloads `02 FF 01 43 02 0C 00 00` and `02 FF 01 43 02 05 FF 00`. Each logical frame has its own rolling code and MAC. MY therefore means “go to the stored favourite” whether the motor was moving or idle, without relying on Home Assistant's estimated state.
+- `my_position` only tells Home Assistant where to animate the 1W position estimate when MY recall begins; it is not used to choose the RF command.
+- `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery. `detected_remote` includes the received rolling sequence and an event number, so repeated presses of the same button remain separate Home Assistant history entries while RF copies from one burst are collapsed.
 - For bidirectional (2W) support, see the next section.
 
 </details>
@@ -302,14 +302,14 @@ cover:
 | `open_duration` | yes | Time for a full open travel |
 | `close_duration` | yes | Time for a full close travel |
 | `my_position` | no, iohc | Estimated 0–100% position of the motor's stored MY/favourite position |
-| `my_button` | no, iohc | Template button that sends the complete native MY short-press sequence; requires `my_position` for UI estimation |
+| `my_button` | no, iohc | Template button that safely stops, then recalls native MY; requires `my_position` for UI estimation |
 | `storage_namespace` | no | NVS namespace for rolling-code persistence; defaults to `somfy` (max 15 chars) |
 | `storage_key` | yes | NVS key for rolling code persistence (max 15 chars) |
 | `initial_rolling_code` | no | Initial code used only when the NVS key is missing; defaults to `1` |
 | `remote_code` | yes | Hex address of this virtual remote |
 | `prog_button` | yes | Button entity to trigger PROG pairing |
 | `repeat_command_count` | no | Ordinary RF command repeat count; defaults to `4` (the tested distant IOHC link uses `6`) |
-| `detected_remote` | no | Text sensor for decoded physical-remote IDs |
+| `detected_remote` | no | Text sensor for decoded physical-remote presses; IOHC includes rolling sequence/event IDs so repeats are logged |
 | `allowed_remotes` | no | Physical remote IDs allowed to update the time-based position estimate |
 | `encryption_key` | no | Custom AES key hex string (iohc 1W: defaults to transfer key; iohc 2W: system key, required) |
 | `mode` | no | iohc only: `1w` (default) or `2w` |

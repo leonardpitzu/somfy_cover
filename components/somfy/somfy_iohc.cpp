@@ -170,21 +170,19 @@ void SomfyIohcCover::stop() {
 }
 
 void SomfyIohcCover::my() {
-  // RF semantics do not depend on our time-based position estimate: a dedicated
-  // MY press always emits the full captured three-frame sequence and the motor
-  // decides whether that press stops active movement or recalls MY while idle.
-  // In contrast, cover STOP emits D200 alone, which never recalls MY.
-  bool was_moving = this->current_operation != cover::COVER_OPERATION_IDLE;
+  // RF semantics do not depend on our time-based position estimate. A
+  // dedicated MY action first sends stop-only D200, then emits the full native
+  // MY sequence after the motor has settled. It therefore always means "go to
+  // favourite" whether the motor was moving or idle. Cover STOP remains one
+  // D200 frame and never recalls MY.
 #ifdef USE_SOMFY_IOHC_RX
-  if (this->rx_sync_.active()) {
-    was_moving = true;
+  if (this->rx_sync_.active())
     this->stop_rx_sync();
-  }
 #endif
 
   if (this->current_operation != cover::COVER_OPERATION_IDLE) {
-    // Update the estimator without firing its normal STOP trigger: the complete
-    // MY sequence below already contains D200 and must be sent exactly once.
+    // Update the estimator without firing its normal STOP trigger: the MY
+    // transmission below begins with the required stop-only D200.
     this->recompute_position_();
     this->current_operation = cover::COVER_OPERATION_IDLE;
     this->stop_prev_trigger_();
@@ -192,16 +190,11 @@ void SomfyIohcCover::my() {
   }
 
   ESP_LOGD(TAG, "MY node=0x%06" PRIX32 " target=%.0f%%", this->node_id_, this->my_position_ * 100.0f);
-  bool sent = true;
   if (this->mode_ == IohcMode::MODE_1W) {
-    sent = this->send_1w_my_sequence();
+    this->send_1w_my_sequence();
   } else {
     this->stop();
   }
-#ifdef USE_SOMFY_IOHC_RX
-  if (sent && !was_moving && this->has_my_position_)
-    this->start_rx_sync_to(this->my_position_);
-#endif
 }
 
 void SomfyIohcCover::control(const cover::CoverCall &call) {
@@ -333,20 +326,33 @@ bool SomfyIohcCover::send_1w_button_event(uint8_t action, bool released) {
 }
 
 void SomfyIohcCover::cancel_1w_my_sequence() {
+  this->cancel_timeout("iohc-my-recall");
   this->cancel_timeout("iohc-my-press");
   this->cancel_timeout("iohc-my-release");
 }
 
 bool SomfyIohcCover::send_1w_my_sequence() {
   this->cancel_1w_my_sequence();
+  // D200 by itself is a safe, stateless pre-stop: it stops a moving motor and
+  // does nothing while idle. Once the motor has settled, reproduce a complete
+  // native MY press. Sending two complete MY presses would be wrong from idle,
+  // because the second one would stop the recall started by the first.
   if (!this->send_1w_command(iohc_cmd::MP_STOP))
     return false;
 
-  this->set_timeout("iohc-my-press", iohc_cmd::MY_EVENT_DELAY_MS, [this]() {
-    if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false))
+  this->set_timeout("iohc-my-recall", iohc_cmd::MY_PRESTOP_SETTLE_MS, [this]() {
+    if (!this->send_1w_command(iohc_cmd::MP_STOP))
       return;
-    this->set_timeout("iohc-my-release", iohc_cmd::MY_RELEASE_DELAY_MS, [this]() {
-      this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, true);
+    this->set_timeout("iohc-my-press", iohc_cmd::MY_EVENT_DELAY_MS, [this]() {
+      if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false))
+        return;
+#ifdef USE_SOMFY_IOHC_RX
+      if (this->has_my_position_)
+        this->start_rx_sync_to(this->my_position_);
+#endif
+      this->set_timeout("iohc-my-release", iohc_cmd::MY_RELEASE_DELAY_MS, [this]() {
+        this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, true);
+      });
     });
   });
   return true;
@@ -438,21 +444,34 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
 
     uint16_t main_param;
     const bool decoded = decode_execute_param_(pkt, main_param);
+    uint16_t sequence = 0;
+    const bool has_sequence = decoded && iohc_proto::extract_sequence_1w(pkt.data, pkt.data_len, sequence);
+    const bool duplicate = decoded && this->rx_deduplicator_.is_duplicate(
+                                          millis(), pkt.src_node, main_param, sequence,
+                                          has_sequence, RX_DEDUP_WINDOW_MS);
 
     // Publish to the discovery text sensor regardless of allow-list so unknown
-    // remote IDs (and unexpected payload layouts) can be learned, mirroring RTS.
-    if (this->log_text_sensor_ != nullptr) {
-      char buf[80];
-      if (decoded)
-        snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04X",
-                 pkt.src_node, main_param_name(main_param), main_param);
-      else
+    // remote IDs can be learned. Sequence-aware burst deduplication publishes
+    // one update per physical press, while the sequence and event number force
+    // repeated presses of the same button to remain visible in HA history.
+    if (this->log_text_sensor_ != nullptr && (!decoded || !duplicate)) {
+      char buf[112];
+      if (decoded) {
+        this->rx_event_counter_++;
+        if (has_sequence)
+          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04X seq=0x%04X event=%" PRIu32,
+                   pkt.src_node, main_param_name(main_param), main_param, sequence, this->rx_event_counter_);
+        else
+          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04X event=%" PRIu32,
+                   pkt.src_node, main_param_name(main_param), main_param, this->rx_event_counter_);
+      } else {
         snprintf(buf, sizeof(buf), "0x%06" PRIX32 " RAW [%s]", pkt.src_node, hexbuf);
+      }
       this->log_text_sensor_->publish_state(buf);
     }
 
     if (decoded && this->is_allowed_remote_(pkt.src_node)) {
-      if (this->rx_is_duplicate_(pkt.src_node, main_param))
+      if (duplicate)
         return;  // repeat frame from the remote's burst — already handled
       ESP_LOGD(TAG, "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
                pkt.src_node, main_param_name(main_param), main_param, pkt.rssi);
@@ -494,20 +513,6 @@ bool SomfyIohcCover::decode_execute_param_(const IohcDecodedPacket &pkt, uint16_
     return false;
   main_param = (static_cast<uint16_t>(pkt.data[2]) << 8) | pkt.data[3];
   return true;
-}
-
-bool SomfyIohcCover::rx_is_duplicate_(uint32_t src, uint16_t main_param) {
-  const uint32_t now = millis();
-  if (this->rx_dedup_valid_ && src == this->rx_dedup_src_ && main_param == this->rx_dedup_param_ &&
-      (now - this->rx_dedup_ms_) < RX_DEDUP_WINDOW_MS) {
-    this->rx_dedup_ms_ = now;  // extend the window across the whole burst
-    return true;
-  }
-  this->rx_dedup_valid_ = true;
-  this->rx_dedup_src_ = src;
-  this->rx_dedup_param_ = main_param;
-  this->rx_dedup_ms_ = now;
-  return false;
 }
 
 void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
