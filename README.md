@@ -211,7 +211,8 @@ cover:
 
 - 1W commands (open/close/stop/MY) are sent on **868.95 MHz**. Ordinary commands use the virtual controller's private AES key; the public transfer key is used only to install that key during pairing.
 - The component handles CRC-16 (Kermit) and AES-128 HMAC in software.
-- `MY` sends the hardware-verified STOP/MY command. While idle, the motor recalls its stored favourite; while moving, it stops. `my_position` tells Home Assistant where to animate the estimate because 1W has no position feedback.
+- STOP and MY are intentionally distinct transmissions even though both begin with the same authenticated `CMD_EXECUTE` main parameter `0xD200`. STOP sends that frame alone, which stops movement but does not recall MY when idle. MY reproduces the real remote's complete short-press sequence: `0xD200`, then `cmd=0x20` payloads `02 FF 01 43 02 0C 00 00` and `02 FF 01 43 02 05 FF 00`, each with its own rolling code and MAC. The motor therefore decides from its real state whether MY stops active movement or recalls the stored favourite; RF behavior does not depend on Home Assistant's estimated position.
+- `my_position` only tells Home Assistant where to animate the 1W position estimate after an idle MY request; it is not used to choose the RF command.
 - `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery.
 - For bidirectional (2W) support, see the next section.
 
@@ -301,7 +302,7 @@ cover:
 | `open_duration` | yes | Time for a full open travel |
 | `close_duration` | yes | Time for a full close travel |
 | `my_position` | no, iohc | Estimated 0–100% position of the motor's stored MY/favourite position |
-| `my_button` | no, iohc | Template button that sends native STOP/MY; requires `my_position` |
+| `my_button` | no, iohc | Template button that sends the complete native MY short-press sequence; requires `my_position` for UI estimation |
 | `storage_namespace` | no | NVS namespace for rolling-code persistence; defaults to `somfy` (max 15 chars) |
 | `storage_key` | yes | NVS key for rolling code persistence (max 15 chars) |
 | `initial_rolling_code` | no | Initial code used only when the NVS key is missing; defaults to `1` |

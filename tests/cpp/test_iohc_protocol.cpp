@@ -115,6 +115,43 @@ int main() {
   iohc_proto::uart_decode(encoded.data(), encoded.size(), decoded);
   expect(decoded == stop_frame, "STOP UART-8N1 encode/decode round-trip");
 
+  // A real idle STOP/MY short press continues with two authenticated cmd=0x20
+  // frames. These payloads were captured from the paired kitchen-door remote.
+  const uint8_t my_press_data[8] = {0x02, 0xFF, 0x01, 0x43, 0x02, 0x0C, 0x00, 0x00};
+  std::vector<uint8_t> my_press_frame;
+  expect(iohc_proto::build_frame_1w(aes128_ecb, device_key.data(), 0xABCDEF,
+                                    0x00003F, 0x20, my_press_data, sizeof(my_press_data),
+                                    sizeof(my_press_data), 0x059A, my_press_frame),
+         "build captured-format MY press-event frame");
+  expect(my_press_frame.size() == 27 && my_press_frame[0] == 0xF8 && my_press_frame[8] == 0x20,
+         "MY press-event command and logical length are correct");
+  expect(std::memcmp(my_press_frame.data() + 9, my_press_data, sizeof(my_press_data)) == 0,
+         "MY press-event data is 02 FF 01 43 02 0C 00 00");
+  expect(my_press_frame[17] == 0x05 && my_press_frame[18] == 0x9A &&
+             iohc_proto::crc16(my_press_frame.data(), my_press_frame.size()) == 0,
+         "MY press-event sequence and CRC are correct");
+
+  const uint8_t my_release_data[8] = {0x02, 0xFF, 0x01, 0x43, 0x02, 0x05, 0xFF, 0x00};
+  std::vector<uint8_t> my_release_frame;
+  expect(iohc_proto::build_frame_1w(aes128_ecb, device_key.data(), 0xABCDEF,
+                                    0x00003F, 0x20, my_release_data, sizeof(my_release_data),
+                                    sizeof(my_release_data), 0x059B, my_release_frame),
+         "build captured-format MY release-event frame");
+  expect(my_release_frame.size() == 27 && my_release_frame[0] == 0xF8 && my_release_frame[8] == 0x20,
+         "MY release-event command and logical length are correct");
+  expect(std::memcmp(my_release_frame.data() + 9, my_release_data, sizeof(my_release_data)) == 0,
+         "MY release-event data is 02 FF 01 43 02 05 FF 00");
+  expect(my_release_frame[17] == 0x05 && my_release_frame[18] == 0x9B &&
+             iohc_proto::crc16(my_release_frame.data(), my_release_frame.size()) == 0,
+         "MY release-event sequence and CRC are correct");
+  expect(std::memcmp(my_press_frame.data() + 19, my_release_frame.data() + 19, 6) != 0,
+         "MY press and release events have independently authenticated MACs");
+
+  std::vector<uint8_t> my_encoded;
+  iohc_proto::uart_encode(my_press_frame.data(), my_press_frame.size(), my_encoded);
+  expect(my_encoded.size() == 35 && my_encoded[0] == 0x99,
+         "27-byte MY event encodes to the expected CC1101 FIFO length");
+
   RxSyncAnimator my_opening;
   my_opening.start_to(0.42f, 0.0f, 1000);
   auto my_open_half = my_opening.update(3100, 10000);

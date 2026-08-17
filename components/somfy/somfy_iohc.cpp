@@ -140,6 +140,7 @@ void SomfyIohcCover::dump_config() {
 // ---------------------------------------------------------------------------
 
 void SomfyIohcCover::open() {
+  this->cancel_1w_my_sequence();
   ESP_LOGD(TAG, "OPEN node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
@@ -149,6 +150,7 @@ void SomfyIohcCover::open() {
 }
 
 void SomfyIohcCover::close() {
+  this->cancel_1w_my_sequence();
   ESP_LOGD(TAG, "CLOSE node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
@@ -158,6 +160,7 @@ void SomfyIohcCover::close() {
 }
 
 void SomfyIohcCover::stop() {
+  this->cancel_1w_my_sequence();
   ESP_LOGD(TAG, "STOP node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
@@ -167,30 +170,36 @@ void SomfyIohcCover::stop() {
 }
 
 void SomfyIohcCover::my() {
-  // The tested physical remote sends the same MP_STOP command for its MY/STOP
-  // key. While the motor is moving this stops it; while idle the motor recalls
-  // its internally stored MY position. Mirror that distinction in the HA state
-  // estimator instead of inventing an unverified on-air command.
+  // RF semantics do not depend on our time-based position estimate: a dedicated
+  // MY press always emits the full captured three-frame sequence and the motor
+  // decides whether that press stops active movement or recalls MY while idle.
+  // In contrast, cover STOP emits D200 alone, which never recalls MY.
+  bool was_moving = this->current_operation != cover::COVER_OPERATION_IDLE;
 #ifdef USE_SOMFY_IOHC_RX
   if (this->rx_sync_.active()) {
+    was_moving = true;
     this->stop_rx_sync();
-    this->stop();
-    return;
   }
 #endif
 
   if (this->current_operation != cover::COVER_OPERATION_IDLE) {
-    // This invokes the normal stop trigger once and updates the time-based
-    // position before going idle.
-    this->start_direction_(cover::COVER_OPERATION_IDLE);
+    // Update the estimator without firing its normal STOP trigger: the complete
+    // MY sequence below already contains D200 and must be sent exactly once.
+    this->recompute_position_();
+    this->current_operation = cover::COVER_OPERATION_IDLE;
+    this->stop_prev_trigger_();
     this->publish_state();
-    return;
   }
 
   ESP_LOGD(TAG, "MY node=0x%06" PRIX32 " target=%.0f%%", this->node_id_, this->my_position_ * 100.0f);
-  this->stop();
+  bool sent = true;
+  if (this->mode_ == IohcMode::MODE_1W) {
+    sent = this->send_1w_my_sequence();
+  } else {
+    this->stop();
+  }
 #ifdef USE_SOMFY_IOHC_RX
-  if (this->has_my_position_)
+  if (sent && !was_moving && this->has_my_position_)
     this->start_rx_sync_to(this->my_position_);
 #endif
 }
@@ -274,7 +283,7 @@ void SomfyIohcCover::program() {
 // 1W Protocol (per-device: uses device key + rolling code)
 // ---------------------------------------------------------------------------
 
-void SomfyIohcCover::send_1w_command(uint16_t main_param) {
+bool SomfyIohcCover::send_1w_command(uint16_t main_param) {
   // CMD_EXECUTE data: Originator(1) + ACEI(1) + MainParam(2) + FP1(1) + FP2(1).
   uint8_t data[6] = {
       iohc_cmd::ORIGINATOR_USER,
@@ -288,12 +297,59 @@ void SomfyIohcCover::send_1w_command(uint16_t main_param) {
   auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, sizeof(data), iohc::BROADCAST_ADDR);
   if (frame.empty()) {
     ESP_LOGE(TAG, "TX EXECUTE 1W aborted: frame construction failed");
-    return;
+    return false;
   }
   // Six copies improved acceptance on the hardware-validated link. Keep this
   // configurable per shutter for unusually strong/weak RF paths; pairing uses
   // the separate four-copy remote pattern above.
   this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+  return true;
+}
+
+bool SomfyIohcCover::send_1w_button_event(uint8_t action, bool released) {
+  // Exact clear payloads captured from the paired Situo remote:
+  //   press:   02 FF 01 43 <action> 0C 00 00
+  //   release: 02 FF 01 43 <action> 05 FF 00
+  // STOP/MY uses action 0x02. Each frame has its own persisted sequence and MAC.
+  uint8_t data[8] = {
+      0x02,
+      0xFF,
+      iohc_cmd::ORIGINATOR_USER,
+      iohc_cmd::ACEI_DEFAULT,
+      action,
+      static_cast<uint8_t>(released ? 0x05 : 0x0C),
+      static_cast<uint8_t>(released ? 0xFF : 0x00),
+      0x00,
+  };
+  ESP_LOGD(TAG, "TX BUTTON EVENT 1W: src=0x%06" PRIX32 " action=0x%02X phase=%s", this->node_id_, action,
+           released ? "release" : "press");
+  auto frame = this->build_1w_frame(iohc_cmd::CMD_BUTTON_EVENT, data, sizeof(data), iohc::BROADCAST_ADDR);
+  if (frame.empty()) {
+    ESP_LOGE(TAG, "TX BUTTON EVENT 1W aborted: frame construction failed");
+    return false;
+  }
+  this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+  return true;
+}
+
+void SomfyIohcCover::cancel_1w_my_sequence() {
+  this->cancel_timeout("iohc-my-press");
+  this->cancel_timeout("iohc-my-release");
+}
+
+bool SomfyIohcCover::send_1w_my_sequence() {
+  this->cancel_1w_my_sequence();
+  if (!this->send_1w_command(iohc_cmd::MP_STOP))
+    return false;
+
+  this->set_timeout("iohc-my-press", iohc_cmd::MY_EVENT_DELAY_MS, [this]() {
+    if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false))
+      return;
+    this->set_timeout("iohc-my-release", iohc_cmd::MY_RELEASE_DELAY_MS, [this]() {
+      this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, true);
+    });
+  });
+  return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -37,6 +37,10 @@ static constexpr uint8_t TRANSFER_KEY[16] = {
 // Commands
 namespace iohc_cmd {
 static constexpr uint8_t CMD_EXECUTE = 0x00;
+// Companion event frames emitted by real Somfy 1W remotes for every short
+// button press. The kitchen-door capture proves that idle MY needs these after
+// the normal D200 EXECUTE frame; D200 alone only stops an active movement.
+static constexpr uint8_t CMD_BUTTON_EVENT = 0x20;
 static constexpr uint8_t CMD_WRITE_PRIVATE = 0x30;
 static constexpr uint8_t CMD_REMOVE_CONTROLLER = 0x39;
 
@@ -45,6 +49,17 @@ static constexpr uint16_t MP_OPEN = 0x0000;
 static constexpr uint16_t MP_CLOSE = 0xC800;
 static constexpr uint16_t MP_STOP = 0xD200;
 static constexpr uint16_t MP_MY = 0xD800;
+
+// CMD_BUTTON_EVENT payload action byte (captured at data offset 4).
+static constexpr uint8_t BUTTON_ACTION_OPEN = 0x00;
+static constexpr uint8_t BUTTON_ACTION_CLOSE = 0x01;
+static constexpr uint8_t BUTTON_ACTION_STOP_MY = 0x02;
+
+// Delays are measured from the end of one local six-copy transmit burst. They
+// reproduce the approximately 300 ms EXECUTE-to-event and 100 ms event-to-event
+// start times of the physical remote without blocking ESPHome's main loop.
+static constexpr uint32_t MY_EVENT_DELAY_MS = 220;
+static constexpr uint32_t MY_RELEASE_DELAY_MS = 25;
 
 // Originator IDs
 static constexpr uint8_t ORIGINATOR_USER = 0x01;
@@ -165,7 +180,10 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void program();
 
   // 1W Protocol (per-device: uses device key + rolling code)
-  void send_1w_command(uint16_t main_param);
+  bool send_1w_command(uint16_t main_param);
+  bool send_1w_button_event(uint8_t action, bool released);
+  bool send_1w_my_sequence();
+  void cancel_1w_my_sequence();
   // Build a complete ordinary 1W frame. The MAC authenticates
   // cmd || data[0..auth_len); auth_len defaults to the full data length.
   // Pairing's special no-MAC 0x30 frame uses the protocol helper directly.
