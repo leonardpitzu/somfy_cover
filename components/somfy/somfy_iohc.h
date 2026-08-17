@@ -1,17 +1,27 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+
 #ifdef USE_SOMFY_IOHC
 
 #include "somfy_hub_iohc.h"
 #include "NVSRollingCodeStorage.h"
 #include "esphome/components/button/button.h"
-#include "esphome/components/time_based/cover/time_based_cover.h"
-#include "esphome/core/automation.h"
+#include "rx_sync_animator.h"
+#include "somfy_time_based_cover.h"
 #include "esphome/core/component.h"
+#include <algorithm>
 #include <cstdint>
-#include <functional>
 #include <memory>
 #include <vector>
+
+#ifdef USE_SOMFY_IOHC_RX
+namespace esphome {
+namespace text_sensor {
+class TextSensor;
+}
+}  // namespace esphome
+#endif
 
 namespace esphome {
 namespace somfy {
@@ -42,11 +52,13 @@ static constexpr uint8_t ORIGINATOR_RAIN = 0x02;
 static constexpr uint8_t ORIGINATOR_TIMER = 0x03;
 static constexpr uint8_t ORIGINATOR_SECURITY = 0x08;
 
-// ACEI (Access Control & Encryption Info)
-static constexpr uint8_t ACEI_DEFAULT = 0x43;   // 1W: standard
-static constexpr uint8_t ACEI_2W = 0xE7;        // 2W: authenticated
+// ACEI (Access Control & Encryption Info). The physical Situo 1W remote used
+// for this installation consistently transmits 0x43 in EXECUTE frames.
+static constexpr uint8_t ACEI_DEFAULT = 0x43;   // 1W
+static constexpr uint8_t ACEI_2W = 0x61;        // 2W
 
 static constexpr uint8_t TX_REPEAT_COUNT = 4;
+static constexpr uint8_t PAIR_REPEAT_COUNT = 4;
 }  // namespace iohc_cmd
 
 // Protocol mode
@@ -55,27 +67,55 @@ enum class IohcMode : uint8_t {
   MODE_2W,   // Two-way (unicast, challenge/response authenticated)
 };
 
-class SomfyIohcCover : public time_based::TimeBasedCover {
+/// Action wrapper that runs a plain callback when a cover trigger fires.
+template<typename... Ts> class SomfyIohcAction : public Action<Ts...> {
+ public:
+  explicit SomfyIohcAction(std::function<void()> callback) : callback_(std::move(callback)) {}
+  void play(Ts... x) override {
+    if (this->callback_)
+      this->callback_();
+  }
+
+ protected:
+  std::function<void()> callback_;
+};
+
+class SomfyIohcCover : public SomfyTimeBasedCover {
  public:
   void setup() override;
+#ifdef USE_SOMFY_IOHC_RX
   void loop() override;
+#endif
   void dump_config() override;
 
   // Configuration setters
   void set_hub(SomfyIohcHub *hub) { this->hub_ = hub; }
   void set_prog_button(button::Button *btn) { this->prog_button_ = btn; }
+  void set_my_button(button::Button *btn) { this->my_button_ = btn; }
+  void set_my_position(float position) {
+    this->my_position_ = position;
+    this->has_my_position_ = true;
+  }
   void set_remote_code(uint32_t code) { this->node_id_ = code & 0x00FFFFFF; }
   void set_storage_key(const char *key) { this->storage_key_ = key; }
   void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns; }
+  void set_initial_rolling_code(uint16_t code) { this->initial_rolling_code_ = code; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
   void set_encryption_key(const char *hex_key);
   void set_mode(IohcMode mode) { this->mode_ = mode; }
   void set_target_node(uint32_t node) { this->target_node_ = node & 0x00FFFFFF; }
 
-  void set_open_duration(uint32_t ms) { this->open_duration_ = ms; }
-  void set_close_duration(uint32_t ms) { this->close_duration_ = ms; }
-
-  cover::CoverTraits get_traits() override;
+#ifdef USE_SOMFY_IOHC_RX
+  // RX state-sync configuration (mirrors the RTS allowed_remotes/detected_remote
+  // feature). Codes are the 3-byte node IDs of physical io-homecontrol remotes.
+  void add_receive_remote_code(uint32_t code) {
+    code &= 0x00FFFFFF;
+    auto it = std::lower_bound(this->receive_remote_codes_.begin(), this->receive_remote_codes_.end(), code);
+    if (it == this->receive_remote_codes_.end() || *it != code)
+      this->receive_remote_codes_.insert(it, code);
+  }
+  void set_log_text_sensor(text_sensor::TextSensor *ts) { this->log_text_sensor_ = ts; }
+#endif
 
  protected:
   void control(const cover::CoverCall &call) override;
@@ -83,13 +123,21 @@ class SomfyIohcCover : public time_based::TimeBasedCover {
   // Hub reference (owns radio)
   SomfyIohcHub *hub_{nullptr};
   button::Button *prog_button_{nullptr};
+  button::Button *my_button_{nullptr};
 
   // Per-device identity
   uint32_t node_id_{0};
   uint32_t target_node_{0};  // 2W: destination actuator address
   const char *storage_key_{nullptr};
   const char *storage_namespace_{nullptr};
+  uint16_t initial_rolling_code_{1};
   int repeat_count_{iohc_cmd::TX_REPEAT_COUNT};
+
+  // Native motor favourite (MY) position, represented in ESPHome's 0..1
+  // cover scale. The value is a configured estimate because 1W has no actual
+  // position feedback.
+  float my_position_{0.5f};
+  bool has_my_position_{false};
 
   // Protocol mode
   IohcMode mode_{IohcMode::MODE_1W};
@@ -101,16 +149,28 @@ class SomfyIohcCover : public time_based::TimeBasedCover {
   // Rolling code storage
   std::unique_ptr<NVSRollingCodeStorage> storage_;
 
+  // Cover trigger wiring (open/close/stop -> radio commands)
+  std::unique_ptr<Automation<>> open_automation_;
+  std::unique_ptr<Automation<>> close_automation_;
+  std::unique_ptr<Automation<>> stop_automation_;
+  std::unique_ptr<SomfyIohcAction<>> open_action_;
+  std::unique_ptr<SomfyIohcAction<>> close_action_;
+  std::unique_ptr<SomfyIohcAction<>> stop_action_;
+
   // Commands
   void open();
   void close();
   void stop();
+  void my();
   void program();
 
   // 1W Protocol (per-device: uses device key + rolling code)
   void send_1w_command(uint16_t main_param);
-  std::vector<uint8_t> build_1w_frame(uint8_t cmd, const uint8_t *data, size_t data_len, uint32_t dest_node);
-  void compute_1w_hmac(const uint8_t *payload, size_t payload_len, uint16_t sequence, uint8_t *mac_out);
+  // Build a complete ordinary 1W frame. The MAC authenticates
+  // cmd || data[0..auth_len); auth_len defaults to the full data length.
+  // Pairing's special no-MAC 0x30 frame uses the protocol helper directly.
+  std::vector<uint8_t> build_1w_frame(uint8_t cmd, const uint8_t *data, size_t data_len,
+                                      uint32_t dest_node, size_t auth_len = SIZE_MAX);
 
   // 2W Protocol (uses challenge/response via hub session)
   void send_2w_command(uint16_t main_param);
@@ -119,21 +179,35 @@ class SomfyIohcCover : public time_based::TimeBasedCover {
   // RX handler
   void on_iohc_packet_(const IohcDecodedPacket &pkt);
 
-  // Action helper for time-based cover triggers
-  template<typename... Ts> class IohcAction : public Action<Ts...> {
-   public:
-    std::function<void(Ts...)> callback;
-    explicit IohcAction(std::function<void(Ts...)> cb) : callback(cb) {}
-    void play(Ts... x) override { if (callback) callback(x...); }
-  };
+#ifdef USE_SOMFY_IOHC_RX
+  // RX state-sync: keep HA in sync with physical io-homecontrol remotes.
+  std::vector<uint32_t> receive_remote_codes_;
+  text_sensor::TextSensor *log_text_sensor_{nullptr};
 
-  // Automations
-  std::unique_ptr<Automation<>> automation_open_;
-  std::unique_ptr<Automation<>> automation_close_;
-  std::unique_ptr<Automation<>> automation_stop_;
-  std::unique_ptr<IohcAction<>> action_open_;
-  std::unique_ptr<IohcAction<>> action_close_;
-  std::unique_ptr<IohcAction<>> action_stop_;
+  // Repeat-burst suppression: a physical remote transmits the same frame several
+  // times back-to-back (and the CC1101 hands us each copy separately). Collapse
+  // identical (src, main_param) pairs seen within a short window.
+  uint32_t rx_dedup_src_{0};
+  uint16_t rx_dedup_param_{0};
+  uint32_t rx_dedup_ms_{0};
+  bool rx_dedup_valid_{false};
+
+  // Physical-remote UI animation state.
+  RxSyncAnimator rx_sync_;
+
+  void start_rx_sync(cover::CoverOperation op);
+  void start_rx_sync_to(float target_position);
+  void stop_rx_sync();
+
+  bool is_allowed_remote_(uint32_t code) const;
+  // Decode the MainParameter from a CMD_EXECUTE packet (foreign remote command).
+  static bool decode_execute_param_(const IohcDecodedPacket &pkt, uint16_t &main_param);
+  // True if this (src, main_param) is a duplicate of the previous one inside the
+  // dedup window (i.e. part of the remote's repeat burst).
+  bool rx_is_duplicate_(uint32_t src, uint16_t main_param);
+  // Drive the HA UI animation in response to a recognised foreign command.
+  void handle_rx_command_(uint16_t main_param);
+#endif
 };
 
 }  // namespace somfy

@@ -18,7 +18,12 @@ def _install_esphome_mocks():
         """Stand-in for voluptuous / esphome config validation errors."""
 
     cv.Invalid = Invalid
+    cv.string = lambda value: str(value)
     esphome.config_validation = cv
+
+    # --- esphome.final_validate ---
+    final_validate = MagicMock()
+    esphome.final_validate = final_validate
 
     # --- esphome.const (only the symbols our modules actually import) ---
     const = MagicMock()
@@ -37,6 +42,7 @@ def _install_esphome_mocks():
         "esphome": esphome,
         "esphome.codegen": esphome.codegen,
         "esphome.config_validation": cv,
+        "esphome.final_validate": final_validate,
         "esphome.const": const,
         "esphome.components": components,
         "esphome.components.button": components.button,

@@ -8,6 +8,9 @@
 /**
  * Stores the rolling codes in the NVS of an ESP32, the codes require two bytes.
  * NVS is initialized once globally, and the namespace is opened once per instance.
+ * Code 0 is reserved as an error sentinel. A storage failure must abort a
+ * transmission: guessing or replaying a rolling code can desynchronise a
+ * scarce pairing that is difficult to recover.
  */
 class NVSRollingCodeStorage : public RollingCodeStorage {
 private:
@@ -15,10 +18,16 @@ private:
   const char *key_;
   nvs_handle handle_{0};
   bool opened_{false};
+  uint16_t initial_code_{1};
 
-  static void ensure_nvs_initialized_();
+  static bool ensure_nvs_initialized_();
+  bool open_();
+  bool read_next_(uint16_t &code);
 
 public:
-  NVSRollingCodeStorage(const char *name, const char *key);
+  NVSRollingCodeStorage(const char *name, const char *key, uint16_t initial_code = 1);
+  /// Return the next persisted code without consuming it, or 0 on error.
+  uint16_t peekNextCode();
+  /// Consume and persist the next code, or return 0 without transmitting on error.
   uint16_t nextCode() override;
 };

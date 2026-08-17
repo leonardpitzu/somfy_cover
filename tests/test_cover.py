@@ -86,6 +86,10 @@ class TestModuleMetadata:
     def test_hub_auto_load_includes_button(self):
         assert "button" in hub_mod.AUTO_LOAD
 
+    def test_hub_auto_load_includes_text_sensor(self):
+        """MY/RX builds need the text-sensor C++ base even without a sensor entity."""
+        assert "text_sensor" in hub_mod.AUTO_LOAD
+
 
 # ---------------------------------------------------------------------------
 # Module importability (regression guard)
@@ -100,10 +104,12 @@ class TestImports:
         "CONF_IOHC_MODE", "CONF_TARGET_NODE",
         "CONF_ALLOWED_REMOTES", "CONF_DETECTED_REMOTE", "CONF_REMOTE_RECEIVER",
         "CONF_PROG_BUTTON", "CONF_REPEAT_COMMAND_COUNT",
+        "CONF_INITIAL_ROLLING_CODE", "CONF_MY_BUTTON", "CONF_MY_POSITION",
         "CONF_SOMFY_STORAGE_KEY", "CONF_SOMFY_STORAGE_NAMESPACE",
         "IOHC_MODE_1W", "IOHC_MODE_2W",
         "COMMON_COVER_FIELDS",
-        "validate_iohc_config", "validate_rts_config", "uses_rx",
+        "validate_iohc_config", "validate_encryption_key",
+        "validate_rts_config", "uses_rx",
     ]
 
     EXPECTED_HUB_SYMBOLS = [

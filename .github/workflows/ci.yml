@@ -34,6 +34,8 @@ jobs:
         run: pip install -r requirements_test.txt
       - name: Run tests
         run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing
+      - name: Run IOHC protocol host tests
+        run: bash tests/cpp/run_iohc_protocol_tests.sh
 
   esphome-compile:
     name: ESPHome Compile (${{ matrix.fixture }})
@@ -41,6 +43,9 @@ jobs:
     strategy:
       matrix:
         fixture:
+          - test_iohc_1w
+          - test_iohc_1w_arduino
+          - test_iohc_2w
           - test_rts_tx_only
           - test_rts_rx
     steps:

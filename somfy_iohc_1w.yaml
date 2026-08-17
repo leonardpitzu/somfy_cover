@@ -34,21 +34,22 @@ spi:
 # The somfy iohc component will auto-configure modulation parameters.
 cc1101:
   id: cc1101_radio
-  cs_pin: GPIO6
-  gdo0_pin: GPIO04
+  cs_pin: GPIO04
+  gdo0_pin: GPIO02
   frequency: 868.95MHz
   modulation_type: 2-FSK
   symbol_rate: 38400
   fsk_deviation: 19.2kHz
   filter_bandwidth: 100kHz
+  output_power: 10
   manchester: false
   packet_mode: true
   packet_length: 0
   crc_enable: false
   sync_mode: "16/16"
-  sync1: 0xFF
-  sync0: 0x33
-  num_preamble: 4
+  sync1: 0x57
+  sync0: 0xFD
+  num_preamble: 7
 
 somfy:
   - id: iohc_radio
@@ -60,6 +61,10 @@ button:
     id: "program_bedroom_blind"
     name: "Prog Bedroom Blind"
     entity_category: config
+    disabled_by_default: true
+  - platform: template
+    id: my_bedroom_blind
+    name: "Bedroom Blind MY"
 
 cover:
   - platform: somfy
@@ -69,8 +74,12 @@ cover:
     device_class: shutter
     open_duration: 30s
     close_duration: 30s
+    my_position: 50%
+    my_button: my_bedroom_blind
     storage_key: KeyBedBlind
+    initial_rolling_code: 1
+    repeat_command_count: 6
     remote_code: 0xAABBCC
     prog_button: program_bedroom_blind
     somfy_id: iohc_radio
-    # encryption_key: "34C3466ED88F4E8E16AA473949884373"  # optional: custom key
+    encryption_key: !secret bedroom_blind_iohc_key

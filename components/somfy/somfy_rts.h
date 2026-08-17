@@ -1,9 +1,14 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+
+#ifdef USE_SOMFY_RTS
+
 #include "somfy_hub_rts.h"
 #include "NVSRollingCodeStorage.h"
+#include "rx_sync_animator.h"
+#include "somfy_time_based_cover.h"
 #include "esphome/components/button/button.h"
-#include "esphome/components/time_based/cover/time_based_cover.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include <array>
@@ -11,6 +16,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <vector>
 #include <algorithm>
 
 #ifdef USE_SOMFY_COVER_RX
@@ -24,13 +30,6 @@ class TextSensor;
 namespace esphome {
 namespace somfy {
 
-struct CoverPosition {
-  static constexpr float OPEN = 1.0f;
-  static constexpr float CLOSED = 0.0f;
-  static constexpr float UNKNOWN = -1.0f;
-  static constexpr float MIN_PUBLISH_DELTA = 0.01f;
-};
-
 // Helper class to attach cover functions to the time based cover triggers
 template <typename... Ts> class SomfyCoverAction : public Action<Ts...> {
 public:
@@ -43,7 +42,7 @@ public:
   }
 };
 
-class SomfyCover : public time_based::TimeBasedCover {
+class SomfyCover : public SomfyTimeBasedCover {
 public:
   void setup() override;
   void loop() override;
@@ -63,6 +62,7 @@ public:
   void set_remote_code(uint32_t code) { this->remote_code_ = code; }
   void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns; }
   void set_storage_key(const char *key) { this->storage_key_ = key; }
+  void set_initial_rolling_code(uint16_t code) { this->initial_rolling_code_ = code; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
 
   cover::CoverTraits get_traits() override;
@@ -78,6 +78,7 @@ protected:
   uint32_t remote_code_{0};
   const char *storage_namespace_{nullptr};
   const char *storage_key_{nullptr};
+  uint16_t initial_rolling_code_{1};
   int repeat_count_{4};
 
   // Rolling code storage
@@ -87,16 +88,15 @@ protected:
 #ifdef USE_SOMFY_COVER_RX
   std::vector<uint32_t> receive_remote_codes_;
   text_sensor::TextSensor *log_text_sensor_{nullptr};
-  bool rx_sync_active_{false};
-  cover::CoverOperation rx_operation_{cover::COVER_OPERATION_IDLE};
-  uint32_t rx_start_ms_{0};
-  float rx_start_pos_{CoverPosition::CLOSED};
-  uint32_t rx_last_publish_ms_{0};
-  float rx_last_published_pos_{CoverPosition::UNKNOWN};
+
+  // Physical-remote UI animation state.
+  RxSyncAnimator rx_sync_;
 
   // RX handler (registered on hub)
   void on_rts_frame_(const RtsDecodedFrame &frame);
   bool is_allowed_remote_(uint32_t code) const;
+  void start_rx_sync_(cover::CoverOperation op);
+  void stop_rx_sync_();
 #endif
 
   // TX
@@ -119,3 +119,5 @@ protected:
 
 } // namespace somfy
 } // namespace esphome
+
+#endif  // USE_SOMFY_RTS

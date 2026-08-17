@@ -1,5 +1,7 @@
 #pragma once
 
+#include "esphome/core/defines.h"
+
 #ifdef USE_SOMFY_IOHC
 
 #include "esphome/core/component.h"
@@ -27,16 +29,19 @@ static constexpr float FREQUENCY_2W_CH2 = 869.85e6f;
 static constexpr float FREQUENCY_2W[] = {FREQUENCY_2W_CH0, FREQUENCY_2W_CH1, FREQUENCY_2W_CH2};
 static constexpr uint32_t CHANNEL_DWELL_US = 2700;
 
-// Sync word
-static constexpr uint8_t SYNC1 = 0xFF;
-static constexpr uint8_t SYNC0 = 0x33;
+// Logical sync bytes are 0xFF 0x33. On air they are UART-encoded, so the CC1101
+// hardware sync word is programmed to iohc_proto::PHY_HW_SYNC1/0 (0x57FD), a
+// preamble-tail-aligned window of the encoded sequence — see iohc_protocol.h.
+
+// Fixed-length RX capture window (raw on-air bytes the CC1101 collects after a
+// sync match). Sized to cover the largest decodable io-homecontrol frame: a
+// largest supported logical frame UART-encodes within 60 raw bytes. The software UART
+// decoder + ctrl0 length field trim away any trailing bytes. Must stay <= 64
+// (the CC1101 FIFO depth).
+static constexpr uint8_t RX_FIFO_WINDOW = 60;
 
 // Broadcast address
 static constexpr uint32_t BROADCAST_ADDR = 0x00003F;
-
-// CRC-16-KERMIT
-static constexpr uint16_t CRC_POLY = 0x8408;
-static constexpr uint16_t CRC_INIT = 0x0000;
 
 // 2W protocol timing
 static constexpr uint32_t SESSION_TIMEOUT_MS = 3000;
@@ -54,8 +59,7 @@ static constexpr uint8_t CMD_CHALLENGE_RESPONSE = 0x3D;
 static constexpr uint8_t CMD_STATUS = 0xFE;
 
 // 2W frame control byte flags
-static constexpr uint8_t CTRL0_2W = 0x00;       // isOneWay = 0
-static constexpr uint8_t CTRL1_START_END = 0x03; // StartFrame=1, EndFrame=1
+static constexpr uint8_t CTRL1_2W = 0x00;       // no Start/End framing bits
 
 }  // namespace iohc
 
@@ -82,9 +86,6 @@ uint16_t crc16_kermit(const uint8_t *data, size_t len);
 // AES-128 ECB helper (shared between hub and devices)
 void aes128_ecb_encrypt(const uint8_t key[16], const uint8_t plaintext[16], uint8_t ciphertext[16]);
 
-// 2W checksum computation (rolling XOR per protocol spec)
-void compute_2w_checksum(const uint8_t *data, size_t len, uint8_t &chk1, uint8_t &chk2);
-
 // 2W challenge response computation
 void compute_2w_response(const uint8_t key[16], const uint8_t *frame_data, size_t frame_len,
                          const uint8_t challenge[6], uint8_t response[6]);
@@ -106,7 +107,7 @@ struct Session2W {
   uint32_t dest_node{0};
   uint8_t cmd{0};
   std::vector<uint8_t> cmd_data;
-  std::vector<uint8_t> frame_payload;  // dest+src+cmd+data (for IV computation)
+  std::vector<uint8_t> frame_payload;  // cmd+data (authenticated MAC input)
   uint8_t key[16]{};
   uint8_t challenge[6]{};
   uint32_t started_ms{0};
@@ -155,6 +156,10 @@ class SomfyIohcHub : public Component,
 
  protected:
   cc1101::CC1101Component *cc1101_{nullptr};
+
+  // Reusable UART-codec buffers, so TX and RX do not allocate per packet.
+  std::vector<uint8_t> tx_payload_;
+  std::vector<uint8_t> rx_frame_;
 
   // 2W hopping state
   bool listening_2w_{false};

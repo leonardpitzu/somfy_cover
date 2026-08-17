@@ -143,26 +143,38 @@ spi:
 
 cc1101:
   id: cc1101_radio
-  cs_pin: GPIO6
-  gdo0_pin: GPIO04
+  cs_pin: GPIO04
+  gdo0_pin: GPIO02
   frequency: 868.95MHz
   modulation_type: 2-FSK
   symbol_rate: 38400
   fsk_deviation: 19.2kHz
   filter_bandwidth: 100kHz
+  output_power: 10
+  manchester: false
   packet_mode: true
   packet_length: 0
   crc_enable: false
   sync_mode: "16/16"
-  sync1: 0xFF
-  sync0: 0x33
-  num_preamble: 4
+  sync1: 0x57
+  sync0: 0xFD
+  # Register value 7 selects the CC1101 maximum 24-byte preamble.
+  num_preamble: 7
 
 button:
   - platform: template
     id: program_bedroom_blind
     name: "Prog Bedroom Blind"
     entity_category: config
+    disabled_by_default: true
+  - platform: template
+    id: my_bedroom_blind
+    name: "Bedroom Blind MY"
+
+text_sensor:
+  - platform: template
+    id: bedroom_blind_detected_remote
+    name: "Bedroom Blind Detected Remote"
 
 somfy:
   - id: iohc_radio
@@ -177,17 +189,30 @@ cover:
     device_class: shutter
     open_duration: 30s
     close_duration: 30s
+    # Estimated position of the motor's stored MY/favourite position.
+    my_position: 42%
+    my_button: my_bedroom_blind
+    storage_namespace: somfy
     storage_key: KeyBedBlind
+    # Used only if KeyBedBlind is absent from NVS. Preserve/increase this when
+    # restoring an already-paired controller identity to replacement hardware.
+    initial_rolling_code: 1
+    repeat_command_count: 6
     remote_code: 0xAABBCC
     prog_button: program_bedroom_blind
     somfy_id: iohc_radio
-    # encryption_key: "34C3466ED88F4E8E16AA473949884373"  # optional: custom key
+    encryption_key: !secret bedroom_blind_iohc_key
+    detected_remote: bedroom_blind_detected_remote
+    allowed_remotes:
+      - 0x112233
 ```
 
 ### Notes
 
-- 1W commands (open/close/stop) are sent on **868.95 MHz** with the public io-homecontrol transfer key.
+- 1W commands (open/close/stop/MY) are sent on **868.95 MHz**. Ordinary commands use the virtual controller's private AES key; the public transfer key is used only to install that key during pairing.
 - The component handles CRC-16 (Kermit) and AES-128 HMAC in software.
+- `MY` sends the hardware-verified STOP/MY command. While idle, the motor recalls its stored favourite; while moving, it stops. `my_position` tells Home Assistant where to animate the estimate because 1W has no position feedback.
+- `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery.
 - For bidirectional (2W) support, see the next section.
 
 </details>
@@ -275,14 +300,36 @@ cover:
 | `somfy_id` | yes | Reference to the `somfy:` hub |
 | `open_duration` | yes | Time for a full open travel |
 | `close_duration` | yes | Time for a full close travel |
+| `my_position` | no, iohc | Estimated 0–100% position of the motor's stored MY/favourite position |
+| `my_button` | no, iohc | Template button that sends native STOP/MY; requires `my_position` |
+| `storage_namespace` | no | NVS namespace for rolling-code persistence; defaults to `somfy` (max 15 chars) |
 | `storage_key` | yes | NVS key for rolling code persistence (max 15 chars) |
+| `initial_rolling_code` | no | Initial code used only when the NVS key is missing; defaults to `1` |
 | `remote_code` | yes | Hex address of this virtual remote |
 | `prog_button` | yes | Button entity to trigger PROG pairing |
-| `detected_remote` | no | Text sensor for decoded remote IDs (RTS only) |
-| `allowed_remotes` | no | List of physical remote IDs to accept (RTS only) |
+| `repeat_command_count` | no | Ordinary RF command repeat count; defaults to `4` (the tested distant IOHC link uses `6`) |
+| `detected_remote` | no | Text sensor for decoded physical-remote IDs |
+| `allowed_remotes` | no | Physical remote IDs allowed to update the time-based position estimate |
 | `encryption_key` | no | Custom AES key hex string (iohc 1W: defaults to transfer key; iohc 2W: system key, required) |
 | `mode` | no | iohc only: `1w` (default) or `2w` |
 | `target_node` | 2W only | 3-byte hex address of target actuator |
+
+## Adding shutters safely
+
+Each independently controlled shutter needs its own cover block and calibration. Record all of the following next to that block:
+
+- a stable `id` and entity `name`;
+- measured `open_duration` and `close_duration`;
+- measured `my_position` and a dedicated `my_button` when the motor has a MY favourite;
+- a unique virtual-controller `remote_code` and private `encryption_key`;
+- a unique `storage_namespace`/`storage_key` pair and the next known unused `initial_rolling_code`;
+- the physical remote ID(s) in `allowed_remotes` for state synchronisation.
+
+Never reuse a `remote_code` or NVS storage key between independent cover entities. One controller identity may intentionally be paired with several shutters, but its broadcast commands will move all of them together; model that as one group cover rather than duplicate entities.
+
+To calibrate a shutter, first drive it fully closed. Time one uninterrupted trip to fully open, then time one uninterrupted trip back to fully closed, and add a small allowance (typically a few tenths of a second) so the estimate reaches the end stop. From a known end stop, recall MY and calculate its percentage from elapsed travel divided by the corresponding full-travel time. Verify 25%, 50%, 75%, MY, physical-remote sync, reboot persistence, and both end stops before relying on automations.
+
+The position is dead reckoning, not motor feedback, in 1W mode. End-stop runs correct accumulated error. A factory erase, renamed NVS key, changed controller ID/key, or accidental PROG operation can lose or consume a scarce pairing slot; back up those values before flashing or replacing hardware.
 
 ## Credits
 
