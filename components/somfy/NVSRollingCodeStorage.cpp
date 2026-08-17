@@ -32,6 +32,11 @@ bool NVSRollingCodeStorage::ensure_nvs_initialized_() {
 NVSRollingCodeStorage::NVSRollingCodeStorage(const char *name, const char *key, uint16_t initial_code)
     : name_(name), key_(key), initial_code_(initial_code == 0 ? 1 : initial_code) {}
 
+NVSRollingCodeStorage::~NVSRollingCodeStorage() {
+  if (this->opened_)
+    nvs_close(this->handle_);
+}
+
 bool NVSRollingCodeStorage::open_() {
   if (this->opened_)
     return true;

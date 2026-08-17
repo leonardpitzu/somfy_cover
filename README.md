@@ -221,6 +221,103 @@ cover:
 ---
 
 <details>
+<summary><h2>iohc GUI commissioning (multiple independent shutters)</h2></summary>
+
+`somfy_iohc_manager` turns one ESP32 + CC1101 into a reusable bridge with up
+to 20 independently controlled 1W shutter identities by default. Shutters are
+added from Home Assistant's UI; adding the second or later shutter does not
+require a YAML edit or another firmware build. Install one bridge per radio
+coverage zone and add each bridge separately to the HA integration.
+
+The manager deliberately creates a unique controller address, AES key, rolling
+code stream, physical-remote allow-list, opening time, closing time, and MY
+position for every shutter. It also maintains an AES-GCM encrypted controller
+backup after every transmitted rolling code.
+
+### ESPHome
+
+Enable custom API actions, add the manager component, create its two diagnostic
+text sensors, and configure a separate 16-byte backup-encryption key:
+
+```yaml
+api:
+  custom_services: true
+
+external_components:
+  source: github://leonardpitzu/esphome_somfy@main
+  components: [somfy, somfy_iohc_manager]
+
+text_sensor:
+  - platform: template
+    id: commissioning_status
+    name: "Commissioning Status"
+    entity_category: diagnostic
+  - platform: template
+    id: encrypted_controller_backup
+    name: "Encrypted Controller Backup"
+    entity_category: diagnostic
+
+somfy_iohc_manager:
+  id: shutter_manager
+  somfy_id: iohc_radio
+  status_sensor: commissioning_status
+  backup_sensor: encrypted_controller_backup
+  backup_key: !secret somfy_io_backup_key  # exactly 32 hex characters
+  max_shutters: 20
+```
+
+The `somfy:` hub, SPI bus, and packet-mode CC1101 block are the same as in the
+1W example above. See `tests/fixtures/test_iohc_manager.yaml` for a complete
+compilable example.
+
+An already-paired controller can be migrated into any chosen slot without any
+pairing RF by adding it under `imports:`. Preserve its existing
+`storage_namespace` and `storage_key`: the live NVS value remains authoritative
+and the YAML `initial_rolling_code` is used only if that NVS key is absent.
+
+The Home Assistant forms use one-based slot numbers **1–20**. Slot moves copy
+the controller address, AES key, remote allow-list, calibration and rolling-code
+storage reference without transmitting RF. The old slot is disabled and made
+durable before the destination is created, so an interrupted move cannot leave
+two transmit-capable copies of one controller identity.
+
+Two occupied managed slots can also be swapped directly, without a spare slot.
+Before either NVS slot is overwritten, the firmware commits a journal containing
+both complete original records and disables both runtime transmitters. Boot-time
+recovery can replay that journal after a power loss. The GUI exchanges the two
+slot numbers while keeping each shutter's Somfy device, name, area, calibration,
+encrypted backup, controller key and rolling-code stream with the same physical
+shutter. A swap emits no RF and never needs PROG.
+
+### Home Assistant
+
+Install the companion
+[Somfy IO Shutter Manager](https://github.com/Jordi-14/homeassistant_somfy_io_manager)
+custom integration through HACS. It provides graphical pairing, import,
+calibration, slot moves, occupied-slot swaps, encrypted recovery, per-shutter
+devices, native MY controls, and physical-remote diagnostics.
+
+The physical PROG press cannot be automated: it is the motor's proof that an
+already-authorized controller approved the new identity. The wizard sends the
+new pairing frame exactly once after explicit confirmation. It persists the
+uncertain `pair_sent` state before emitting any pairing RF, so even a power loss
+at that boundary cannot trigger an automatic retry. If the second jog is
+uncertain, it preserves that identity and offers a resume path instead of
+blindly generating or retransmitting controllers.
+
+The firmware status contract is versioned. This manager emits API version `1`;
+compatible Home Assistant integration releases validate that version before
+using manager events.
+
+Do not run the same restored controller identity on two powered bridges. A
+rolling-code identity has one owner; switch the old bridge off before moving a
+backup to replacement hardware.
+
+</details>
+
+---
+
+<details>
 <summary><h2>iohc configuration (2W — bidirectional)</h2></summary>
 
 2W mode enables authenticated bidirectional communication with io-homecontrol actuators. The controller sends a command, the actuator replies with a cryptographic challenge, and the controller responds to prove it holds the system key. This provides command acknowledgement and status feedback.
@@ -309,7 +406,7 @@ cover:
 | `remote_code` | yes | Hex address of this virtual remote |
 | `prog_button` | yes | Button entity to trigger PROG pairing |
 | `repeat_command_count` | no | Ordinary RF command repeat count; defaults to `4` (the tested distant IOHC link uses `6`) |
-| `detected_remote` | no | Text sensor for decoded physical-remote presses; IOHC includes rolling sequence/event IDs so repeats are logged |
+| `detected_remote` | no | Text sensor showing the physical remote ID, decoded action, raw parameter, rolling sequence, and event number |
 | `allowed_remotes` | no | Physical remote IDs allowed to update the time-based position estimate |
 | `encryption_key` | no | Custom AES key hex string (iohc 1W: defaults to transfer key; iohc 2W: system key, required) |
 | `mode` | no | iohc only: `1w` (default) or `2w` |

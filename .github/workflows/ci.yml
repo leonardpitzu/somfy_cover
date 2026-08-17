@@ -46,6 +46,7 @@ jobs:
           - test_iohc_1w
           - test_iohc_1w_arduino
           - test_iohc_2w
+          - test_iohc_manager
           - test_rts_tx_only
           - test_rts_rx
     steps:

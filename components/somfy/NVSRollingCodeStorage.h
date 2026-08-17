@@ -26,6 +26,7 @@ private:
 
 public:
   NVSRollingCodeStorage(const char *name, const char *key, uint16_t initial_code = 1);
+  ~NVSRollingCodeStorage() override;
   /// Return the next persisted code without consuming it, or 0 on error.
   uint16_t peekNextCode();
   /// Consume and persist the next code, or return 0 without transmitting on error.

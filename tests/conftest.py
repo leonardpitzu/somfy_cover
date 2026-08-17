@@ -34,6 +34,13 @@ def _install_esphome_mocks():
     const.CONF_TYPE = "type"
     esphome.const = const
 
+    # --- esphome.core ---
+    core = MagicMock()
+    core.CORE = MagicMock()
+    esphome.core = core
+    entity_helpers = MagicMock()
+    entity_helpers.register_device_class = MagicMock(return_value=1)
+
     # --- sub-packages imported by __init__.py and cover.py ---
     components = MagicMock()
     esphome.components = components
@@ -44,12 +51,15 @@ def _install_esphome_mocks():
         "esphome.config_validation": cv,
         "esphome.final_validate": final_validate,
         "esphome.const": const,
+        "esphome.core": core,
+        "esphome.core.entity_helpers": entity_helpers,
         "esphome.components": components,
         "esphome.components.button": components.button,
         "esphome.components.remote_transmitter": components.remote_transmitter,
         "esphome.components.remote_receiver": components.remote_receiver,
         "esphome.components.text_sensor": components.text_sensor,
         "esphome.components.cover": components.cover,
+        "esphome.components.somfy": components.somfy,
     }
 
     sys.modules.update(modules)

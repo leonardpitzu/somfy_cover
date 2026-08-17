@@ -13,7 +13,9 @@
 #include "esphome/core/component.h"
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
+#include <string>
 #include <vector>
 
 #ifdef USE_SOMFY_IOHC_RX
@@ -123,8 +125,32 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void set_initial_rolling_code(uint16_t code) { this->initial_rolling_code_ = code; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
   void set_encryption_key(const char *hex_key);
+  void set_encryption_key(const uint8_t key[16]);
   void set_mode(IohcMode mode) { this->mode_ = mode; }
   void set_target_node(uint32_t node) { this->target_node_ = node & 0x00FFFFFF; }
+
+  // Runtime-manager hooks. Ordinary YAML-defined covers remain enabled by
+  // default and continue to use the same paths. Managed slot covers are born
+  // disabled, then receive their persisted identity before RF is enabled.
+  void set_runtime_enabled(bool enabled) { this->runtime_enabled_ = enabled; }
+  bool is_runtime_enabled() const { return this->runtime_enabled_; }
+  void reconfigure_storage(const char *ns, const char *key, uint16_t initial_code);
+  void set_rolling_code_callback(std::function<void(uint16_t)> callback) {
+    this->rolling_code_callback_ = std::move(callback);
+  }
+  void set_remote_command_callback(std::function<void(uint16_t)> callback) {
+    this->remote_command_callback_ = std::move(callback);
+  }
+  uint16_t peek_next_rolling_code() const;
+  void runtime_clear_receive_remote_codes();
+  bool runtime_program();
+  void runtime_open();
+  void runtime_close();
+  void runtime_stop();
+  void runtime_my();
+  void runtime_set_position(float position);
+  void runtime_setup() { this->call_setup(); }
+  void runtime_loop() { this->call(); }
 
 #ifdef USE_SOMFY_IOHC_RX
   // RX state-sync configuration (mirrors the RTS allowed_remotes/detected_remote
@@ -166,9 +192,12 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Encryption key (system key for 2W, controller key for 1W)
   uint8_t encryption_key_[16]{};
   bool has_custom_key_{false};
+  bool runtime_enabled_{true};
 
   // Rolling code storage
   std::unique_ptr<NVSRollingCodeStorage> storage_;
+  std::function<void(uint16_t)> rolling_code_callback_;
+  std::function<void(uint16_t)> remote_command_callback_;
 
   // Cover trigger wiring (open/close/stop -> radio commands)
   std::unique_ptr<Automation<>> open_automation_;
@@ -183,7 +212,8 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void close();
   void stop();
   void my();
-  void program();
+  bool program();
+  uint16_t next_rolling_code_();
 
   // 1W Protocol (per-device: uses device key + rolling code)
   bool send_1w_command(uint16_t main_param);

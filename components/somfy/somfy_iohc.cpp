@@ -68,6 +68,65 @@ void SomfyIohcCover::set_encryption_key(const char *hex_key) {
   this->has_custom_key_ = true;
 }
 
+void SomfyIohcCover::set_encryption_key(const uint8_t key[16]) {
+  if (key == nullptr) {
+    ESP_LOGE(TAG, "Encryption key is missing");
+    return;
+  }
+  memcpy(this->encryption_key_, key, sizeof(this->encryption_key_));
+  this->has_custom_key_ = true;
+}
+
+void SomfyIohcCover::reconfigure_storage(const char *ns, const char *key, uint16_t initial_code) {
+  this->storage_namespace_ = ns;
+  this->storage_key_ = key;
+  this->initial_rolling_code_ = initial_code == 0 ? 1 : initial_code;
+  // This is also safe after setup: NVSRollingCodeStorage closes its old handle
+  // before the replacement stream is opened.
+  if (this->storage_ != nullptr) {
+    this->storage_ = std::make_unique<NVSRollingCodeStorage>(
+        this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
+  }
+}
+
+uint16_t SomfyIohcCover::peek_next_rolling_code() const {
+  return this->storage_ == nullptr ? 0 : this->storage_->peekNextCode();
+}
+
+void SomfyIohcCover::runtime_clear_receive_remote_codes() {
+#ifdef USE_SOMFY_IOHC_RX
+  this->receive_remote_codes_.clear();
+#endif
+}
+
+bool SomfyIohcCover::runtime_program() { return this->program(); }
+
+void SomfyIohcCover::runtime_open() {
+  auto call = this->make_call();
+  call.set_command_open();
+  call.perform();
+}
+
+void SomfyIohcCover::runtime_close() {
+  auto call = this->make_call();
+  call.set_command_close();
+  call.perform();
+}
+
+void SomfyIohcCover::runtime_stop() {
+  auto call = this->make_call();
+  call.set_command_stop();
+  call.perform();
+}
+
+void SomfyIohcCover::runtime_my() { this->my(); }
+
+void SomfyIohcCover::runtime_set_position(float position) {
+  auto call = this->make_call();
+  call.set_position(clamp(position, 0.0f, 1.0f));
+  call.perform();
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -75,9 +134,14 @@ void SomfyIohcCover::set_encryption_key(const char *hex_key) {
 void SomfyIohcCover::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Somfy iohc cover...");
 
-  this->storage_ = std::make_unique<NVSRollingCodeStorage>(
-      this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
-  const uint16_t next_code = this->storage_->peekNextCode();
+  if (this->storage_namespace_ == nullptr || this->storage_key_ == nullptr) {
+    ESP_LOGE(TAG, "Rolling-code storage identity is missing; RF transmission will remain disabled");
+    this->runtime_enabled_ = false;
+  } else {
+    this->storage_ = std::make_unique<NVSRollingCodeStorage>(
+        this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
+  }
+  const uint16_t next_code = this->storage_ == nullptr ? 0 : this->storage_->peekNextCode();
   if (next_code == 0) {
     ESP_LOGE(TAG, "Rolling-code storage is unavailable; RF transmission will remain disabled");
   } else {
@@ -106,7 +170,8 @@ void SomfyIohcCover::setup() {
   this->stop_automation_ = std::make_unique<Automation<>>(this->get_stop_trigger());
   this->stop_automation_->add_action(this->stop_action_.get());
 
-  this->prog_button_->add_on_press_callback([this]() { this->program(); });
+  if (this->prog_button_ != nullptr)
+    this->prog_button_->add_on_press_callback([this]() { this->program(); });
   if (this->my_button_ != nullptr)
     this->my_button_->add_on_press_callback([this]() { this->my(); });
 
@@ -198,6 +263,10 @@ void SomfyIohcCover::my() {
 }
 
 void SomfyIohcCover::control(const cover::CoverCall &call) {
+  if (!this->runtime_enabled_) {
+    ESP_LOGW(TAG, "Ignoring command for an unused managed shutter slot");
+    return;
+  }
 #ifdef USE_SOMFY_IOHC_RX
   // A Home Assistant command supersedes passive physical-remote/MY animation.
   const bool was_external_animation = this->rx_sync_.active();
@@ -222,7 +291,11 @@ void SomfyIohcCover::control(const cover::CoverCall &call) {
   SomfyTimeBasedCover::control(call);
 }
 
-void SomfyIohcCover::program() {
+bool SomfyIohcCover::program() {
+  if (!this->runtime_enabled_ || this->hub_ == nullptr || this->storage_ == nullptr) {
+    ESP_LOGE(TAG, "PROG refused: controller identity/storage is not active");
+    return false;
+  }
   ESP_LOGI(TAG, "PROG (pair): node=0x%06" PRIX32 " -> dest=BROADCAST(0x%06" PRIX32 ") repeat=%u", this->node_id_,
            static_cast<uint32_t>(iohc::BROADCAST_ADDR), iohc_cmd::PAIR_REPEAT_COUNT);
 
@@ -232,7 +305,7 @@ void SomfyIohcCover::program() {
       this->build_1w_frame(iohc_cmd::CMD_REMOVE_CONTROLLER, remove_data, sizeof(remove_data), iohc::BROADCAST_ADDR);
   if (frame_remove.empty()) {
     ESP_LOGE(TAG, "PROG aborted: could not build remove-controller frame");
-    return;
+    return false;
   }
   ESP_LOGD(TAG, "PROG: tx CMD_REMOVE_CONTROLLER (0x%02X), %u bytes",
            iohc_cmd::CMD_REMOVE_CONTROLLER, static_cast<unsigned>(frame_remove.size()));
@@ -251,17 +324,17 @@ void SomfyIohcCover::program() {
   uint8_t encrypted_key[16];
   iohc_proto::obfuscate_key_1w(aes128_ecb_encrypt, iohc_keys::TRANSFER_KEY, this->node_id_,
                                this->encryption_key_, encrypted_key);
-  const uint16_t key_sequence = this->storage_->nextCode();
+  const uint16_t key_sequence = this->next_rolling_code_();
   if (key_sequence == 0) {
     ESP_LOGE(TAG, "PROG aborted: rolling-code storage unavailable or exhausted");
-    return;
+    return false;
   }
   std::vector<uint8_t> frame_key;
   if (!iohc_proto::build_key_transfer_frame_1w(this->node_id_, iohc::BROADCAST_ADDR,
                                                 encrypted_key, 0x02, 0x01,
                                                 key_sequence, 0x00, frame_key)) {
     ESP_LOGE(TAG, "PROG aborted: could not build key-transfer frame");
-    return;
+    return false;
   }
   const uint16_t key_crc = static_cast<uint16_t>(frame_key[frame_key.size() - 2]) |
                            (static_cast<uint16_t>(frame_key[frame_key.size() - 1]) << 8);
@@ -270,6 +343,7 @@ void SomfyIohcCover::program() {
            static_cast<unsigned>(frame_key.size()));
   this->hub_->transmit_packet(frame_key, iohc_cmd::PAIR_REPEAT_COUNT);
   ESP_LOGI(TAG, "PROG: pairing frames sent");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -405,7 +479,7 @@ std::vector<uint8_t> SomfyIohcCover::build_1w_frame(uint8_t cmd, const uint8_t *
   if (auth_len == SIZE_MAX || auth_len > data_len)
     auth_len = data_len;
 
-  const uint16_t sequence = this->storage_->nextCode();
+  const uint16_t sequence = this->next_rolling_code_();
   if (sequence == 0) {
     ESP_LOGE(TAG, "Cannot build 1W frame cmd=0x%02X: rolling-code storage unavailable or exhausted", cmd);
     return {};
@@ -425,11 +499,23 @@ std::vector<uint8_t> SomfyIohcCover::build_1w_frame(uint8_t cmd, const uint8_t *
   return frame;
 }
 
+uint16_t SomfyIohcCover::next_rolling_code_() {
+  if (this->storage_ == nullptr)
+    return 0;
+  const uint16_t sequence = this->storage_->nextCode();
+  if (sequence != 0 && this->rolling_code_callback_)
+    this->rolling_code_callback_(static_cast<uint16_t>(sequence + 1));
+  return sequence;
+}
+
 // ---------------------------------------------------------------------------
 // RX callback from hub
 // ---------------------------------------------------------------------------
 
 void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
+  if (!this->runtime_enabled_)
+    return;
+
 #ifdef USE_SOMFY_IOHC_RX
   // --- State-sync + discovery: surface movement commands sent by physical
   //     io-homecontrol remotes so the HA UI matches the motor when driven
@@ -475,6 +561,8 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
         return;  // repeat frame from the remote's burst — already handled
       ESP_LOGD(TAG, "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
                pkt.src_node, main_param_name(main_param), main_param, pkt.rssi);
+      if (this->remote_command_callback_)
+        this->remote_command_callback_(main_param);
       this->handle_rx_command_(main_param);
       return;
     }
