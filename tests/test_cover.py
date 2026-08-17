@@ -4,8 +4,10 @@ Focuses on structural integrity, cross-module consistency, and schema
 composition rather than trivial string equality.
 """
 
-import pytest
+from typing import ClassVar
 
+import pytest
+import somfy as hub_mod
 import somfy.cover as cover_mod
 from somfy.cover import (
     CODEOWNERS,
@@ -14,9 +16,6 @@ from somfy.cover import (
     TYPE_IOHC,
     TYPE_RTS,
 )
-
-import somfy as hub_mod
-
 
 # ---------------------------------------------------------------------------
 # Cross-module consistency
@@ -98,7 +97,7 @@ class TestModuleMetadata:
 class TestImports:
     """All public symbols must be importable — catches accidental renames."""
 
-    EXPECTED_COVER_SYMBOLS = [
+    EXPECTED_COVER_SYMBOLS: ClassVar[list[str]] = [
         "TYPE_RTS", "TYPE_IOHC",
         "CONF_SOMFY_ID", "CONF_REMOTE_CODE", "CONF_ENCRYPTION_KEY",
         "CONF_IOHC_MODE", "CONF_TARGET_NODE",
@@ -112,9 +111,9 @@ class TestImports:
         "validate_rts_config", "uses_rx",
     ]
 
-    EXPECTED_HUB_SYMBOLS = [
+    EXPECTED_HUB_SYMBOLS: ClassVar[list[str]] = [
         "CONF_REMOTE_TRANSMITTER", "CONF_REMOTE_RECEIVER", "CONF_CC1101_ID",
-        "TYPE_RTS", "TYPE_IOHC", "MULTI_CONF",
+        "TYPE_RTS", "TYPE_IOHC", "MULTI_CONF", "DOMAIN",
     ]
 
     @pytest.mark.parametrize("symbol", EXPECTED_COVER_SYMBOLS)

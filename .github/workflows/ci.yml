@@ -3,19 +3,28 @@ name: CI
 on:
   push:
     branches: [main, master]
+    paths-ignore: ["**.md", ".gitignore", "LICENSE"]
   pull_request:
-    branches: [main, master]
+    paths-ignore: ["**.md", ".gitignore", "LICENSE"]
   schedule:
     # Weekly build to catch breakage from ESPHome updates
     - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   ruff:
     name: Lint (Ruff)
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install ruff
@@ -25,21 +34,39 @@ jobs:
   tests:
     name: Tests
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements_test.txt
       - name: Install test dependencies
         run: pip install -r requirements_test.txt
+      # Floor is a ratchet against regression, not a target. Much of cover.py is
+      # async to_code() codegen that only the ESPHome compile jobs exercise.
       - name: Run tests
-        run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing
-      - name: Run IOHC protocol host tests
-        run: bash tests/cpp/run_iohc_protocol_tests.sh
+        run: pytest tests/ -v --cov=components/somfy --cov-report=term-missing --cov-fail-under=50
+
+  cpp-tests:
+    name: Host tests (C++)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      # The protocol test uses OpenSSL as an independent AES oracle on Linux
+      # (CommonCrypto on macOS).
+      - name: Install OpenSSL headers
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev
+      # Compile production sources against the minimal host stubs.
+      - name: Run C++ suites
+        run: tests/cpp/run.sh
 
   esphome-compile:
     name: ESPHome Compile (${{ matrix.fixture }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       matrix:
         fixture:
@@ -50,14 +77,14 @@ jobs:
           - test_rts_tx_only
           - test_rts_rx
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install ESPHome
         run: pip install esphome
       - name: Cache PlatformIO
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: ~/.platformio
           key: pio-${{ runner.os }}-${{ hashFiles('components/**') }}

@@ -113,3 +113,6 @@ CTestTestfile.cmake
 # Tests build artifacts
 tests/build/
 tests/.esphome/
+
+# Agent memory (local only — never publish)
+AGENTS.md
