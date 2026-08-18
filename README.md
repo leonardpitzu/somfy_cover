@@ -216,6 +216,32 @@ cover:
 - `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery. `detected_remote` includes the received rolling sequence and an event number, so repeated presses of the same button remain separate Home Assistant history entries while RF copies from one burst are collapsed.
 - For bidirectional (2W) support, see the next section.
 
+### Receive-only raw capture (experimental)
+
+`somfy_iohc_capture` is a diagnostic component for investigating commands from
+real io-homecontrol remotes before implementing new device types. It has no
+controller key, rolling-code storage, transmit method, pairing action or API
+service. Every CRC-valid RF copy is published separately; do not press PROG
+during a capture.
+
+Include `somfy_iohc_capture` in the `external_components` list and add:
+
+```yaml
+somfy_iohc_capture:
+  id: iohc_raw_capture
+  somfy_id: iohc_radio
+  # Optional after the first capture. Omit to hear every valid iohc frame.
+  # remote_code: 0x112233
+  capture:
+    name: "IOHC Raw Frame Capture"
+```
+
+The diagnostic state and the `somfy.iohc.capture` INFO log contain a unique
+event number, source/destination, command ID, both frame-control bytes, RSSI,
+LQI, complete command data, and the complete logical frame. Raw frames contain
+controller identifiers and authenticated values, so treat captures as private
+diagnostic material.
+
 </details>
 
 ---

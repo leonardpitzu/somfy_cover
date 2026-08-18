@@ -349,6 +349,8 @@ void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
 
   // Parse header
   IohcDecodedPacket pkt;
+  pkt.ctrl0 = packet[0];
+  pkt.ctrl1 = packet[1];
   pkt.dest_node = (static_cast<uint32_t>(packet[2]) << 16) |
                   (static_cast<uint32_t>(packet[3]) << 8) |
                   static_cast<uint32_t>(packet[4]);
@@ -358,6 +360,8 @@ void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
   pkt.cmd = packet[8];
   pkt.data = (packet.size() > 11) ? &packet[9] : nullptr;
   pkt.data_len = (packet.size() > 11) ? packet.size() - 11 : 0;  // 9 header + 2 CRC
+  pkt.frame = packet.data();
+  pkt.frame_len = packet.size();
   pkt.rssi = rssi;
   pkt.lqi = lqi;
 

@@ -79,3 +79,10 @@ somfy_iohc_manager:
       close_duration: 29.8s
       my_position: 42%
       repeat_command_count: 6
+
+somfy_iohc_capture:
+  id: iohc_raw_capture
+  somfy_id: iohc_hub
+  remote_code: 0x654321
+  capture:
+    name: "IOHC Raw Frame Capture"

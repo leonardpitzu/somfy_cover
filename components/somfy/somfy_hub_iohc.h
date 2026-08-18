@@ -63,13 +63,19 @@ static constexpr uint8_t CTRL1_2W = 0x00;       // no Start/End framing bits
 
 }  // namespace iohc
 
-// Decoded iohc RX packet (from 2W feedback)
+// Decoded CRC-valid iohc RX packet. The frame/data pointers remain valid only
+// for the duration of the registered RX callbacks; consumers that need them
+// later must copy the bytes.
 struct IohcDecodedPacket {
+  uint8_t ctrl0{0};
+  uint8_t ctrl1{0};
   uint32_t dest_node{0};
   uint32_t src_node{0};
   uint8_t cmd{0};
   const uint8_t *data{nullptr};
   size_t data_len{0};
+  const uint8_t *frame{nullptr};
+  size_t frame_len{0};
   float rssi{0};
   uint8_t lqi{0};
 };
