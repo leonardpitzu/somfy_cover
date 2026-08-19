@@ -213,7 +213,7 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   bool complete_swap_(const ManagedSwapJournal &journal);
   bool recover_pending_swap_();
   void start_discovery_(uint8_t slot);
-  void arm_pairing_(uint8_t slot);
+  void arm_pairing_(uint8_t slot, bool retry);
   void transmit_pairing_(uint8_t slot);
   void confirm_pairing_(uint8_t slot);
   void discard_staged_(uint8_t slot);

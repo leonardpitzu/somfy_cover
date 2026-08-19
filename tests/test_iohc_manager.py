@@ -77,6 +77,36 @@ def test_pairing_uncertainty_is_persisted_before_rf():
     )
 
 
+def test_uncertain_pairing_can_only_retry_the_same_persisted_identity():
+    source = _manager_cpp()
+    service = source.split("void SomfyIohcManager::commission_service", 1)[1]
+    service = service.split("void SomfyIohcManager::calibrate_service", 1)[0]
+    assert 'action == "retry_arm"' in service
+    assert "arm_pairing_(static_cast<uint8_t>(slot), true)" in service
+
+    arm = source.split("void SomfyIohcManager::arm_pairing_", 1)[1]
+    arm = arm.split("void SomfyIohcManager::transmit_pairing_", 1)[0]
+    assert "retry ? ManagedSlotState::PAIR_SENT" in arm
+    assert 'retry ? "slot_not_pair_sent" : "slot_not_staged"' in arm
+
+    transmit = source.split("void SomfyIohcManager::transmit_pairing_", 1)[1]
+    transmit = transmit.split("void SomfyIohcManager::confirm_pairing_", 1)[0]
+    assert "state != ManagedSlotState::STAGED" in transmit
+    assert "state != ManagedSlotState::PAIR_SENT" in transmit
+    assert "const bool retry = state == ManagedSlotState::PAIR_SENT" in transmit
+    assert "default_record_" not in transmit
+    assert "erase_record_" not in transmit
+
+    discard = source.split("void SomfyIohcManager::discard_staged_", 1)[1]
+    discard = discard.split("void SomfyIohcManager::publish_status_", 1)[0]
+    assert "ManagedSlotState::STAGED" in discard
+    assert "ManagedSlotState::PAIR_SENT" not in discard
+
+
+def test_manager_advertises_same_identity_pairing_retry_capability():
+    assert r'\"pair_retry\":true' in _manager_cpp()
+
+
 def test_exhausted_rolling_code_backup_cannot_be_restored():
     source = _manager_cpp()
     function = source.split("void SomfyIohcManager::restore_service", 1)[1]

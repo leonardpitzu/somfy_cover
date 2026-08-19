@@ -366,7 +366,9 @@ void SomfyIohcManager::commission_service(std::string action, int32_t slot) {
   } else if (action == "discover") {
     this->start_discovery_(static_cast<uint8_t>(slot));
   } else if (action == "arm") {
-    this->arm_pairing_(static_cast<uint8_t>(slot));
+    this->arm_pairing_(static_cast<uint8_t>(slot), false);
+  } else if (action == "retry_arm") {
+    this->arm_pairing_(static_cast<uint8_t>(slot), true);
   } else if (action == "pair") {
     this->transmit_pairing_(static_cast<uint8_t>(slot));
   } else if (action == "confirm") {
@@ -1506,10 +1508,14 @@ void SomfyIohcManager::start_discovery_(uint8_t slot) {
   this->publish_status_("waiting_remote", slot);
 }
 
-void SomfyIohcManager::arm_pairing_(uint8_t slot) {
+void SomfyIohcManager::arm_pairing_(uint8_t slot, bool retry) {
   const auto &record = this->slots_[slot].record;
-  if (static_cast<ManagedSlotState>(record.state) != ManagedSlotState::STAGED) {
-    this->publish_status_("error", slot, "slot_not_staged");
+  const auto state = static_cast<ManagedSlotState>(record.state);
+  const auto required_state = retry ? ManagedSlotState::PAIR_SENT
+                                    : ManagedSlotState::STAGED;
+  if (state != required_state) {
+    this->publish_status_("error", slot,
+                          retry ? "slot_not_pair_sent" : "slot_not_staged");
     return;
   }
   if (this->armed_slot_ >= 0 && this->armed_slot_ != static_cast<int8_t>(slot)) {
@@ -1522,7 +1528,9 @@ void SomfyIohcManager::arm_pairing_(uint8_t slot) {
   }
   this->armed_slot_ = static_cast<int8_t>(slot);
   this->arm_deadline_ms_ = millis() + PAIR_ARM_TIMEOUT_MS;
-  this->publish_status_("armed", slot, "pair_within_60_seconds");
+  this->publish_status_("armed", slot,
+                        retry ? "retry_pair_within_60_seconds"
+                              : "pair_within_60_seconds");
 }
 
 void SomfyIohcManager::transmit_pairing_(uint8_t slot) {
@@ -1534,14 +1542,22 @@ void SomfyIohcManager::transmit_pairing_(uint8_t slot) {
   }
   this->armed_slot_ = -1;  // one transmission per explicit arming
   auto &record = this->slots_[slot].record;
+  const auto state = static_cast<ManagedSlotState>(record.state);
+  if (state != ManagedSlotState::STAGED && state != ManagedSlotState::PAIR_SENT) {
+    this->publish_status_("error", slot, "slot_not_pairable");
+    return;
+  }
+  const bool retry = state == ManagedSlotState::PAIR_SENT;
   // Persist the uncertain state *before* the first RF byte is emitted. If
   // power is lost during transmission, reboot must never make this identity
   // look staged and therefore eligible for an automatic second attempt.
-  record.state = static_cast<uint8_t>(ManagedSlotState::PAIR_SENT);
-  if (!this->save_record_(slot)) {
-    record.state = static_cast<uint8_t>(ManagedSlotState::STAGED);
-    this->publish_status_("error", slot, "pairing_state_save_failed");
-    return;
+  if (!retry) {
+    record.state = static_cast<uint8_t>(ManagedSlotState::PAIR_SENT);
+    if (!this->save_record_(slot)) {
+      record.state = static_cast<uint8_t>(ManagedSlotState::STAGED);
+      this->publish_status_("error", slot, "pairing_state_save_failed");
+      return;
+    }
   }
   if (!this->slots_[slot].cover->runtime_program()) {
     // The remove burst may already have left the radio. Retain PAIR_SENT and
@@ -1551,7 +1567,9 @@ void SomfyIohcManager::transmit_pairing_(uint8_t slot) {
     return;
   }
   this->publish_backup_(slot);
-  this->publish_status_("pair_sent", slot, "confirm_motor_jog");
+  this->publish_status_("pair_sent", slot,
+                        retry ? "confirm_retry_motor_jog"
+                              : "confirm_motor_jog");
 }
 
 void SomfyIohcManager::confirm_pairing_(uint8_t slot) {
@@ -1619,7 +1637,7 @@ void SomfyIohcManager::publish_status_(
   slots += ']';
   char output[384];
   snprintf(output, sizeof(output),
-           "{\"v\":1,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
+           "{\"v\":1,\"pair_retry\":true,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
            ",\"slots\":%s"
            ",\"steps\":%u"
            ",\"state\":\"%s\",\"node\":\"0x%06" PRIX32 "\",\"remote\":\"0x%06" PRIX32
