@@ -33,12 +33,15 @@ static constexpr uint32_t CHANNEL_DWELL_US = 2700;
 // hardware sync word is programmed to iohc_proto::PHY_HW_SYNC1/0 (0x57FD), a
 // preamble-tail-aligned window of the encoded sequence — see iohc_protocol.h.
 
-// Fixed-length RX capture window (raw on-air bytes the CC1101 collects after a
-// sync match). Sized to cover the largest decodable io-homecontrol frame: a
-// largest supported logical frame UART-encodes within 60 raw bytes. The software UART
-// decoder + ctrl0 length field trim away any trailing bytes. Must stay <= 64
-// (the CC1101 FIFO depth).
-static constexpr uint8_t RX_FIFO_WINDOW = 60;
+// Fixed-length RX capture windows (raw on-air bytes collected after a sync
+// match). The hardware-validated 1W receiver uses 60 bytes so a complete frame
+// can be recovered from the remote's repeated burst despite CC1101 sync/FIFO
+// alignment. Shortening it to the encoded application-frame size prevented
+// the FIFO from completing on real Situo presses. Both windows must stay <= 64
+// bytes (the CC1101 FIFO depth); the software UART decoder and ctrl0 length
+// field discard trailing bytes.
+static constexpr uint8_t RX_FIFO_WINDOW_1W = 60;
+static constexpr uint8_t RX_FIFO_WINDOW_2W = 60;
 
 // Broadcast address
 static constexpr uint32_t BROADCAST_ADDR = 0x00003F;
@@ -158,6 +161,13 @@ class SomfyIohcHub : public Component,
     this->rx_callbacks_.push_back(std::move(callback));
   }
 
+  // Monotonic boot-local counters for reception diagnostics. A raw packet has
+  // passed the CC1101 sync/FIFO layer; a valid frame also passed UART decode,
+  // length validation, and protocol CRC.
+  uint32_t get_rx_raw_packet_count() const { return this->rx_raw_packet_count_; }
+  uint32_t get_rx_valid_frame_count() const { return this->rx_valid_frame_count_; }
+  float get_last_valid_rssi() const { return this->last_valid_rssi_; }
+
   // CC1101Listener interface
   void on_packet(const std::vector<uint8_t> &packet, float freq_offset, float rssi, uint8_t lqi) override;
 
@@ -176,6 +186,9 @@ class SomfyIohcHub : public Component,
 
   // RX dispatch
   std::vector<IohcRxCallback> rx_callbacks_;
+  uint32_t rx_raw_packet_count_{0};
+  uint32_t rx_valid_frame_count_{0};
+  float last_valid_rssi_{0.0f};
 
   // 2W session management
   Session2W session_;

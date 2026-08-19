@@ -122,6 +122,63 @@ def test_slot_swap_is_registered_as_a_local_api_action():
     assert '"somfy_swap", {"slot", "target_slot"}' in source
 
 
+def test_group_remote_aliases_are_many_to_many_and_receive_only():
+    root = Path(__file__).parent.parent
+    source = _manager_cpp()
+    header = (
+        root
+        / "components"
+        / "somfy_iohc_manager"
+        / "somfy_iohc_manager.h"
+    ).read_text()
+
+    assert "IOHC_MANAGER_MAX_REMOTE_ALIASES = 32" in header
+    assert "node_ids[IOHC_MANAGER_MAX_SHUTTERS]" in header
+    assert '"somfy_remote_alias"' in source
+    service = source.split("void SomfyIohcManager::remote_alias_service", 1)[1]
+    service = service.split("bool SomfyIohcManager::parse_remote_code_", 1)[0]
+    assert 'action == "discover"' in service
+    assert 'action == "set"' in service
+    assert 'action == "remove"' in service
+    assert "runtime_program" not in service
+
+
+def test_group_remote_membership_uses_permanent_nodes_not_slot_positions():
+    source = _manager_cpp()
+    resolver = source.split("bool SomfyIohcManager::resolve_alias_slots_", 1)[1]
+    resolver = resolver.split("std::string SomfyIohcManager::alias_slots_for_nodes_", 1)[0]
+    assert "managed.record.node_id" in resolver
+    apply_filter = source.split(
+        "void SomfyIohcManager::apply_slot_remote_filters_", 1
+    )[1]
+    apply_filter = apply_filter.split(
+        "bool SomfyIohcManager::complete_move_", 1
+    )[0]
+    assert "record.node_id" in apply_filter
+    assert "alias.record.remote_code" in apply_filter
+
+
+def test_group_remote_capture_requires_a_user_movement_command():
+    source = _manager_cpp()
+    receiver = source.split("void SomfyIohcManager::on_iohc_packet_", 1)[1]
+    assert "alias_discovery_active_" in receiver
+    assert "packet.dest_node == iohc::BROADCAST_ADDR" in receiver
+    assert "main_param == iohc_cmd::MP_OPEN" in receiver
+    assert "main_param == iohc_cmd::MP_CLOSE" in receiver
+    assert '"alias_remote_detected"' in receiver
+
+
+def test_remote_events_report_the_actual_group_source_and_rssi():
+    root = Path(__file__).parent.parent
+    source = _manager_cpp()
+    cover_header = (root / "components" / "somfy" / "somfy_iohc.h").read_text()
+    cover_source = (root / "components" / "somfy" / "somfy_iohc.cpp").read_text()
+    assert "std::function<void(uint16_t, uint32_t, float)>" in cover_header
+    assert "event_code, pkt.src_node, pkt.rssi" in cover_source
+    assert "main_param, pkt.src_node, pkt.rssi" in cover_source
+    assert 'publish_status_("remote_command", index, detail, rssi, remote)' in source
+
+
 def test_manager_exposes_versioned_status_without_native_ui_buttons():
     root = Path(__file__).parent.parent
     manager_python = (

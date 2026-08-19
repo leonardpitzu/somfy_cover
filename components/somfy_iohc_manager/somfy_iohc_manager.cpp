@@ -26,6 +26,7 @@ constexpr uint32_t RECORD_MAGIC = 0x53494F4D;  // "SIOM"
 constexpr uint8_t RECORD_VERSION = 1;
 constexpr const char *REGISTRY_NAMESPACE = "somfy_mgr";
 constexpr uint32_t DISCOVERY_TIMEOUT_MS = 120000;
+constexpr uint32_t ALIAS_DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t PAIR_ARM_TIMEOUT_MS = 60000;
 constexpr uint8_t BACKUP_FORMAT_VERSION = 1;
 constexpr size_t GCM_NONCE_SIZE = 12;
@@ -55,9 +56,15 @@ constexpr uint32_t DURATION_MS_MASK = 0x00FFFFFFUL;
 constexpr uint8_t MY_TILT_STEP_SHIFT = 24;
 constexpr uint32_t SWAP_JOURNAL_MAGIC = 0x53574150;  // "SWAP"
 constexpr uint8_t SWAP_JOURNAL_VERSION = 1;
+constexpr uint32_t REMOTE_ALIAS_MAGIC = 0x5349414C;  // "SIAL"
+constexpr uint8_t REMOTE_ALIAS_VERSION = 1;
 
 void record_key(uint8_t slot, char output[8]) {
   snprintf(output, 8, "slot%02u", static_cast<unsigned>(slot));
+}
+
+void remote_alias_key(uint8_t index, char output[9]) {
+  snprintf(output, 9, "alias%02u", static_cast<unsigned>(index));
 }
 
 std::string hex_encode(const uint8_t *data, size_t length) {
@@ -180,10 +187,12 @@ void SomfyIohcManager::create_slots() {
         slot.record.initial_rolling_code);
     slot.cover->set_rolling_code_callback(
         [this, index](uint16_t next_code) { this->on_rolling_code_(index, next_code); });
-    slot.cover->set_remote_command_callback([this, index](uint16_t main_param) {
+    slot.cover->set_remote_command_callback(
+        [this, index](uint16_t main_param, uint32_t remote, float rssi) {
+      this->accepted_remote_command_count_++;
       char detail[7];
       snprintf(detail, sizeof(detail), "0x%04X", main_param);
-      this->publish_status_("remote_command", index, detail);
+      this->publish_status_("remote_command", index, detail, rssi, remote);
     });
 
     // Slot entities are intentionally disabled until the HA commissioning flow
@@ -254,6 +263,10 @@ void SomfyIohcManager::setup() {
     this->mark_failed();
     return;
   }
+  if (!this->load_remote_aliases_()) {
+    this->mark_failed();
+    return;
+  }
 
   for (uint8_t index = 0; index < this->slots_.size(); index++) {
     this->apply_slot_(index);
@@ -284,6 +297,9 @@ void SomfyIohcManager::setup() {
       &SomfyIohcManager::move_service, "somfy_move", {"slot", "target_slot"});
   this->register_service(
       &SomfyIohcManager::swap_service, "somfy_swap", {"slot", "target_slot"});
+  this->register_service(
+      &SomfyIohcManager::remote_alias_service, "somfy_remote_alias",
+      {"action", "remote", "slots"});
 
   this->publish_status_("ready", -1);
   this->set_timeout("initial-backups", 1000, [this]() {
@@ -311,20 +327,30 @@ void SomfyIohcManager::loop() {
     this->armed_slot_ = -1;
     this->publish_status_("error", slot, "pairing_arm_expired");
   }
+  if (this->alias_discovery_active_ &&
+      static_cast<int32_t>(now - this->alias_discovery_deadline_ms_) >= 0) {
+    this->alias_discovery_active_ = false;
+    this->publish_status_("error", -1, "remote_alias_discovery_timeout");
+  }
 }
 
 void SomfyIohcManager::dump_config() {
   uint8_t active = 0;
   uint8_t uncertain = 0;
+  uint8_t aliases = 0;
   for (const auto &slot : this->slots_) {
     const auto state = static_cast<ManagedSlotState>(slot.record.state);
     if (state == ManagedSlotState::ACTIVE) active++;
     if (state == ManagedSlotState::PAIR_SENT) uncertain++;
   }
+  for (const auto &alias : this->remote_aliases_)
+    if (alias.has_record)
+      aliases++;
   ESP_LOGCONFIG(TAG, "Somfy IO commissioning manager:");
   ESP_LOGCONFIG(TAG, "  Slots: %u", static_cast<unsigned>(this->slots_.size()));
   ESP_LOGCONFIG(TAG, "  Active shutters: %u", active);
   ESP_LOGCONFIG(TAG, "  Uncertain pairing attempts: %u", uncertain);
+  ESP_LOGCONFIG(TAG, "  Receive-only group remotes: %u", aliases);
   ESP_LOGCONFIG(TAG, "  Encrypted recovery backup: enabled");
 }
 
@@ -349,6 +375,8 @@ void SomfyIohcManager::commission_service(std::string action, int32_t slot) {
   } else if (action == "export") {
     this->publish_backup_(static_cast<uint8_t>(slot));
     this->publish_status_("backup_exported", slot);
+  } else if (action == "rx_stats") {
+    this->publish_rx_stats_(slot);
   } else {
     this->publish_status_("error", slot, "unknown_action");
   }
@@ -406,6 +434,8 @@ void SomfyIohcManager::venetian_service(
     return;
   }
 
+  const uint16_t previous_flags = managed.record.flags;
+  const uint32_t previous_close_duration = managed.record.close_duration_ms;
   managed.record.flags &= ~(FLAG_VENETIAN | FLAG_TILT_INVERTED |
                             FLAG_TILT_STEPS_MASK);
   if (enabled) {
@@ -419,12 +449,16 @@ void SomfyIohcManager::venetian_service(
   } else {
     managed.record.close_duration_ms &= DURATION_MS_MASK;
   }
-  if (!this->save_record_(static_cast<uint8_t>(slot))) {
-    this->publish_status_("error", slot, "storage_write_failed");
-    return;
+  const bool changed = managed.record.flags != previous_flags ||
+                       managed.record.close_duration_ms != previous_close_duration;
+  if (changed) {
+    if (!this->save_record_(static_cast<uint8_t>(slot))) {
+      this->publish_status_("error", slot, "storage_write_failed");
+      return;
+    }
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_backup_(static_cast<uint8_t>(slot));
   }
-  this->apply_slot_(static_cast<uint8_t>(slot));
-  this->publish_backup_(static_cast<uint8_t>(slot));
   this->publish_status_("venetian_configured", slot,
                         enabled ? "venetian" : "shutter");
 }
@@ -636,6 +670,248 @@ void SomfyIohcManager::swap_service(int32_t slot, int32_t target_slot) {
   this->publish_status_("swapped", slot, detail);
 }
 
+void SomfyIohcManager::remote_alias_service(
+    std::string action, std::string remote, std::string slots) {
+  uint32_t remote_code = 0;
+  if (action == "discover") {
+    this->start_alias_discovery_(slots);
+    return;
+  }
+  if (action == "cancel") {
+    this->alias_discovery_active_ = false;
+    this->captured_alias_remote_ = 0;
+    this->captured_alias_rssi_ = 0.0f;
+    this->alias_discovery_nodes_.clear();
+    this->publish_status_("alias_capture_cancelled", -1);
+    return;
+  }
+  if (action == "query" && remote.empty()) {
+    if (this->captured_alias_remote_ == 0) {
+      this->publish_status_("error", -1, "remote_alias_not_detected");
+      return;
+    }
+    const std::string selected =
+        this->alias_slots_for_nodes_(this->alias_discovery_nodes_);
+    this->publish_status_("alias_remote_detected", -1, selected.c_str(),
+                          this->captured_alias_rssi_,
+                          this->captured_alias_remote_);
+    return;
+  }
+  if (!this->parse_remote_code_(remote, remote_code)) {
+    this->publish_status_("error", -1, "invalid_remote_alias");
+    return;
+  }
+  if (action == "query") {
+    const int8_t index = this->find_remote_alias_(remote_code);
+    if (index < 0) {
+      this->publish_status_("error", -1, "remote_alias_not_found");
+      return;
+    }
+    const auto &record = this->remote_aliases_[index].record;
+    const std::vector<uint32_t> node_ids(
+        record.node_ids, record.node_ids + record.node_count);
+    const std::string selected = this->alias_slots_for_nodes_(node_ids);
+    this->publish_status_("alias", -1, selected.c_str(), 0.0f,
+                          remote_code);
+    return;
+  }
+  if (action == "remove") {
+    this->remove_remote_alias_(remote_code);
+    return;
+  }
+  if (action == "set") {
+    std::vector<uint32_t> node_ids;
+    if (!this->resolve_alias_slots_(slots, node_ids)) {
+      this->publish_status_("error", -1, "invalid_remote_alias_slots");
+      return;
+    }
+    this->set_remote_alias_(remote_code, node_ids);
+    return;
+  }
+  this->publish_status_("error", -1, "unknown_action");
+}
+
+bool SomfyIohcManager::parse_remote_code_(const std::string &value,
+                                          uint32_t &remote) const {
+  if (value.size() != 8 || value[0] != '0' ||
+      (value[1] != 'x' && value[1] != 'X')) {
+    return false;
+  }
+  uint32_t parsed = 0;
+  for (size_t index = 2; index < value.size(); index++) {
+    const int digit = hex_digit(value[index]);
+    if (digit < 0)
+      return false;
+    parsed = (parsed << 4U) | static_cast<uint32_t>(digit);
+  }
+  if (parsed == 0 || parsed > 0x00FFFFFF ||
+      parsed == iohc::BROADCAST_ADDR) {
+    return false;
+  }
+  remote = parsed;
+  return true;
+}
+
+bool SomfyIohcManager::resolve_alias_slots_(
+    const std::string &value, std::vector<uint32_t> &node_ids) const {
+  node_ids.clear();
+  if (value.empty())
+    return false;
+  size_t start = 0;
+  while (start < value.size()) {
+    const size_t end = value.find(',', start);
+    const size_t length =
+        (end == std::string::npos ? value.size() : end) - start;
+    if (length == 0)
+      return false;
+    uint32_t slot = 0;
+    for (size_t offset = 0; offset < length; offset++) {
+      const char ch = value[start + offset];
+      if (ch < '0' || ch > '9')
+        return false;
+      slot = slot * 10U + static_cast<uint32_t>(ch - '0');
+      if (slot >= IOHC_MANAGER_MAX_SHUTTERS)
+        return false;
+    }
+    if (!this->valid_slot_(static_cast<int32_t>(slot)))
+      return false;
+    const auto &managed = this->slots_[slot];
+    if (!managed.has_record ||
+        static_cast<ManagedSlotState>(managed.record.state) !=
+            ManagedSlotState::ACTIVE) {
+      return false;
+    }
+    if (std::find(node_ids.begin(), node_ids.end(), managed.record.node_id) ==
+        node_ids.end()) {
+      node_ids.push_back(managed.record.node_id);
+    }
+    if (end == std::string::npos)
+      break;
+    start = end + 1;
+  }
+  std::sort(node_ids.begin(), node_ids.end());
+  return !node_ids.empty();
+}
+
+std::string SomfyIohcManager::alias_slots_for_nodes_(
+    const std::vector<uint32_t> &node_ids) const {
+  std::string output;
+  for (uint8_t slot = 0; slot < this->slots_.size(); slot++) {
+    const auto &managed = this->slots_[slot];
+    if (!managed.has_record ||
+        std::find(node_ids.begin(), node_ids.end(), managed.record.node_id) ==
+            node_ids.end()) {
+      continue;
+    }
+    if (!output.empty())
+      output.push_back(',');
+    output.append(std::to_string(slot));
+  }
+  return output;
+}
+
+int8_t SomfyIohcManager::find_remote_alias_(uint32_t remote) const {
+  for (uint8_t index = 0; index < this->remote_aliases_.size(); index++) {
+    if (this->remote_aliases_[index].has_record &&
+        this->remote_aliases_[index].record.remote_code ==
+            (remote & 0x00FFFFFF)) {
+      return static_cast<int8_t>(index);
+    }
+  }
+  return -1;
+}
+
+int8_t SomfyIohcManager::find_empty_remote_alias_() const {
+  for (uint8_t index = 0; index < this->remote_aliases_.size(); index++)
+    if (!this->remote_aliases_[index].has_record)
+      return static_cast<int8_t>(index);
+  return -1;
+}
+
+bool SomfyIohcManager::remote_alias_contains_node_(
+    const ManagedRemoteAliasRecord &record, uint32_t node_id) const {
+  return std::find(record.node_ids, record.node_ids + record.node_count,
+                   node_id & 0x00FFFFFF) !=
+         record.node_ids + record.node_count;
+}
+
+void SomfyIohcManager::apply_all_slots_() {
+  for (uint8_t slot = 0; slot < this->slots_.size(); slot++)
+    this->apply_slot_remote_filters_(slot);
+}
+
+void SomfyIohcManager::start_alias_discovery_(const std::string &slots) {
+  if (this->discovery_slot_ >= 0 || this->armed_slot_ >= 0) {
+    this->publish_status_("error", -1, "commissioning_busy");
+    return;
+  }
+  std::vector<uint32_t> node_ids;
+  if (!this->resolve_alias_slots_(slots, node_ids)) {
+    this->publish_status_("error", -1, "invalid_remote_alias_slots");
+    return;
+  }
+  this->alias_discovery_nodes_ = std::move(node_ids);
+  this->captured_alias_remote_ = 0;
+  this->captured_alias_rssi_ = 0.0f;
+  this->alias_discovery_active_ = true;
+  this->alias_discovery_deadline_ms_ =
+      millis() + ALIAS_DISCOVERY_TIMEOUT_MS;
+  this->publish_status_("alias_listening", -1, slots.c_str());
+}
+
+void SomfyIohcManager::set_remote_alias_(
+    uint32_t remote, const std::vector<uint32_t> &node_ids) {
+  int8_t index = this->find_remote_alias_(remote);
+  if (index < 0)
+    index = this->find_empty_remote_alias_();
+  if (index < 0) {
+    this->publish_status_("error", -1, "remote_alias_registry_full");
+    return;
+  }
+
+  auto &alias = this->remote_aliases_[index];
+  const RemoteAlias previous = alias;
+  alias = {};
+  alias.has_record = true;
+  alias.record.magic = REMOTE_ALIAS_MAGIC;
+  alias.record.version = REMOTE_ALIAS_VERSION;
+  alias.record.remote_code = remote & 0x00FFFFFF;
+  alias.record.node_count = static_cast<uint8_t>(node_ids.size());
+  std::copy(node_ids.begin(), node_ids.end(), alias.record.node_ids);
+  alias.record.checksum = remote_alias_checksum_(alias.record);
+
+  const bool changed = !previous.has_record ||
+                       previous.record.checksum != alias.record.checksum;
+  if (changed && !this->save_remote_alias_record_(index)) {
+    alias = previous;
+    this->publish_status_("error", -1, "storage_write_failed");
+    return;
+  }
+  this->alias_discovery_active_ = false;
+  this->captured_alias_remote_ = 0;
+  this->captured_alias_rssi_ = 0.0f;
+  this->alias_discovery_nodes_.clear();
+  this->apply_all_slots_();
+  const std::string selected = this->alias_slots_for_nodes_(node_ids);
+  this->publish_status_("alias_saved", -1, selected.c_str(), 0.0f,
+                        remote);
+}
+
+void SomfyIohcManager::remove_remote_alias_(uint32_t remote) {
+  const int8_t index = this->find_remote_alias_(remote);
+  if (index < 0) {
+    this->publish_status_("error", -1, "remote_alias_not_found");
+    return;
+  }
+  if (!this->erase_remote_alias_record_(index)) {
+    this->publish_status_("error", -1, "storage_erase_failed");
+    return;
+  }
+  this->remote_aliases_[index] = {};
+  this->apply_all_slots_();
+  this->publish_status_("alias_removed", -1, "", 0.0f, remote);
+}
+
 bool SomfyIohcManager::open_registry_() {
   const esp_err_t init = nvs_flash_init();
   if (init != ESP_OK) {
@@ -731,6 +1007,89 @@ bool SomfyIohcManager::erase_record_(uint8_t slot) {
   return err == ESP_OK;
 }
 
+bool SomfyIohcManager::load_remote_aliases_() {
+  this->remote_aliases_.clear();
+  this->remote_aliases_.resize(IOHC_MANAGER_MAX_REMOTE_ALIASES);
+  for (uint8_t index = 0; index < this->remote_aliases_.size(); index++) {
+    ManagedRemoteAliasRecord record{};
+    bool found = false;
+    if (!this->load_remote_alias_record_(index, record, found))
+      return false;
+    if (!found)
+      continue;
+    if (this->find_remote_alias_(record.remote_code) >= 0) {
+      ESP_LOGE(TAG,
+               "Duplicate physical remote alias 0x%06" PRIX32
+               " in registry; preserving records and disabling manager",
+               record.remote_code);
+      return false;
+    }
+    this->remote_aliases_[index].record = record;
+    this->remote_aliases_[index].has_record = true;
+  }
+  return true;
+}
+
+bool SomfyIohcManager::load_remote_alias_record_(
+    uint8_t index, ManagedRemoteAliasRecord &record, bool &found) {
+  found = false;
+  if (!this->registry_open_ || index >= IOHC_MANAGER_MAX_REMOTE_ALIASES)
+    return false;
+  char key[9];
+  remote_alias_key(index, key);
+  size_t size = sizeof(record);
+  const esp_err_t err =
+      nvs_get_blob(this->registry_handle_, key, &record, &size);
+  if (err == ESP_ERR_NVS_NOT_FOUND)
+    return true;
+  if (err != ESP_OK || size != sizeof(record) ||
+      !remote_alias_is_valid_(record)) {
+    ESP_LOGE(TAG,
+             "Remote alias %u is invalid; preserving it and disabling manager",
+             index);
+    return false;
+  }
+  found = true;
+  return true;
+}
+
+bool SomfyIohcManager::save_remote_alias_record_(uint8_t index) {
+  if (!this->registry_open_ || index >= this->remote_aliases_.size() ||
+      !this->remote_aliases_[index].has_record) {
+    return false;
+  }
+  auto &record = this->remote_aliases_[index].record;
+  record.magic = REMOTE_ALIAS_MAGIC;
+  record.version = REMOTE_ALIAS_VERSION;
+  record.checksum = remote_alias_checksum_(record);
+  char key[9];
+  remote_alias_key(index, key);
+  esp_err_t err =
+      nvs_set_blob(this->registry_handle_, key, &record, sizeof(record));
+  if (err == ESP_OK)
+    err = nvs_commit(this->registry_handle_);
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "Saving remote alias %u failed: %s", index,
+             esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
+bool SomfyIohcManager::erase_remote_alias_record_(uint8_t index) {
+  if (!this->registry_open_ || index >= IOHC_MANAGER_MAX_REMOTE_ALIASES)
+    return false;
+  char key[9];
+  remote_alias_key(index, key);
+  esp_err_t err = nvs_erase_key(this->registry_handle_, key);
+  if (err == ESP_ERR_NVS_NOT_FOUND)
+    return true;
+  if (err == ESP_OK)
+    err = nvs_commit(this->registry_handle_);
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "Erasing remote alias %u failed: %s", index,
+             esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
 bool SomfyIohcManager::read_swap_journal_(ManagedSwapJournal &journal, bool &found) {
   found = false;
   if (!this->registry_open_)
@@ -810,6 +1169,18 @@ uint32_t SomfyIohcManager::swap_checksum_(const ManagedSwapJournal &journal) {
   return hash;
 }
 
+uint32_t SomfyIohcManager::remote_alias_checksum_(
+    const ManagedRemoteAliasRecord &record) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&record);
+  uint32_t hash = 2166136261UL;
+  for (size_t index = 0;
+       index < offsetof(ManagedRemoteAliasRecord, checksum); index++) {
+    hash ^= bytes[index];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
 bool SomfyIohcManager::record_is_valid_(const ManagedSlotRecord &record) {
   const bool move_pending = (record.flags & FLAG_MOVE_PENDING) != 0;
   const bool flags_valid =
@@ -841,6 +1212,30 @@ bool SomfyIohcManager::swap_is_valid_(const ManagedSwapJournal &journal) {
          (journal.first_record.flags & FLAG_MOVE_PENDING) == 0 &&
          (journal.second_record.flags & FLAG_MOVE_PENDING) == 0 &&
          journal.checksum == swap_checksum_(journal);
+}
+
+bool SomfyIohcManager::remote_alias_is_valid_(
+    const ManagedRemoteAliasRecord &record) {
+  if (record.magic != REMOTE_ALIAS_MAGIC ||
+      record.version != REMOTE_ALIAS_VERSION || record.reserved != 0 ||
+      record.remote_code == 0 || record.remote_code > 0x00FFFFFF ||
+      record.remote_code == iohc::BROADCAST_ADDR || record.node_count == 0 ||
+      record.node_count > IOHC_MANAGER_MAX_SHUTTERS) {
+    return false;
+  }
+  for (uint8_t index = 0; index < record.node_count; index++) {
+    const uint32_t node = record.node_ids[index];
+    if (node == 0 || node > 0x00FFFFFF || node == iohc::BROADCAST_ADDR)
+      return false;
+    for (uint8_t previous = 0; previous < index; previous++)
+      if (record.node_ids[previous] == node)
+        return false;
+  }
+  for (uint8_t index = record.node_count;
+       index < IOHC_MANAGER_MAX_SHUTTERS; index++)
+    if (record.node_ids[index] != 0)
+      return false;
+  return record.checksum == remote_alias_checksum_(record);
 }
 
 const char *SomfyIohcManager::state_name_(ManagedSlotState state) {
@@ -912,13 +1307,30 @@ void SomfyIohcManager::apply_slot_(uint8_t slot) {
                       record_my_tilt_step(record));
   cover->reconfigure_storage(record.storage_namespace, record.storage_key,
                              record.initial_rolling_code);
-  cover->runtime_clear_receive_remote_codes();
-  if (record.physical_remote != 0)
-    cover->add_receive_remote_code(record.physical_remote);
+  this->apply_slot_remote_filters_(slot);
   const auto state = static_cast<ManagedSlotState>(record.state);
   cover->set_runtime_enabled(state == ManagedSlotState::STAGED ||
                              state == ManagedSlotState::PAIR_SENT ||
                              state == ManagedSlotState::ACTIVE);
+}
+
+void SomfyIohcManager::apply_slot_remote_filters_(uint8_t slot) {
+  if (!this->valid_slot_(slot))
+    return;
+  auto &managed = this->slots_[slot];
+  auto *cover = managed.cover.get();
+  cover->runtime_clear_receive_remote_codes();
+  if (!managed.has_record)
+    return;
+  const auto &record = managed.record;
+  if (record.physical_remote != 0)
+    cover->add_receive_remote_code(record.physical_remote);
+  for (const auto &alias : this->remote_aliases_) {
+    if (alias.has_record &&
+        this->remote_alias_contains_node_(alias.record, record.node_id)) {
+      cover->add_receive_remote_code(alias.record.remote_code);
+    }
+  }
 }
 
 bool SomfyIohcManager::complete_move_(uint8_t source_slot, uint8_t target_slot) {
@@ -1081,6 +1493,10 @@ void SomfyIohcManager::start_discovery_(uint8_t slot) {
     this->publish_status_("error", slot, "remote_discovery_busy");
     return;
   }
+  if (this->alias_discovery_active_) {
+    this->publish_status_("error", slot, "remote_discovery_busy");
+    return;
+  }
   this->discovery_slot_ = static_cast<int8_t>(slot);
   this->discovery_deadline_ms_ = millis() + DISCOVERY_TIMEOUT_MS;
   this->publish_status_("waiting_remote", slot);
@@ -1168,7 +1584,8 @@ void SomfyIohcManager::discard_staged_(uint8_t slot) {
 }
 
 void SomfyIohcManager::publish_status_(
-    const char *action, int32_t slot, const char *detail, float rssi) {
+    const char *action, int32_t slot, const char *detail, float rssi,
+    uint32_t remote_override) {
   if (this->status_sensor_ == nullptr)
     return;
   this->event_counter_++;
@@ -1185,6 +1602,8 @@ void SomfyIohcManager::publish_status_(
     if (next == 0)
       next = managed.record.initial_rolling_code;
   }
+  if (remote_override != 0)
+    remote = remote_override & 0x00FFFFFF;
   char output[255];
   snprintf(output, sizeof(output),
            "{\"v\":1,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
@@ -1192,6 +1611,18 @@ void SomfyIohcManager::publish_status_(
            "\",\"next\":%u,\"rssi\":%.1f,\"detail\":\"%s\"}",
            this->event_counter_, action, slot, state, node, remote, next, rssi, detail);
   this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::publish_rx_stats_(int32_t slot) {
+  char detail[128];
+  snprintf(detail, sizeof(detail),
+           "raw=%" PRIu32 ",valid=%" PRIu32 ",accepted=%" PRIu32
+           ",last_rssi=%.1f",
+           this->hub_->get_rx_raw_packet_count(),
+           this->hub_->get_rx_valid_frame_count(),
+           this->accepted_remote_command_count_, this->hub_->get_last_valid_rssi());
+  this->publish_status_("rx_stats", slot, detail,
+                        this->hub_->get_last_valid_rssi());
 }
 
 void SomfyIohcManager::publish_backup_(uint8_t slot) {
@@ -1222,6 +1653,26 @@ void SomfyIohcManager::on_rolling_code_(uint8_t slot, uint16_t next_code) {
 }
 
 void SomfyIohcManager::on_iohc_packet_(const IohcDecodedPacket &packet) {
+  if (this->alias_discovery_active_ &&
+      packet.src_node != 0 && !this->node_id_in_use_(packet.src_node) &&
+      packet.dest_node == iohc::BROADCAST_ADDR &&
+      packet.cmd == iohc_cmd::CMD_EXECUTE && packet.data != nullptr &&
+      packet.data_len >= 4) {
+    const uint16_t main_param =
+        (static_cast<uint16_t>(packet.data[2]) << 8) | packet.data[3];
+    if (main_param == iohc_cmd::MP_OPEN ||
+        main_param == iohc_cmd::MP_CLOSE) {
+      this->alias_discovery_active_ = false;
+      this->captured_alias_remote_ = packet.src_node & 0x00FFFFFF;
+      this->captured_alias_rssi_ = packet.rssi;
+      const std::string selected =
+          this->alias_slots_for_nodes_(this->alias_discovery_nodes_);
+      this->publish_status_("alias_remote_detected", -1,
+                            selected.c_str(), packet.rssi,
+                            this->captured_alias_remote_);
+      return;
+    }
+  }
   if (this->discovery_slot_ < 0 || packet.cmd != iohc_cmd::CMD_EXECUTE ||
       packet.data == nullptr || packet.data_len < 4)
     return;

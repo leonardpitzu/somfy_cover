@@ -315,13 +315,29 @@ slot numbers while keeping each shutter's Somfy device, name, area, calibration,
 encrypted backup, controller key and rolling-code stream with the same physical
 shutter. A swap emits no RF and never needs PROG.
 
+Physical group selections can use an additional receive-only controller
+identity. On the hardware-tested Situo 5, **All channels** sends one broadcast
+command from that group identity rather than one command for every motor. The
+manager stores up to 32 group aliases, each targeting up to 32 managed
+shutters. A shutter may belong to multiple aliases. Membership is stored by
+permanent controller node identity, so it follows shutters through slot moves
+and swaps.
+
+Group discovery accepts only a broadcast OPEN or CLOSE from the physical
+remote and stages it until Home Assistant confirms the complete target list.
+Adding, editing, or removing an alias sends no RF, never presses PROG, and does
+not consume a motor pairing slot. Independent bridge control still uses each
+shutter's own paired controller identity; aliases only synchronize received
+physical commands to all assigned state estimates.
+
 ### Home Assistant
 
 Install the companion
 [Somfy IO Shutter Manager](https://github.com/Jordi-14/homeassistant_somfy_io_manager)
 custom integration through HACS. It provides graphical pairing, import,
 calibration, slot moves, occupied-slot swaps, encrypted recovery, per-shutter
-devices, native MY controls, and physical-remote diagnostics.
+devices, native MY controls, physical-group assignment, and physical-remote
+diagnostics.
 
 The physical PROG press cannot be automated: it is the motor's proof that an
 already-authorized controller approved the new identity. The wizard sends the

@@ -132,8 +132,9 @@ void SomfyIohcHub::transmit_packet(const std::vector<uint8_t> &frame, uint8_t re
     }
   }
 
-  // Restore the fixed-length RX capture window before resuming reception.
-  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW);
+  // TX uses a more permissive sync setting. Restore every 1W RX register,
+  // including the strict receive-only sync mode, before listening again.
+  this->configure_radio_1w();
   this->cc1101_->begin_rx();
 }
 
@@ -158,17 +159,31 @@ void SomfyIohcHub::configure_radio_1w() {
   this->cc1101_->set_manchester(false);
   // The logical 0xFF 0x33 sync is UART-encoded on air. The hardware-validated
   // CC1101 alignment locks on preamble tail + wrapped 0xFF (0x57FD), leaving
-  // a 0x99 residue at the FIFO head. Hardware CRC remains disabled.
+  // a 0x99 residue at the FIFO head. Use full front-end gain, TI's 33 dB
+  // magnitude target, the lowest absolute offset, and the 6 dB relative-rise
+  // detector. The relative detector admits weak remotes when they rise above
+  // the local noise floor, while the carrier-qualified sync prevents false
+  // 16-bit noise matches from continuously occupying the FIFO. Hardware CRC
+  // remains disabled because IOHC's CRC is checked after UART decoding.
   this->cc1101_->set_sync1(iohc_proto::PHY_HW_SYNC1);
   this->cc1101_->set_sync0(iohc_proto::PHY_HW_SYNC0);
+  this->cc1101_->set_magn_target(cc1101::MagnTarget::MAGN_TARGET_33DB);
+  this->cc1101_->set_max_lna_gain(cc1101::MaxLnaGain::MAX_LNA_GAIN_DEFAULT);
+  this->cc1101_->set_max_dvga_gain(cc1101::MaxDvgaGain::MAX_DVGA_GAIN_DEFAULT);
+  this->cc1101_->set_lna_priority(true);
+  this->cc1101_->set_carrier_sense_abs_thr(-8);
+  this->cc1101_->set_carrier_sense_rel_thr(cc1101::CarrierSenseRelThr::CARRIER_SENSE_REL_THR_PLUS_6DB);
+  this->cc1101_->set_sync_mode(cc1101::SyncMode::SYNC_MODE_16_16);
+  this->cc1101_->set_carrier_sense_above_threshold(true);
   this->cc1101_->set_crc_enable(false);
-  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW);
+  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW_1W);
   this->listening_2w_ = false;
 }
 
 void SomfyIohcHub::configure_radio_2w(uint8_t channel) {
   if (channel >= 3) channel = 0;
   this->cc1101_->set_frequency(iohc::FREQUENCY_2W[channel]);
+  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW_2W);
 }
 
 void SomfyIohcHub::start_2w_listen() {
@@ -315,7 +330,7 @@ void SomfyIohcHub::send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
   if (err != cc1101::CC1101Error::NONE) {
     ESP_LOGW(TAG, "2W TX error: %d", static_cast<int>(err));
   }
-  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW);
+  this->cc1101_->set_packet_length(iohc::RX_FIFO_WINDOW_2W);
   this->cc1101_->begin_rx();
   ESP_LOGD(TAG, "TX 2W: cmd=0x%02X %u logical / %u on-air bytes", cmd, static_cast<unsigned>(frame.size()),
            static_cast<unsigned>(payload.size()));
@@ -327,6 +342,7 @@ void SomfyIohcHub::send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
 
 void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
                               float rssi, uint8_t lqi) {
+  this->rx_raw_packet_count_++;
   // The CC1101 captures a fixed-size window of raw on-air bytes after the
   // hardware sync match (0x57FD). Strip the io-homecontrol UART 8N1 framing to
   // recover the logical frame bytes (this is what the documented captures show).
@@ -351,6 +367,8 @@ void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
     ESP_LOGV(TAG, "RX: CRC mismatch (got 0x%04X, calc 0x%04X)", received_crc, calc_crc);
     return;
   }
+  this->rx_valid_frame_count_++;
+  this->last_valid_rssi_ = rssi;
 
   // Parse header
   IohcDecodedPacket pkt;

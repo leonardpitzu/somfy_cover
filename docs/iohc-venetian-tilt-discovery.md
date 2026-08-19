@@ -42,8 +42,10 @@ complete native MY sequence shown above.
   action; `0x0D` and `0x0E` are tilt detents.
 - Sending tilt consumes two rolling codes per detent because both frames are
   independently authenticated.
-- The wheel direction that should increase Home Assistant's 0–100 tilt value
-  is installation-dependent and must be configurable.
+- Home Assistant defines 0% tilt as fully closed and 100% as fully open. The
+  physical direction that increases that value is installation-dependent and
+  must remain configurable. On the tested blind, counterclockwise opens the
+  slats and clockwise closes them.
 - The motor does not report an absolute slat angle in this 1W path. Setup must
   ask the user to count the wheel detents that actually move the slats between
   the two physical tilt limits, just as it asks for full opening and closing
@@ -56,11 +58,10 @@ complete native MY sequence shown above.
 - Intermediate requests are quantized to the nearest reachable detent. The
   final published tilt state is that quantized value, not the unachievable raw
   percentage requested by the caller.
-- A lift OPEN command immediately rotates the slats to their fully open,
-  horizontal attitude. On the tested eight-step blind this is the physical
-  midpoint, not either tilt endpoint. A lift CLOSE command immediately rotates
-  them to the clockwise closed endpoint. Stopping the lift leaves the slats in
-  that attitude; it does not restore their previous tilt.
+- A lift OPEN command immediately rotates the slats to the fully open,
+  counterclockwise endpoint (100%). A lift CLOSE command immediately rotates
+  them to the clockwise closed endpoint (0%). Stopping the lift leaves the
+  slats in that attitude; it does not restore their previous tilt.
 - A tilt command issued while the lift is moving stops the lift, applies the
   requested detents, and does not resume the interrupted height movement.
 - A native MY recall uses the same temporary lift attitude while travelling,
@@ -69,15 +70,53 @@ complete native MY sequence shown above.
   the counterclockwise endpoint, so the estimated tilt state can follow the
   physical motor without sending corrective wheel commands.
 - The tested installation used eight effective steps and a saved MY tilt at
-  physical step two. Both settings, the Venetian flag, direction mapping, and
-  the paired controller identity survived an ESP reboot and were verified
-  again with endpoint and MY commands.
+  physical step two from the counterclockwise/open endpoint, which is 75% in
+  Home Assistant. Both settings, the Venetian flag, direction mapping, and the
+  paired controller identity survived an ESP reboot and were verified again
+  with endpoint and MY commands.
 
 ## Receiver note
 
-For this capture hardware, tuning the CC1101 to `868.961 MHz` and rejecting
-predecode candidates below `-100 dBm` made all four gestures reliable. The
-first valid carrier appeared roughly 9.5–12.7 kHz above the nominal
-`868.950 MHz`. This is a diagnostic observation, not a production-frequency
-change: normal firmware should remain at the standard frequency unless a
-specific radio is calibrated.
+The discovery build first obtained reliable close-range captures near
+`868.961 MHz`, with valid energy roughly 9.5–12.7 kHz above the nominal
+`868.950 MHz`. This is a per-radio calibration observation, not a
+protocol-frequency change; production remains on the configured 1W frequency.
+
+Several apparently reasonable production settings failed at the remote's
+normal location. A 35-byte FIFO window—the encoded size of the longest ordinary
+application frame—did not let real Situo presses complete. A fixed absolute
+carrier threshold and stricter 30/32 sync also rejected useful weak bursts.
+Removing carrier qualification recovered frames but left reception vulnerable
+to noise matches.
+
+The hardware-validated receiver therefore retains the 60-byte FIFO window,
+16/16 carrier-qualified sync, full LNA and DVGA gain, TI's 33 dB magnitude
+target, the lowest absolute carrier offset, and a 6 dB relative carrier-rise
+threshold. The relative threshold admits a remote that rises above the local
+noise floor without allowing continuous weak-noise sync matches to occupy the
+FIFO. At the normal test location the full DOWN, STOP/MY, MY, clockwise and
+counterclockwise sequence produced 43 raw FIFO packets, 40 CRC-valid frames and
+five accepted user actions; the final accepted action measured `-70.5 dBm`.
+
+## Situo group and All-channels mode
+
+The tested Situo 5 does not replay every individual channel when **All
+channels** is selected. It sends one normal broadcast `CMD_EXECUTE` from a
+distinct group controller identity. That identity differs from the source used
+by an individual channel; its exact value is installation-specific and is not
+published here.
+
+The manager models these identities as receive-only many-to-many aliases. One
+physical group may update any number of managed shutters, and one shutter may
+belong to several overlapping groups. Alias membership refers to permanent
+controller node identities rather than mutable slot numbers, so it survives
+slot moves and swaps. The records are persisted separately from paired
+controller identities and rolling-code storage.
+
+Discovery accepts only a broadcast OPEN or CLOSE and stages the source until a
+caller confirms the target shutters. Setting or deleting the alias only
+refreshes receive filters: it sends no RF, uses no PROG action, consumes no
+motor pairing slot, and never changes a transmitter's rolling-code stream.
+Hardware testing confirmed that an All-channels DOWN followed by MY was
+accepted for an assigned shutter and that the alias remained active after an
+ESP reboot.

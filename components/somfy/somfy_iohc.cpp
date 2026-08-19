@@ -235,13 +235,15 @@ void SomfyIohcCover::dump_config() {
   ESP_LOGCONFIG(TAG, "  Storage: %s/%s", this->storage_namespace_, this->storage_key_);
   ESP_LOGCONFIG(TAG, "  Missing-NVS initial rolling code: %u", this->initial_rolling_code_);
   ESP_LOGCONFIG(TAG, "  Custom key: %s", this->has_custom_key_ ? "yes" : "no (transfer key)");
-  if (this->has_my_position_)
+  if (this->has_my_position_) {
     ESP_LOGCONFIG(TAG, "  MY position estimate: %.0f%%", this->my_position_ * 100.0f);
+  }
   ESP_LOGCONFIG(TAG, "  Venetian tilt: %s", this->venetian_ ? "enabled" : "disabled");
-  if (this->venetian_)
+  if (this->venetian_) {
     ESP_LOGCONFIG(TAG, "  Tilt calibration: %u steps, clockwise %s value",
                   static_cast<unsigned>(this->tilt_steps_),
                   this->tilt_inverted_ ? "decreases" : "increases");
+  }
 #ifdef USE_SOMFY_IOHC_RX
   ESP_LOGCONFIG(TAG, "  RX state-sync: enabled (%u allowed remote(s)%s)",
                 static_cast<unsigned>(this->receive_remote_codes_.size()),
@@ -521,12 +523,11 @@ float SomfyIohcCover::logical_tilt_for_physical_step_(
 void SomfyIohcCover::set_lift_tilt_(bool opening, bool publish) {
   if (!this->venetian_)
     return;
-  // The tested motor drives the slats to their horizontal/open angle while
-  // raising, and to the clockwise endpoint while lowering. STOP leaves that
-  // mechanically established angle untouched.
-  this->tilt = opening
-                   ? 0.5f
-                   : this->logical_tilt_for_physical_step_(this->tilt_steps_);
+  // Home Assistant defines 100% tilt as fully open and 0% as fully closed.
+  // The tested motor establishes those absolute slat states while raising and
+  // lowering respectively. STOP leaves the mechanically established angle in
+  // place, so the published estimate must remain at that endpoint.
+  this->tilt = opening ? 1.0f : 0.0f;
   if (publish)
     this->publish_state();
 }
@@ -799,7 +800,7 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
         if (duplicate)
           return;
         if (this->remote_command_callback_)
-          this->remote_command_callback_(event_code);
+          this->remote_command_callback_(event_code, pkt.src_node, pkt.rssi);
         this->handle_rx_tilt_step_(
             action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE);
         return;
@@ -850,7 +851,7 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
       ESP_LOGD(TAG, "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
                pkt.src_node, main_param_name(main_param), main_param, pkt.rssi);
       if (this->remote_command_callback_)
-        this->remote_command_callback_(main_param);
+        this->remote_command_callback_(main_param, pkt.src_node, pkt.rssi);
       this->handle_rx_command_(main_param);
       return;
     }

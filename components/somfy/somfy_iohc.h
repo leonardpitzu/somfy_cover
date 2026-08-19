@@ -154,7 +154,8 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void set_rolling_code_callback(std::function<void(uint16_t)> callback) {
     this->rolling_code_callback_ = std::move(callback);
   }
-  void set_remote_command_callback(std::function<void(uint16_t)> callback) {
+  void set_remote_command_callback(
+      std::function<void(uint16_t, uint32_t, float)> callback) {
     this->remote_command_callback_ = std::move(callback);
   }
   uint16_t peek_next_rolling_code() const;
@@ -231,7 +232,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Rolling code storage
   std::unique_ptr<NVSRollingCodeStorage> storage_;
   std::function<void(uint16_t)> rolling_code_callback_;
-  std::function<void(uint16_t)> remote_command_callback_;
+  std::function<void(uint16_t, uint32_t, float)> remote_command_callback_;
 
   // Cover trigger wiring (open/close/stop -> radio commands)
   std::unique_ptr<Automation<>> open_automation_;
