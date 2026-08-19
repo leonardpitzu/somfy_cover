@@ -21,6 +21,7 @@ SomfyIohcHub = somfy_ns.class_("SomfyIohcHub", cg.Component)
 CONF_REMOTE_TRANSMITTER = "remote_transmitter"
 CONF_REMOTE_RECEIVER = "remote_receiver"
 CONF_CC1101_ID = "cc1101_id"
+CONF_FREQUENCY_1W = "frequency_1w"
 
 TYPE_RTS = "rts"
 TYPE_IOHC = "iohc"
@@ -41,6 +42,9 @@ IOHC_HUB_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SomfyIohcHub),
         cv.Required(CONF_CC1101_ID): cv.use_id(cg.Component),
+        cv.Optional(CONF_FREQUENCY_1W, default="868.95MHz"): cv.All(
+            cv.frequency, cv.float_range(min=860.0e6, max=870.0e6)
+        ),
     }
 ).extend(cv.COMPONENT_SCHEMA)
 
@@ -77,4 +81,5 @@ async def to_code(config):
 
         cc1101 = await cg.get_variable(config[CONF_CC1101_ID])
         cg.add(var.set_cc1101(cc1101))
+        cg.add(var.set_frequency_1w(config[CONF_FREQUENCY_1W]))
         cg.add_define("USE_SOMFY_IOHC")

@@ -132,6 +132,7 @@ class SomfyIohcHub : public Component,
 
   // Configuration
   void set_cc1101(cc1101::CC1101Component *cc1101) { this->cc1101_ = cc1101; }
+  void set_frequency_1w(float frequency) { this->frequency_1w_ = frequency; }
 
   // TX: transmit a raw packet (frame bytes including CRC) with repeats (1W mode)
   void transmit_packet(const std::vector<uint8_t> &frame, uint8_t repeat_count);
@@ -162,6 +163,7 @@ class SomfyIohcHub : public Component,
 
  protected:
   cc1101::CC1101Component *cc1101_{nullptr};
+  float frequency_1w_{iohc::FREQUENCY_1W};
 
   // Reusable UART-codec buffers, so TX and RX do not allocate per packet.
   std::vector<uint8_t> tx_payload_;

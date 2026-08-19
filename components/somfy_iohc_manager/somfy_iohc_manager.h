@@ -113,6 +113,8 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void commission_service(std::string action, int32_t slot);
   void calibrate_service(int32_t slot, float open_seconds, float close_seconds,
                          float my_percent);
+  void venetian_service(int32_t slot, bool enabled, int32_t tilt_steps,
+                        bool tilt_inverted, int32_t my_tilt_step);
   void control_service(int32_t slot, std::string command, float position_percent);
   void restore_service(std::string encrypted_backup, int32_t slot);
   void move_service(int32_t slot, int32_t target_slot);

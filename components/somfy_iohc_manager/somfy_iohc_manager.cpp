@@ -25,7 +25,7 @@ namespace {
 constexpr uint32_t RECORD_MAGIC = 0x53494F4D;  // "SIOM"
 constexpr uint8_t RECORD_VERSION = 1;
 constexpr const char *REGISTRY_NAMESPACE = "somfy_mgr";
-constexpr uint32_t DISCOVERY_TIMEOUT_MS = 30000;
+constexpr uint32_t DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t PAIR_ARM_TIMEOUT_MS = 60000;
 constexpr uint8_t BACKUP_FORMAT_VERSION = 1;
 constexpr size_t GCM_NONCE_SIZE = 12;
@@ -35,6 +35,24 @@ constexpr char IMPORTS_BOOTSTRAPPED_KEY[] = "imports_v1";
 constexpr char SWAP_JOURNAL_KEY[] = "swap_v1";
 constexpr uint16_t FLAG_MOVE_PENDING = 0x8000;
 constexpr uint16_t FLAG_MOVE_TARGET_MASK = 0x001F;
+// Record v1 intentionally reserved this field. Keep the packed record and
+// encrypted-backup format unchanged while adding Venetian metadata.
+constexpr uint16_t FLAG_VENETIAN = 0x4000;
+constexpr uint16_t FLAG_TILT_INVERTED = 0x2000;
+constexpr uint8_t FLAG_TILT_STEPS_SHIFT = 5;
+constexpr uint16_t FLAG_TILT_STEPS_MASK = 0x1FE0;
+constexpr uint16_t FLAG_FEATURE_MASK =
+    FLAG_VENETIAN | FLAG_TILT_INVERTED | FLAG_TILT_STEPS_MASK;
+constexpr uint16_t FLAG_ALLOWED_MASK =
+    FLAG_MOVE_PENDING | FLAG_FEATURE_MASK | FLAG_MOVE_TARGET_MASK;
+// Full travel calibration is limited to 300 seconds, so its millisecond value
+// needs fewer than 24 bits. Reuse the previously-zero high byte of the closing
+// duration for an encoded MY tilt step without changing the v1 record layout,
+// encrypted-backup format, identity, or move/swap transactions. Zero means an
+// older/unconfigured record and defaults to the midpoint; 1..255 encode steps
+// 0..254 from the counterclockwise endpoint.
+constexpr uint32_t DURATION_MS_MASK = 0x00FFFFFFUL;
+constexpr uint8_t MY_TILT_STEP_SHIFT = 24;
 constexpr uint32_t SWAP_JOURNAL_MAGIC = 0x53574150;  // "SWAP"
 constexpr uint8_t SWAP_JOURNAL_VERSION = 1;
 
@@ -72,6 +90,37 @@ bool hex_decode(const std::string &input, std::vector<uint8_t> &output) {
     output[i] = static_cast<uint8_t>((high << 4) | low);
   }
   return true;
+}
+
+uint8_t record_tilt_steps(const ManagedSlotRecord &record) {
+  const uint8_t stored = static_cast<uint8_t>(
+      (record.flags & FLAG_TILT_STEPS_MASK) >> FLAG_TILT_STEPS_SHIFT);
+  return stored == 0 ? 12 : stored;
+}
+
+uint32_t record_close_duration_ms(const ManagedSlotRecord &record) {
+  return record.close_duration_ms & DURATION_MS_MASK;
+}
+
+uint8_t record_my_tilt_step(const ManagedSlotRecord &record) {
+  const uint8_t tilt_steps = record_tilt_steps(record);
+  const uint8_t encoded = static_cast<uint8_t>(record.close_duration_ms >>
+                                                MY_TILT_STEP_SHIFT);
+  return encoded == 0
+             ? static_cast<uint8_t>(tilt_steps / 2)
+             : std::min<uint8_t>(static_cast<uint8_t>(encoded - 1), tilt_steps);
+}
+
+void set_record_close_duration_ms(ManagedSlotRecord &record, uint32_t duration_ms) {
+  record.close_duration_ms =
+      (record.close_duration_ms & ~DURATION_MS_MASK) |
+      (duration_ms & DURATION_MS_MASK);
+}
+
+void set_record_my_tilt_step(ManagedSlotRecord &record, uint8_t step) {
+  record.close_duration_ms =
+      (record.close_duration_ms & DURATION_MS_MASK) |
+      (static_cast<uint32_t>(step + 1U) << MY_TILT_STEP_SHIFT);
 }
 
 }  // namespace
@@ -223,6 +272,9 @@ void SomfyIohcManager::setup() {
       &SomfyIohcManager::calibrate_service, "somfy_calibrate",
       {"slot", "open_seconds", "close_seconds", "my_percent"});
   this->register_service(
+      &SomfyIohcManager::venetian_service, "somfy_venetian",
+      {"slot", "enabled", "tilt_steps", "tilt_inverted", "my_tilt_step"});
+  this->register_service(
       &SomfyIohcManager::control_service, "somfy_control",
       {"slot", "command", "position_percent"});
   this->register_service(
@@ -321,7 +373,9 @@ void SomfyIohcManager::calibrate_service(
     return;
   }
   managed.record.open_duration_ms = static_cast<uint32_t>(open_seconds * 1000.0f + 0.5f);
-  managed.record.close_duration_ms = static_cast<uint32_t>(close_seconds * 1000.0f + 0.5f);
+  set_record_close_duration_ms(
+      managed.record,
+      static_cast<uint32_t>(close_seconds * 1000.0f + 0.5f));
   managed.record.my_position_basis_points = static_cast<uint16_t>(my_percent * 100.0f + 0.5f);
   if (!this->save_record_(static_cast<uint8_t>(slot))) {
     this->publish_status_("error", slot, "storage_write_failed");
@@ -330,6 +384,49 @@ void SomfyIohcManager::calibrate_service(
   this->apply_slot_(static_cast<uint8_t>(slot));
   this->publish_backup_(static_cast<uint8_t>(slot));
   this->publish_status_("calibrated", slot);
+}
+
+void SomfyIohcManager::venetian_service(
+    int32_t slot, bool enabled, int32_t tilt_steps, bool tilt_inverted,
+    int32_t my_tilt_step) {
+  if (!this->valid_slot_(slot)) {
+    this->publish_status_("error", slot, "invalid_slot");
+    return;
+  }
+  auto &managed = this->slots_[slot];
+  const auto state = static_cast<ManagedSlotState>(managed.record.state);
+  if (state != ManagedSlotState::STAGED && state != ManagedSlotState::PAIR_SENT &&
+      state != ManagedSlotState::ACTIVE) {
+    this->publish_status_("error", slot, "slot_not_configurable");
+    return;
+  }
+  if (enabled && (tilt_steps < 1 || tilt_steps > 254 || my_tilt_step < 0 ||
+                  my_tilt_step > tilt_steps)) {
+    this->publish_status_("error", slot, "invalid_tilt_calibration");
+    return;
+  }
+
+  managed.record.flags &= ~(FLAG_VENETIAN | FLAG_TILT_INVERTED |
+                            FLAG_TILT_STEPS_MASK);
+  if (enabled) {
+    managed.record.flags |= FLAG_VENETIAN;
+    if (tilt_inverted)
+      managed.record.flags |= FLAG_TILT_INVERTED;
+    managed.record.flags |= static_cast<uint16_t>(tilt_steps)
+                            << FLAG_TILT_STEPS_SHIFT;
+    set_record_my_tilt_step(managed.record,
+                            static_cast<uint8_t>(my_tilt_step));
+  } else {
+    managed.record.close_duration_ms &= DURATION_MS_MASK;
+  }
+  if (!this->save_record_(static_cast<uint8_t>(slot))) {
+    this->publish_status_("error", slot, "storage_write_failed");
+    return;
+  }
+  this->apply_slot_(static_cast<uint8_t>(slot));
+  this->publish_backup_(static_cast<uint8_t>(slot));
+  this->publish_status_("venetian_configured", slot,
+                        enabled ? "venetian" : "shutter");
 }
 
 void SomfyIohcManager::control_service(
@@ -350,6 +447,14 @@ void SomfyIohcManager::control_service(
   else if (command == "my") managed.cover->runtime_my();
   else if (command == "position") {
     managed.cover->runtime_set_position(clamp(position_percent, 0.0f, 100.0f) / 100.0f);
+  } else if (command == "tilt_position") {
+    managed.cover->runtime_set_tilt(clamp(position_percent, 0.0f, 100.0f) / 100.0f);
+  } else if (command == "tilt_clockwise") {
+    managed.cover->runtime_tilt_step(true);
+  } else if (command == "tilt_counterclockwise") {
+    managed.cover->runtime_tilt_step(false);
+  } else if (command == "tilt_stop") {
+    managed.cover->runtime_stop_tilt();
   } else {
     this->publish_status_("error", slot, "unknown_command");
     return;
@@ -438,7 +543,8 @@ void SomfyIohcManager::move_service(int32_t slot, int32_t target_slot) {
 
     const auto original = source.record;
     source.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
-    source.record.flags = FLAG_MOVE_PENDING |
+    source.record.flags = (original.flags & FLAG_FEATURE_MASK) |
+                          FLAG_MOVE_PENDING |
                           (static_cast<uint16_t>(target_slot) & FLAG_MOVE_TARGET_MASK);
     if (!this->save_record_(static_cast<uint8_t>(slot))) {
       source.record = original;
@@ -705,11 +811,12 @@ uint32_t SomfyIohcManager::swap_checksum_(const ManagedSwapJournal &journal) {
 }
 
 bool SomfyIohcManager::record_is_valid_(const ManagedSlotRecord &record) {
+  const bool move_pending = (record.flags & FLAG_MOVE_PENDING) != 0;
   const bool flags_valid =
-      record.flags == 0 ||
-      ((record.flags & FLAG_MOVE_PENDING) != 0 &&
-       (record.flags & ~(FLAG_MOVE_PENDING | FLAG_MOVE_TARGET_MASK)) == 0 &&
-       (record.flags & FLAG_MOVE_TARGET_MASK) < IOHC_MANAGER_MAX_SHUTTERS);
+      (record.flags & ~FLAG_ALLOWED_MASK) == 0 &&
+      ((move_pending &&
+        (record.flags & FLAG_MOVE_TARGET_MASK) < IOHC_MANAGER_MAX_SHUTTERS) ||
+       (!move_pending && (record.flags & FLAG_MOVE_TARGET_MASK) == 0));
   if (record.magic != RECORD_MAGIC || record.version != RECORD_VERSION ||
       record.state > static_cast<uint8_t>(ManagedSlotState::ARCHIVED) ||
       record.node_id > 0x00FFFFFF || record.storage_namespace[15] != '\0' ||
@@ -731,7 +838,8 @@ bool SomfyIohcManager::swap_is_valid_(const ManagedSwapJournal &journal) {
              ManagedSlotState::ACTIVE &&
          static_cast<ManagedSlotState>(journal.second_record.state) ==
              ManagedSlotState::ACTIVE &&
-         journal.first_record.flags == 0 && journal.second_record.flags == 0 &&
+         (journal.first_record.flags & FLAG_MOVE_PENDING) == 0 &&
+         (journal.second_record.flags & FLAG_MOVE_PENDING) == 0 &&
          journal.checksum == swap_checksum_(journal);
 }
 
@@ -784,6 +892,7 @@ void SomfyIohcManager::apply_slot_(uint8_t slot) {
     const auto defaults = default_record_(slot);
     managed.record = defaults;
     cover->set_runtime_enabled(false);
+    cover->set_venetian(false);
     cover->runtime_clear_receive_remote_codes();
     cover->reconfigure_storage(defaults.storage_namespace, defaults.storage_key,
                                defaults.initial_rolling_code);
@@ -794,9 +903,13 @@ void SomfyIohcManager::apply_slot_(uint8_t slot) {
   cover->set_remote_code(record.node_id);
   cover->set_encryption_key(record.encryption_key);
   cover->set_open_duration(record.open_duration_ms);
-  cover->set_close_duration(record.close_duration_ms);
+  cover->set_close_duration(record_close_duration_ms(record));
   cover->set_my_position(record.my_position_basis_points / 10000.0f);
   cover->set_repeat_count(record.repeat_count);
+  cover->set_venetian((record.flags & FLAG_VENETIAN) != 0,
+                      record_tilt_steps(record),
+                      (record.flags & FLAG_TILT_INVERTED) != 0,
+                      record_my_tilt_step(record));
   cover->reconfigure_storage(record.storage_namespace, record.storage_key,
                              record.initial_rolling_code);
   cover->runtime_clear_receive_remote_codes();
@@ -828,7 +941,7 @@ bool SomfyIohcManager::complete_move_(uint8_t source_slot, uint8_t target_slot) 
   } else {
     target.record = source.record;
     target.record.state = static_cast<uint8_t>(ManagedSlotState::ACTIVE);
-    target.record.flags = 0;
+    target.record.flags &= FLAG_FEATURE_MASK;
     target.has_record = true;
     if (!this->save_record_(target_slot)) {
       target.has_record = false;

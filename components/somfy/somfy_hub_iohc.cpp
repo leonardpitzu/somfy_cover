@@ -74,6 +74,7 @@ void SomfyIohcHub::loop() {
 void SomfyIohcHub::dump_config() {
   ESP_LOGCONFIG(TAG, "Somfy iohc Hub:");
   ESP_LOGCONFIG(TAG, "  CC1101: %s", this->cc1101_ != nullptr ? "configured" : "MISSING");
+  ESP_LOGCONFIG(TAG, "  1W frequency: %.3f MHz", this->frequency_1w_ / 1.0e6f);
   ESP_LOGCONFIG(TAG, "  RX callbacks: %u", this->rx_callbacks_.size());
 }
 
@@ -145,7 +146,11 @@ void SomfyIohcHub::begin_rx() {
 // ---------------------------------------------------------------------------
 
 void SomfyIohcHub::configure_radio_1w() {
-  this->cc1101_->set_frequency(iohc::FREQUENCY_1W);
+  // Use the configured per-radio calibration every time. TX changes packet
+  // settings and always re-enters this path; falling back to the nominal
+  // constant here would silently undo a calibrated RX frequency after the
+  // first Home Assistant command.
+  this->cc1101_->set_frequency(this->frequency_1w_);
   this->cc1101_->set_modulation_type(cc1101::Modulation::MODULATION_2_FSK);
   this->cc1101_->set_symbol_rate(iohc::SYMBOL_RATE);
   this->cc1101_->set_fsk_deviation(iohc::FSK_DEVIATION);

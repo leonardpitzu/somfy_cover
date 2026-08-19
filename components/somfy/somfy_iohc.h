@@ -41,8 +41,8 @@ static constexpr uint8_t TRANSFER_KEY[16] = {
 namespace iohc_cmd {
 static constexpr uint8_t CMD_EXECUTE = 0x00;
 // Companion event frames emitted by real Somfy 1W remotes for every short
-// button press. The kitchen-door capture proves that idle MY needs these after
-// the normal D200 EXECUTE frame; D200 alone only stops an active movement.
+// button press. Hardware captures prove that idle MY needs these after its
+// extended D200 EXECUTE frame; an ordinary short D200 alone only stops motion.
 static constexpr uint8_t CMD_BUTTON_EVENT = 0x20;
 static constexpr uint8_t CMD_WRITE_PRIVATE = 0x30;
 static constexpr uint8_t CMD_REMOVE_CONTROLLER = 0x39;
@@ -57,6 +57,18 @@ static constexpr uint16_t MP_MY = 0xD800;
 static constexpr uint8_t BUTTON_ACTION_OPEN = 0x00;
 static constexpr uint8_t BUTTON_ACTION_CLOSE = 0x01;
 static constexpr uint8_t BUTTON_ACTION_STOP_MY = 0x02;
+// Hardware-verified Situo 5 Variation wheel detents. A detent is a D200
+// EXECUTE frame with direction-specific FP bytes followed by one of these
+// private actions; unlike an ordinary button press, no release was observed.
+static constexpr uint8_t BUTTON_ACTION_TILT_CLOCKWISE = 0x0D;
+static constexpr uint8_t BUTTON_ACTION_TILT_COUNTERCLOCKWISE = 0x0E;
+
+static constexpr uint32_t TILT_EVENT_DELAY_MS = 25;
+static constexpr uint32_t TILT_NEXT_STEP_DELAY_MS = 100;
+// Endpoint requests deliberately drive beyond the calibrated number of
+// effective detents. Motors ignore extra commands at their mechanical limit,
+// making 0% and 100% reliable resynchronisation points.
+static constexpr uint8_t TILT_ENDPOINT_MARGIN_STEPS = 2;
 
 // A dedicated HA MY action first sends a lone D200 stop, waits for the motor to
 // settle, and only then reproduces the native three-frame MY press. This gives
@@ -128,6 +140,10 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void set_encryption_key(const uint8_t key[16]);
   void set_mode(IohcMode mode) { this->mode_ = mode; }
   void set_target_node(uint32_t node) { this->target_node_ = node & 0x00FFFFFF; }
+  void set_venetian(bool enabled, uint8_t tilt_steps = 12,
+                    bool tilt_inverted = false, uint8_t my_tilt_step = 6);
+  bool is_venetian() const { return this->venetian_; }
+  cover::CoverTraits get_traits() override;
 
   // Runtime-manager hooks. Ordinary YAML-defined covers remain enabled by
   // default and continue to use the same paths. Managed slot covers are born
@@ -149,6 +165,9 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void runtime_stop();
   void runtime_my();
   void runtime_set_position(float position);
+  void runtime_set_tilt(float tilt);
+  void runtime_tilt_step(bool clockwise);
+  void runtime_stop_tilt() { this->cancel_1w_tilt_sequence(); }
   void runtime_setup() { this->call_setup(); }
   void runtime_loop() { this->call(); }
 
@@ -186,6 +205,21 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   float my_position_{0.5f};
   bool has_my_position_{false};
 
+  // Venetian tilt is step-based on 1W remotes. tilt_steps_ is the calibrated
+  // number of wheel detents between the two slat endpoints. The public cover
+  // tilt value remains ESPHome's standard 0..1 scale and is restored by the
+  // cover base class.
+  bool venetian_{false};
+  bool tilt_inverted_{false};
+  uint8_t tilt_steps_{12};
+  // Physical clockwise detents from the counterclockwise endpoint. Keeping
+  // this installation-facing value separate from the logical HA percentage
+  // makes direction inversion unambiguous.
+  uint8_t my_tilt_step_{6};
+  int16_t tilt_steps_remaining_{0};
+  int8_t tilt_direction_{0};
+  float tilt_target_{1.0f};
+
   // Protocol mode
   IohcMode mode_{IohcMode::MODE_1W};
 
@@ -217,9 +251,18 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
 
   // 1W Protocol (per-device: uses device key + rolling code)
   bool send_1w_command(uint16_t main_param);
+  bool send_1w_my_execute();
   bool send_1w_button_event(uint8_t action, bool released);
   bool send_1w_my_sequence();
   void cancel_1w_my_sequence();
+  bool send_1w_tilt_execute(bool clockwise);
+  void set_tilt_target_(float target);
+  float logical_tilt_for_physical_step_(uint8_t physical_step) const;
+  void set_lift_tilt_(bool opening, bool publish = true);
+  void set_my_tilt_(bool publish = true);
+  void start_tilt_steps_(int16_t steps, int8_t logical_direction, float target);
+  void send_next_tilt_step_();
+  void cancel_1w_tilt_sequence();
   // Build a complete ordinary 1W frame. The MAC authenticates
   // cmd || data[0..auth_len); auth_len defaults to the full data length.
   // Pairing's special no-MAC 0x30 frame uses the protocol helper directly.
@@ -247,6 +290,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
 
   // Physical-remote UI animation state.
   RxSyncAnimator rx_sync_;
+  bool my_tilt_pending_{false};
 
   void start_rx_sync(cover::CoverOperation op);
   void start_rx_sync_to(float target_position);
@@ -255,8 +299,11 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   bool is_allowed_remote_(uint32_t code) const;
   // Decode the MainParameter from a CMD_EXECUTE packet (foreign remote command).
   static bool decode_execute_param_(const IohcDecodedPacket &pkt, uint16_t &main_param);
+  static bool decode_button_action_(const IohcDecodedPacket &pkt, uint8_t &action);
+  static bool is_tilt_execute_(const IohcDecodedPacket &pkt);
   // Drive the HA UI animation in response to a recognised foreign command.
   void handle_rx_command_(uint16_t main_param);
+  void handle_rx_tilt_step_(bool clockwise);
 #endif
 };
 

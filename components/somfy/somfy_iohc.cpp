@@ -36,6 +36,17 @@ const char *main_param_name(uint16_t mp) {
   }
 }
 
+const char *button_action_name(uint8_t action) {
+  switch (action) {
+    case iohc_cmd::BUTTON_ACTION_OPEN: return "OPEN";
+    case iohc_cmd::BUTTON_ACTION_CLOSE: return "CLOSE";
+    case iohc_cmd::BUTTON_ACTION_STOP_MY: return "STOP/MY";
+    case iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE: return "TILT CLOCKWISE";
+    case iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE: return "TILT COUNTERCLOCKWISE";
+    default: return "BUTTON";
+  }
+}
+
 // Render up to RX_HEX_MAX_BYTES of a payload as "AA BB CC" into out (NUL-terminated).
 void format_payload_hex(const uint8_t *data, size_t len, char *out, size_t out_size) {
   if (out_size == 0) return;
@@ -75,6 +86,22 @@ void SomfyIohcCover::set_encryption_key(const uint8_t key[16]) {
   }
   memcpy(this->encryption_key_, key, sizeof(this->encryption_key_));
   this->has_custom_key_ = true;
+}
+
+void SomfyIohcCover::set_venetian(bool enabled, uint8_t tilt_steps,
+                                  bool tilt_inverted, uint8_t my_tilt_step) {
+  this->venetian_ = enabled;
+  this->tilt_steps_ = clamp<uint8_t>(tilt_steps, 1, 254);
+  this->tilt_inverted_ = tilt_inverted;
+  this->my_tilt_step_ = std::min<uint8_t>(my_tilt_step, this->tilt_steps_);
+  if (!enabled)
+    this->cancel_1w_tilt_sequence();
+}
+
+cover::CoverTraits SomfyIohcCover::get_traits() {
+  auto traits = SomfyTimeBasedCover::get_traits();
+  traits.set_supports_tilt(this->venetian_);
+  return traits;
 }
 
 void SomfyIohcCover::reconfigure_storage(const char *ns, const char *key, uint16_t initial_code) {
@@ -125,6 +152,23 @@ void SomfyIohcCover::runtime_set_position(float position) {
   auto call = this->make_call();
   call.set_position(clamp(position, 0.0f, 1.0f));
   call.perform();
+}
+
+void SomfyIohcCover::runtime_set_tilt(float tilt) {
+  auto call = this->make_call();
+  call.set_tilt(clamp(tilt, 0.0f, 1.0f));
+  call.perform();
+}
+
+void SomfyIohcCover::runtime_tilt_step(bool clockwise) {
+  if (!this->runtime_enabled_ || !this->venetian_) {
+    ESP_LOGW(TAG, "Ignoring tilt step for a non-Venetian or unused slot");
+    return;
+  }
+  const int8_t logical_direction = (clockwise != this->tilt_inverted_) ? 1 : -1;
+  const float target = clamp(this->tilt + logical_direction / static_cast<float>(this->tilt_steps_),
+                             0.0f, 1.0f);
+  this->start_tilt_steps_(1, logical_direction, target);
 }
 
 // ---------------------------------------------------------------------------
@@ -193,6 +237,11 @@ void SomfyIohcCover::dump_config() {
   ESP_LOGCONFIG(TAG, "  Custom key: %s", this->has_custom_key_ ? "yes" : "no (transfer key)");
   if (this->has_my_position_)
     ESP_LOGCONFIG(TAG, "  MY position estimate: %.0f%%", this->my_position_ * 100.0f);
+  ESP_LOGCONFIG(TAG, "  Venetian tilt: %s", this->venetian_ ? "enabled" : "disabled");
+  if (this->venetian_)
+    ESP_LOGCONFIG(TAG, "  Tilt calibration: %u steps, clockwise %s value",
+                  static_cast<unsigned>(this->tilt_steps_),
+                  this->tilt_inverted_ ? "decreases" : "increases");
 #ifdef USE_SOMFY_IOHC_RX
   ESP_LOGCONFIG(TAG, "  RX state-sync: enabled (%u allowed remote(s)%s)",
                 static_cast<unsigned>(this->receive_remote_codes_.size()),
@@ -206,26 +255,31 @@ void SomfyIohcCover::dump_config() {
 
 void SomfyIohcCover::open() {
   this->cancel_1w_my_sequence();
+  this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "OPEN node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
-  if (this->mode_ == IohcMode::MODE_2W)
+  if (this->mode_ == IohcMode::MODE_2W) {
     this->send_2w_command(iohc_cmd::MP_OPEN);
-  else
-    this->send_1w_command(iohc_cmd::MP_OPEN);
+  } else if (this->send_1w_command(iohc_cmd::MP_OPEN)) {
+    this->set_lift_tilt_(true);
+  }
 }
 
 void SomfyIohcCover::close() {
   this->cancel_1w_my_sequence();
+  this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "CLOSE node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
-  if (this->mode_ == IohcMode::MODE_2W)
+  if (this->mode_ == IohcMode::MODE_2W) {
     this->send_2w_command(iohc_cmd::MP_CLOSE);
-  else
-    this->send_1w_command(iohc_cmd::MP_CLOSE);
+  } else if (this->send_1w_command(iohc_cmd::MP_CLOSE)) {
+    this->set_lift_tilt_(false);
+  }
 }
 
 void SomfyIohcCover::stop() {
   this->cancel_1w_my_sequence();
+  this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "STOP node=0x%06" PRIX32 " mode=%s", this->node_id_,
            this->mode_ == IohcMode::MODE_2W ? "2W" : "1W");
   if (this->mode_ == IohcMode::MODE_2W)
@@ -244,6 +298,7 @@ void SomfyIohcCover::my() {
   if (this->rx_sync_.active())
     this->stop_rx_sync();
 #endif
+  this->cancel_1w_tilt_sequence();
 
   if (this->current_operation != cover::COVER_OPERATION_IDLE) {
     // Update the estimator without firing its normal STOP trigger: the MY
@@ -287,6 +342,10 @@ void SomfyIohcCover::control(const cover::CoverCall &call) {
     return;
   }
 #endif
+
+  const auto requested_tilt = call.get_tilt();
+  if (requested_tilt.has_value() && this->venetian_)
+    this->set_tilt_target_(*requested_tilt);
 
   SomfyTimeBasedCover::control(call);
 }
@@ -399,6 +458,195 @@ bool SomfyIohcCover::send_1w_button_event(uint8_t action, bool released) {
   return true;
 }
 
+bool SomfyIohcCover::send_1w_my_execute() {
+  // Exact extended EXECUTE payload captured from a Situo 5 Variation MY press:
+  //   01 43 D2 00 20 D2 00 00
+  // This is deliberately distinct from the ordinary six-byte D200 STOP frame.
+  const uint8_t data[8] = {
+      iohc_cmd::ORIGINATOR_USER,
+      iohc_cmd::ACEI_DEFAULT,
+      static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8),
+      static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF),
+      0x20,
+      0xD2,
+      0x00,
+      0x00,
+  };
+  ESP_LOGD(TAG, "TX MY EXECUTE 1W: src=0x%06" PRIX32, this->node_id_);
+  auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, sizeof(data),
+                                    iohc::BROADCAST_ADDR);
+  if (frame.empty()) {
+    ESP_LOGE(TAG, "TX MY EXECUTE 1W aborted: frame construction failed");
+    return false;
+  }
+  this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+  return true;
+}
+
+bool SomfyIohcCover::send_1w_tilt_execute(bool clockwise) {
+  // Exact clear EXECUTE payloads captured from the Situo Variation wheel:
+  //   clockwise:        01 43 D2 00 20 CD 2E 00
+  //   counterclockwise: 01 43 D2 00 20 CC A2 00
+  // The following private 0x20 action carries the authoritative direction,
+  // but the motor expects this complete leading frame as part of the gesture.
+  uint8_t data[8] = {
+      iohc_cmd::ORIGINATOR_USER,
+      iohc_cmd::ACEI_DEFAULT,
+      static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8),
+      static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF),
+      0x20,
+      static_cast<uint8_t>(clockwise ? 0xCD : 0xCC),
+      static_cast<uint8_t>(clockwise ? 0x2E : 0xA2),
+      0x00,
+  };
+  ESP_LOGD(TAG, "TX TILT EXECUTE 1W: src=0x%06" PRIX32 " direction=%s",
+           this->node_id_, clockwise ? "clockwise" : "counterclockwise");
+  auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, sizeof(data),
+                                    iohc::BROADCAST_ADDR);
+  if (frame.empty()) {
+    ESP_LOGE(TAG, "TX TILT EXECUTE 1W aborted: frame construction failed");
+    return false;
+  }
+  this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+  return true;
+}
+
+float SomfyIohcCover::logical_tilt_for_physical_step_(
+    uint8_t physical_step) const {
+  const float physical = std::min<uint8_t>(physical_step, this->tilt_steps_) /
+                         static_cast<float>(this->tilt_steps_);
+  return this->tilt_inverted_ ? 1.0f - physical : physical;
+}
+
+void SomfyIohcCover::set_lift_tilt_(bool opening, bool publish) {
+  if (!this->venetian_)
+    return;
+  // The tested motor drives the slats to their horizontal/open angle while
+  // raising, and to the clockwise endpoint while lowering. STOP leaves that
+  // mechanically established angle untouched.
+  this->tilt = opening
+                   ? 0.5f
+                   : this->logical_tilt_for_physical_step_(this->tilt_steps_);
+  if (publish)
+    this->publish_state();
+}
+
+void SomfyIohcCover::set_my_tilt_(bool publish) {
+  if (!this->venetian_)
+    return;
+  this->tilt = this->logical_tilt_for_physical_step_(this->my_tilt_step_);
+  if (publish)
+    this->publish_state();
+}
+
+void SomfyIohcCover::set_tilt_target_(float target) {
+  if (!this->runtime_enabled_ || !this->venetian_) {
+    ESP_LOGW(TAG, "Ignoring tilt target for a non-Venetian or unused slot");
+    return;
+  }
+  target = clamp(target, 0.0f, 1.0f);
+  // An endpoint request is also the absolute-position resynchronisation path.
+  // Always sweep beyond a complete calibrated range so the first command
+  // after pairing/reboot is correct even if the restored estimate and physical
+  // slats disagree. The motor ignores the deliberate extra endpoint detents.
+  const bool endpoint = target == 0.0f || target == 1.0f;
+  if (endpoint) {
+    const int16_t steps = static_cast<int16_t>(this->tilt_steps_) +
+                          iohc_cmd::TILT_ENDPOINT_MARGIN_STEPS;
+    this->start_tilt_steps_(steps, target == 1.0f ? 1 : -1, target);
+    return;
+  }
+
+  // A 1W Venetian motor accepts relative detents, not arbitrary percentages.
+  // Quantize both ends to the calibrated step grid, transmit exactly their
+  // difference, and publish the reachable target rather than the user's raw
+  // request when the sequence completes.
+  const int16_t current_step = clamp<int16_t>(
+      static_cast<int16_t>(std::lround(this->tilt * this->tilt_steps_)), 0,
+      this->tilt_steps_);
+  const int16_t target_step = clamp<int16_t>(
+      static_cast<int16_t>(std::lround(target * this->tilt_steps_)), 0,
+      this->tilt_steps_);
+  const float reachable_target =
+      target_step / static_cast<float>(this->tilt_steps_);
+  const int16_t step_delta = target_step - current_step;
+  const int16_t steps = std::abs(step_delta);
+  if (steps == 0) {
+    this->tilt = reachable_target;
+    this->publish_state();
+    return;
+  }
+  this->start_tilt_steps_(steps, step_delta > 0 ? 1 : -1,
+                          reachable_target);
+}
+
+void SomfyIohcCover::start_tilt_steps_(int16_t steps, int8_t logical_direction,
+                                       float target) {
+  this->cancel_1w_my_sequence();
+  this->cancel_1w_tilt_sequence();
+
+#ifdef USE_SOMFY_IOHC_RX
+  if (this->rx_sync_.active())
+    this->stop_rx_sync();
+#endif
+  if (this->current_operation != cover::COVER_OPERATION_IDLE) {
+    // The first tilt EXECUTE is D200 and therefore stops the lift motor. Keep
+    // the time-based lift estimate accurate without emitting a separate STOP.
+    this->recompute_position_();
+    this->current_operation = cover::COVER_OPERATION_IDLE;
+    this->stop_prev_trigger_();
+    this->publish_state();
+  }
+
+  this->tilt_steps_remaining_ = std::max<int16_t>(1, steps);
+  this->tilt_direction_ = logical_direction >= 0 ? 1 : -1;
+  this->tilt_target_ = clamp(target, 0.0f, 1.0f);
+  this->send_next_tilt_step_();
+}
+
+void SomfyIohcCover::send_next_tilt_step_() {
+  if (this->tilt_steps_remaining_ <= 0 || !this->runtime_enabled_ || !this->venetian_)
+    return;
+
+  const bool clockwise = (this->tilt_direction_ > 0) != this->tilt_inverted_;
+  if (!this->send_1w_tilt_execute(clockwise)) {
+    this->cancel_1w_tilt_sequence();
+    return;
+  }
+
+  this->set_timeout("iohc-tilt-event", iohc_cmd::TILT_EVENT_DELAY_MS,
+                    [this, clockwise]() {
+    const uint8_t action = clockwise ? iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE
+                                     : iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE;
+    if (!this->send_1w_button_event(action, false)) {
+      this->cancel_1w_tilt_sequence();
+      return;
+    }
+
+    this->tilt_steps_remaining_--;
+    if (this->tilt_steps_remaining_ <= 0) {
+      this->tilt = this->tilt_target_;
+      this->tilt_direction_ = 0;
+      this->publish_state();
+      return;
+    }
+
+    this->tilt = clamp(this->tilt + this->tilt_direction_ /
+                                      static_cast<float>(this->tilt_steps_),
+                       0.0f, 1.0f);
+    this->publish_state();
+    this->set_timeout("iohc-tilt-next", iohc_cmd::TILT_NEXT_STEP_DELAY_MS,
+                      [this]() { this->send_next_tilt_step_(); });
+  });
+}
+
+void SomfyIohcCover::cancel_1w_tilt_sequence() {
+  this->cancel_timeout("iohc-tilt-event");
+  this->cancel_timeout("iohc-tilt-next");
+  this->tilt_steps_remaining_ = 0;
+  this->tilt_direction_ = 0;
+}
+
 void SomfyIohcCover::cancel_1w_my_sequence() {
   this->cancel_timeout("iohc-my-recall");
   this->cancel_timeout("iohc-my-press");
@@ -415,7 +663,7 @@ bool SomfyIohcCover::send_1w_my_sequence() {
     return false;
 
   this->set_timeout("iohc-my-recall", iohc_cmd::MY_PRESTOP_SETTLE_MS, [this]() {
-    if (!this->send_1w_command(iohc_cmd::MP_STOP))
+    if (!this->send_1w_my_execute())
       return;
     this->set_timeout("iohc-my-press", iohc_cmd::MY_EVENT_DELAY_MS, [this]() {
       if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false))
@@ -522,6 +770,43 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
   //     outside HA. Runs for both 1W and 2W covers — a foreign remote command
   //     is a 1W broadcast frame regardless of this cover's own mode, so we must
   //     inspect it before the 2W target-node filter below drops it. ---
+  if (this->venetian_ && pkt.src_node != this->node_id_ &&
+      pkt.cmd == iohc_cmd::CMD_BUTTON_EVENT) {
+    uint8_t action = 0;
+    if (decode_button_action_(pkt, action) &&
+        (action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE ||
+         action == iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE)) {
+      uint16_t sequence = 0;
+      const bool has_sequence = iohc_proto::extract_sequence_1w(
+          pkt.data, pkt.data_len, sequence);
+      const uint16_t event_code = static_cast<uint16_t>(0xF000U | action);
+      const bool duplicate = this->rx_deduplicator_.is_duplicate(
+          millis(), pkt.src_node, event_code, sequence, has_sequence,
+          RX_DEDUP_WINDOW_MS);
+      if (!duplicate && this->log_text_sensor_ != nullptr) {
+        char buf[112];
+        this->rx_event_counter_++;
+        if (has_sequence)
+          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s seq=0x%04X event=%" PRIu32,
+                   pkt.src_node, button_action_name(action), sequence,
+                   this->rx_event_counter_);
+        else
+          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s event=%" PRIu32,
+                   pkt.src_node, button_action_name(action), this->rx_event_counter_);
+        this->log_text_sensor_->publish_state(buf);
+      }
+      if (this->is_allowed_remote_(pkt.src_node)) {
+        if (duplicate)
+          return;
+        if (this->remote_command_callback_)
+          this->remote_command_callback_(event_code);
+        this->handle_rx_tilt_step_(
+            action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE);
+        return;
+      }
+    }
+  }
+
   if (pkt.src_node != this->node_id_ && pkt.cmd == iohc_cmd::CMD_EXECUTE) {
     char hexbuf[RX_HEX_MAX_BYTES * 3 + 1];
     format_payload_hex(pkt.data, pkt.data_len, hexbuf, sizeof(hexbuf));
@@ -532,6 +817,7 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     const bool decoded = decode_execute_param_(pkt, main_param);
     uint16_t sequence = 0;
     const bool has_sequence = decoded && iohc_proto::extract_sequence_1w(pkt.data, pkt.data_len, sequence);
+    const bool tilt_execute = decoded && this->venetian_ && is_tilt_execute_(pkt);
     const bool duplicate = decoded && this->rx_deduplicator_.is_duplicate(
                                           millis(), pkt.src_node, main_param, sequence,
                                           has_sequence, RX_DEDUP_WINDOW_MS);
@@ -540,7 +826,7 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     // remote IDs can be learned. Sequence-aware burst deduplication publishes
     // one update per physical press, while the sequence and event number force
     // repeated presses of the same button to remain visible in HA history.
-    if (this->log_text_sensor_ != nullptr && (!decoded || !duplicate)) {
+    if (!tilt_execute && this->log_text_sensor_ != nullptr && (!decoded || !duplicate)) {
       char buf[112];
       if (decoded) {
         this->rx_event_counter_++;
@@ -559,6 +845,8 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     if (decoded && this->is_allowed_remote_(pkt.src_node)) {
       if (duplicate)
         return;  // repeat frame from the remote's burst — already handled
+      if (tilt_execute)
+        return;  // the following private 0x20 action supplies the direction
       ESP_LOGD(TAG, "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
                pkt.src_node, main_param_name(main_param), main_param, pkt.rssi);
       if (this->remote_command_callback_)
@@ -603,12 +891,38 @@ bool SomfyIohcCover::decode_execute_param_(const IohcDecodedPacket &pkt, uint16_
   return true;
 }
 
+bool SomfyIohcCover::decode_button_action_(const IohcDecodedPacket &pkt, uint8_t &action) {
+  if (pkt.cmd != iohc_cmd::CMD_BUTTON_EVENT || pkt.data == nullptr || pkt.data_len < 6)
+    return false;
+  // Captured private payload: 02 FF 01 43 <action> <phase> ...
+  if (pkt.data[0] != 0x02 || pkt.data[1] != 0xFF ||
+      pkt.data[2] != iohc_cmd::ORIGINATOR_USER ||
+      pkt.data[3] != iohc_cmd::ACEI_DEFAULT)
+    return false;
+  action = pkt.data[4];
+  return true;
+}
+
+bool SomfyIohcCover::is_tilt_execute_(const IohcDecodedPacket &pkt) {
+  if (pkt.cmd != iohc_cmd::CMD_EXECUTE || pkt.data == nullptr || pkt.data_len < 8)
+    return false;
+  return pkt.data[2] == static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8) &&
+         pkt.data[3] == static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF) &&
+         pkt.data[4] == 0x20 && pkt.data[7] == 0x00 &&
+         ((pkt.data[5] == 0xCD && pkt.data[6] == 0x2E) ||
+          (pkt.data[5] == 0xCC && pkt.data[6] == 0xA2));
+}
+
 void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
   switch (main_param) {
     case iohc_cmd::MP_OPEN:
+      this->my_tilt_pending_ = false;
+      this->set_lift_tilt_(true, false);
       this->start_rx_sync(cover::COVER_OPERATION_OPENING);
       break;
     case iohc_cmd::MP_CLOSE:
+      this->my_tilt_pending_ = false;
+      this->set_lift_tilt_(false, false);
       this->start_rx_sync(cover::COVER_OPERATION_CLOSING);
       break;
     case iohc_cmd::MP_STOP:
@@ -626,7 +940,28 @@ void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
   }
 }
 
+void SomfyIohcCover::handle_rx_tilt_step_(bool clockwise) {
+  this->cancel_1w_tilt_sequence();
+  // A physical wheel gesture begins with D200 and therefore stops lift motion.
+  // The private direction event arrives afterward and is the point at which we
+  // can safely update both the height estimator and the slat angle.
+  if (this->rx_sync_.active()) {
+    this->stop_rx_sync();
+  } else if (this->current_operation != cover::COVER_OPERATION_IDLE) {
+    this->recompute_position_();
+    this->current_operation = cover::COVER_OPERATION_IDLE;
+    this->stop_prev_trigger_();
+  }
+  const int8_t direction = (clockwise != this->tilt_inverted_) ? 1 : -1;
+  this->tilt = clamp(this->tilt + direction / static_cast<float>(this->tilt_steps_),
+                     0.0f, 1.0f);
+  ESP_LOGD(TAG, "RX sync: Venetian tilt %s -> %.0f%%",
+           clockwise ? "clockwise" : "counterclockwise", this->tilt * 100.0f);
+  this->publish_state();
+}
+
 void SomfyIohcCover::start_rx_sync(cover::CoverOperation op) {
+  this->my_tilt_pending_ = false;
   this->rx_sync_.start(op == cover::COVER_OPERATION_OPENING, this->position, millis());
   this->current_operation = op;
   this->publish_state();
@@ -634,16 +969,23 @@ void SomfyIohcCover::start_rx_sync(cover::CoverOperation op) {
 
 void SomfyIohcCover::start_rx_sync_to(float target_position) {
   this->rx_sync_.start_to(target_position, this->position, millis());
-  if (!this->rx_sync_.active())
+  this->my_tilt_pending_ = this->venetian_;
+  if (!this->rx_sync_.active()) {
+    this->set_my_tilt_();
+    this->my_tilt_pending_ = false;
     return;
+  }
   this->current_operation = target_position >= this->position
                                 ? cover::COVER_OPERATION_OPENING
                                 : cover::COVER_OPERATION_CLOSING;
+  this->set_lift_tilt_(
+      this->current_operation == cover::COVER_OPERATION_OPENING, false);
   this->publish_state();
 }
 
 void SomfyIohcCover::stop_rx_sync() {
   this->rx_sync_.stop();
+  this->my_tilt_pending_ = false;
   this->current_operation = cover::COVER_OPERATION_IDLE;
   this->publish_state();
 }
@@ -655,7 +997,12 @@ void SomfyIohcCover::loop() {
 
     this->position = update.position;
     if (update.finished) {
-      this->stop_rx_sync();
+      this->rx_sync_.stop();
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      if (this->my_tilt_pending_)
+        this->set_my_tilt_(false);
+      this->my_tilt_pending_ = false;
+      this->publish_state();
     } else if (update.publish) {
       this->publish_state();
     }
