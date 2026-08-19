@@ -189,10 +189,7 @@ void SomfyIohcManager::create_slots() {
         [this, index](uint16_t next_code) { this->on_rolling_code_(index, next_code); });
     slot.cover->set_remote_command_callback(
         [this, index](uint16_t main_param, uint32_t remote, float rssi) {
-      this->accepted_remote_command_count_++;
-      char detail[7];
-      snprintf(detail, sizeof(detail), "0x%04X", main_param);
-      this->publish_status_("remote_command", index, detail, rssi, remote);
+      this->stage_remote_command_(index, main_param, remote, rssi);
     });
 
     // Slot entities are intentionally disabled until the HA commissioning flow
@@ -313,6 +310,12 @@ void SomfyIohcManager::setup() {
 void SomfyIohcManager::loop() {
   for (auto &slot : this->slots_)
     slot.cover->runtime_loop();
+
+  // Every cover assigned to a receive-only physical group sees the same RF
+  // packet in one hub dispatch. Publish one status containing the full target
+  // set instead of several back-to-back text-sensor states, which the native
+  // API is allowed to coalesce to only the final value.
+  this->flush_pending_remote_command_();
 
   const uint32_t now = millis();
   if (this->discovery_slot_ >= 0 &&
@@ -1585,7 +1588,7 @@ void SomfyIohcManager::discard_staged_(uint8_t slot) {
 
 void SomfyIohcManager::publish_status_(
     const char *action, int32_t slot, const char *detail, float rssi,
-    uint32_t remote_override) {
+    uint32_t remote_override, uint32_t slot_mask) {
   if (this->status_sensor_ == nullptr)
     return;
   this->event_counter_++;
@@ -1604,13 +1607,68 @@ void SomfyIohcManager::publish_status_(
   }
   if (remote_override != 0)
     remote = remote_override & 0x00FFFFFF;
-  char output[255];
+  std::string slots = "[";
+  for (uint8_t index = 0; index < this->slots_.size(); index++) {
+    if ((slot_mask & (uint32_t{1} << index)) == 0)
+      continue;
+    if (slots.size() > 1)
+      slots += ',';
+    slots += std::to_string(index);
+  }
+  slots += ']';
+  char output[384];
   snprintf(output, sizeof(output),
            "{\"v\":1,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
+           ",\"slots\":%s"
            ",\"state\":\"%s\",\"node\":\"0x%06" PRIX32 "\",\"remote\":\"0x%06" PRIX32
            "\",\"next\":%u,\"rssi\":%.1f,\"detail\":\"%s\"}",
-           this->event_counter_, action, slot, state, node, remote, next, rssi, detail);
+           this->event_counter_, action, slot, slots.c_str(), state, node,
+           remote, next, rssi, detail);
   this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::stage_remote_command_(uint8_t slot,
+                                             uint16_t main_param,
+                                             uint32_t remote, float rssi) {
+  remote &= 0x00FFFFFF;
+  if (this->pending_remote_command_.active &&
+      (this->pending_remote_command_.main_param != main_param ||
+       this->pending_remote_command_.remote != remote)) {
+    this->flush_pending_remote_command_();
+  }
+  auto &pending = this->pending_remote_command_;
+  if (!pending.active) {
+    pending.active = true;
+    pending.main_param = main_param;
+    pending.remote = remote;
+    pending.rssi = rssi;
+  } else if (rssi > pending.rssi) {
+    pending.rssi = rssi;
+  }
+  pending.slot_mask |= uint32_t{1} << slot;
+}
+
+void SomfyIohcManager::flush_pending_remote_command_() {
+  if (!this->pending_remote_command_.active)
+    return;
+  const PendingRemoteCommand pending = this->pending_remote_command_;
+  this->pending_remote_command_ = {};
+
+  int32_t first_slot = -1;
+  for (uint8_t index = 0; index < this->slots_.size(); index++) {
+    if ((pending.slot_mask & (uint32_t{1} << index)) != 0) {
+      first_slot = index;
+      break;
+    }
+  }
+  if (first_slot < 0)
+    return;
+
+  this->accepted_remote_command_count_++;
+  char detail[7];
+  snprintf(detail, sizeof(detail), "0x%04X", pending.main_param);
+  this->publish_status_("remote_command", first_slot, detail, pending.rssi,
+                        pending.remote, pending.slot_mask);
 }
 
 void SomfyIohcManager::publish_rx_stats_(int32_t slot) {

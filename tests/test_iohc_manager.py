@@ -176,7 +176,10 @@ def test_remote_events_report_the_actual_group_source_and_rssi():
     assert "std::function<void(uint16_t, uint32_t, float)>" in cover_header
     assert "event_code, pkt.src_node, pkt.rssi" in cover_source
     assert "main_param, pkt.src_node, pkt.rssi" in cover_source
-    assert 'publish_status_("remote_command", index, detail, rssi, remote)' in source
+    assert "stage_remote_command_(index, main_param, remote, rssi)" in source
+    assert "pending.slot_mask |= uint32_t{1} << slot" in source
+    assert 'publish_status_("remote_command", first_slot, detail, pending.rssi' in source
+    assert '\\"slots\\":%s' in source
 
 
 def test_manager_exposes_versioned_status_without_native_ui_buttons():

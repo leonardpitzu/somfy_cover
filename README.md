@@ -214,6 +214,10 @@ cover:
 - STOP and MY are intentionally distinct transmissions even though both use the authenticated `CMD_EXECUTE` main parameter `0xD200`. STOP sends that frame alone, which stops movement but does not recall MY when idle. A dedicated MY action sends that safe stop-only frame first, waits 500 ms for the motor to settle, and then reproduces the real remote's complete short-press sequence: `0xD200`, followed by `cmd=0x20` payloads `02 FF 01 43 02 0C 00 00` and `02 FF 01 43 02 05 FF 00`. Each logical frame has its own rolling code and MAC. MY therefore means “go to the stored favourite” whether the motor was moving or idle, without relying on Home Assistant's estimated state.
 - `my_position` only tells Home Assistant where to animate the 1W position estimate when MY recall begins; it is not used to choose the RF command.
 - `allowed_remotes` lets commands from already-paired physical remotes update the time-based Home Assistant estimate. An empty list accepts all decoded remote IDs; an explicit list is safer after discovery. `detected_remote` includes the received rolling sequence and an event number, so repeated presses of the same button remain separate Home Assistant history entries while RF copies from one burst are collapsed.
+- On Venetian remotes, a wheel gesture can intentionally stop lift movement
+  with a `D200` frame before sending its direction-bearing tilt event. The
+  receiver correlates that pair into one tilt action for Home Assistant; a
+  genuine standalone STOP/MY remains visible and functional.
 - For bidirectional (2W) support, see the next section.
 
 ### Receive-only raw capture (experimental)
@@ -328,7 +332,9 @@ remote and stages it until Home Assistant confirms the complete target list.
 Adding, editing, or removing an alias sends no RF, never presses PROG, and does
 not consume a motor pairing slot. Independent bridge control still uses each
 shutter's own paired controller identity; aliases only synchronize received
-physical commands to all assigned state estimates.
+physical commands to all assigned state estimates. One received group command
+is published with its complete target-slot list, so Home Assistant updates
+every member without losing intermediate status to state coalescing.
 
 ### Home Assistant
 

@@ -96,6 +96,18 @@ void SomfyIohcCover::set_venetian(bool enabled, uint8_t tilt_steps,
   this->my_tilt_step_ = std::min<uint8_t>(my_tilt_step, this->tilt_steps_);
   if (!enabled)
     this->cancel_1w_tilt_sequence();
+#ifdef USE_SOMFY_IOHC_RX
+  if (!enabled)
+    this->clear_pending_rx_stop_();
+#endif
+}
+
+void SomfyIohcCover::set_runtime_enabled(bool enabled) {
+  this->runtime_enabled_ = enabled;
+#ifdef USE_SOMFY_IOHC_RX
+  if (!enabled)
+    this->clear_pending_rx_stop_();
+#endif
 }
 
 cover::CoverTraits SomfyIohcCover::get_traits() {
@@ -326,6 +338,7 @@ void SomfyIohcCover::control(const cover::CoverCall &call) {
   }
 #ifdef USE_SOMFY_IOHC_RX
   // A Home Assistant command supersedes passive physical-remote/MY animation.
+  this->clear_pending_rx_stop_();
   const bool was_external_animation = this->rx_sync_.active();
   if (was_external_animation) {
     this->rx_sync_.stop();
@@ -774,9 +787,23 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
   if (this->venetian_ && pkt.src_node != this->node_id_ &&
       pkt.cmd == iohc_cmd::CMD_BUTTON_EVENT) {
     uint8_t action = 0;
-    if (decode_button_action_(pkt, action) &&
-        (action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE ||
-         action == iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE)) {
+    if (decode_button_action_(pkt, action)) {
+      if (action == iohc_cmd::BUTTON_ACTION_STOP_MY &&
+          this->pending_rx_stop_ &&
+          this->pending_rx_stop_remote_ == pkt.src_node) {
+        // A real STOP/MY press has confirmed that the staged D200 was not the
+        // prefix of a wheel detent. Emit it now rather than waiting for expiry.
+        this->flush_pending_rx_stop_();
+        return;
+      }
+      if (action != iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE &&
+          action != iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE) {
+        return;
+      }
+      // The direction-bearing private action is authoritative. Any preceding
+      // ordinary-looking D200 from this same physical source belongs to this
+      // gesture and must never surface as a separate STOP/MY event.
+      this->cancel_rx_stop_for_(pkt.src_node);
       uint16_t sequence = 0;
       const bool has_sequence = iohc_proto::extract_sequence_1w(
           pkt.data, pkt.data_len, sequence);
@@ -823,37 +850,29 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
                                           millis(), pkt.src_node, main_param, sequence,
                                           has_sequence, RX_DEDUP_WINDOW_MS);
 
-    // Publish to the discovery text sensor regardless of allow-list so unknown
-    // remote IDs can be learned. Sequence-aware burst deduplication publishes
-    // one update per physical press, while the sequence and event number force
-    // repeated presses of the same button to remain visible in HA history.
-    if (!tilt_execute && this->log_text_sensor_ != nullptr && (!decoded || !duplicate)) {
-      char buf[112];
-      if (decoded) {
-        this->rx_event_counter_++;
-        if (has_sequence)
-          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04X seq=0x%04X event=%" PRIu32,
-                   pkt.src_node, main_param_name(main_param), main_param, sequence, this->rx_event_counter_);
-        else
-          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s 0x%04X event=%" PRIu32,
-                   pkt.src_node, main_param_name(main_param), main_param, this->rx_event_counter_);
-      } else {
-        snprintf(buf, sizeof(buf), "0x%06" PRIX32 " RAW [%s]", pkt.src_node, hexbuf);
-      }
-      this->log_text_sensor_->publish_state(buf);
-    }
-
-    if (decoded && this->is_allowed_remote_(pkt.src_node)) {
+    if (decoded) {
       if (duplicate)
         return;  // repeat frame from the remote's burst — already handled
       if (tilt_execute)
         return;  // the following private 0x20 action supplies the direction
-      ESP_LOGD(TAG, "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
-               pkt.src_node, main_param_name(main_param), main_param, pkt.rssi);
-      if (this->remote_command_callback_)
-        this->remote_command_callback_(main_param, pkt.src_node, pkt.rssi);
-      this->handle_rx_command_(main_param);
+      if (this->venetian_ && main_param == iohc_cmd::MP_STOP) {
+        this->stage_rx_stop_(pkt.src_node, pkt.rssi, sequence, has_sequence);
+        return;
+      }
+      if (this->pending_rx_stop_ &&
+          this->pending_rx_stop_remote_ == pkt.src_node)
+        this->flush_pending_rx_stop_();
+      this->emit_rx_command_(main_param, pkt.src_node, pkt.rssi, sequence,
+                             has_sequence);
       return;
+    }
+
+    // Preserve raw discovery visibility for undecodable foreign frames.
+    if (this->log_text_sensor_ != nullptr) {
+      char buf[112];
+      snprintf(buf, sizeof(buf), "0x%06" PRIX32 " RAW [%s]", pkt.src_node,
+               hexbuf);
+      this->log_text_sensor_->publish_state(buf);
     }
   }
 #endif  // USE_SOMFY_IOHC_RX
@@ -912,6 +931,79 @@ bool SomfyIohcCover::is_tilt_execute_(const IohcDecodedPacket &pkt) {
          pkt.data[4] == 0x20 && pkt.data[7] == 0x00 &&
          ((pkt.data[5] == 0xCD && pkt.data[6] == 0x2E) ||
           (pkt.data[5] == 0xCC && pkt.data[6] == 0xA2));
+}
+
+void SomfyIohcCover::stage_rx_stop_(uint32_t remote, float rssi,
+                                    uint16_t sequence, bool has_sequence) {
+  if (this->pending_rx_stop_ && this->pending_rx_stop_remote_ != remote)
+    this->flush_pending_rx_stop_();
+  this->pending_rx_stop_ = true;
+  this->pending_rx_stop_remote_ = remote & 0x00FFFFFF;
+  this->pending_rx_stop_deadline_ms_ =
+      millis() + iohc_cmd::RX_GESTURE_CORRELATION_MS;
+  this->pending_rx_stop_rssi_ = rssi;
+  this->pending_rx_stop_sequence_ = sequence;
+  this->pending_rx_stop_has_sequence_ = has_sequence;
+}
+
+bool SomfyIohcCover::cancel_rx_stop_for_(uint32_t remote) {
+  if (!this->pending_rx_stop_ ||
+      this->pending_rx_stop_remote_ != (remote & 0x00FFFFFF))
+    return false;
+  this->clear_pending_rx_stop_();
+  return true;
+}
+
+void SomfyIohcCover::clear_pending_rx_stop_() {
+  this->pending_rx_stop_ = false;
+  this->pending_rx_stop_remote_ = 0;
+  this->pending_rx_stop_deadline_ms_ = 0;
+  this->pending_rx_stop_rssi_ = 0.0f;
+  this->pending_rx_stop_sequence_ = 0;
+  this->pending_rx_stop_has_sequence_ = false;
+}
+
+void SomfyIohcCover::flush_pending_rx_stop_() {
+  if (!this->pending_rx_stop_)
+    return;
+  const uint32_t remote = this->pending_rx_stop_remote_;
+  const float rssi = this->pending_rx_stop_rssi_;
+  const uint16_t sequence = this->pending_rx_stop_sequence_;
+  const bool has_sequence = this->pending_rx_stop_has_sequence_;
+  this->clear_pending_rx_stop_();
+  this->emit_rx_command_(iohc_cmd::MP_STOP, remote, rssi, sequence,
+                         has_sequence);
+}
+
+void SomfyIohcCover::emit_rx_command_(uint16_t main_param, uint32_t remote,
+                                      float rssi, uint16_t sequence,
+                                      bool has_sequence) {
+  // Publish to the discovery text sensor regardless of allow-list so unknown
+  // remote IDs can be learned. Sequence-aware burst deduplication has already
+  // collapsed copies belonging to one RF burst.
+  if (this->log_text_sensor_ != nullptr) {
+    char buf[112];
+    this->rx_event_counter_++;
+    if (has_sequence)
+      snprintf(buf, sizeof(buf),
+               "0x%06" PRIX32 " %s 0x%04X seq=0x%04X event=%" PRIu32,
+               remote, main_param_name(main_param), main_param, sequence,
+               this->rx_event_counter_);
+    else
+      snprintf(buf, sizeof(buf),
+               "0x%06" PRIX32 " %s 0x%04X event=%" PRIu32, remote,
+               main_param_name(main_param), main_param,
+               this->rx_event_counter_);
+    this->log_text_sensor_->publish_state(buf);
+  }
+  if (!this->is_allowed_remote_(remote))
+    return;
+  ESP_LOGD(TAG,
+           "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
+           remote, main_param_name(main_param), main_param, rssi);
+  if (this->remote_command_callback_)
+    this->remote_command_callback_(main_param, remote, rssi);
+  this->handle_rx_command_(main_param);
 }
 
 void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
@@ -992,6 +1084,10 @@ void SomfyIohcCover::stop_rx_sync() {
 }
 
 void SomfyIohcCover::loop() {
+  if (this->pending_rx_stop_ &&
+      static_cast<int32_t>(millis() - this->pending_rx_stop_deadline_ms_) >= 0)
+    this->flush_pending_rx_stop_();
+
   if (this->rx_sync_.active()) {
     const uint32_t full_duration_ms = this->rx_sync_.opening() ? this->open_duration_ : this->close_duration_;
     const RxSyncUpdate update = this->rx_sync_.update(millis(), full_duration_ms);

@@ -39,7 +39,12 @@ complete native MY sequence shown above.
   already-known STOP command and does not identify a tilt direction.
 - Receive synchronization must not immediately expose the wheel's leading
   `D200` as STOP/MY. It should briefly correlate it with the following `0x20`
-  action; `0x0D` and `0x0E` are tilt detents.
+  action; `0x0D` and `0x0E` are tilt detents. Live capture measured 57 ms
+  between the ordinary-looking `D200` and its matching private tilt action.
+  The implementation holds a received Venetian `D200` for up to 350 ms: a
+  matching tilt action consumes it, a matching STOP/MY action releases it
+  immediately, and expiry releases a standalone stop. The motor still stops
+  before tilting; only the duplicate Home Assistant event is suppressed.
 - Sending tilt consumes two rolling codes per detent because both frames are
   independently authenticated.
 - Home Assistant defines 0% tilt as fully closed and 100% as fully open. The
@@ -98,6 +103,13 @@ FIFO. At the normal test location the full DOWN, STOP/MY, MY, clockwise and
 counterclockwise sequence produced 43 raw FIFO packets, 40 CRC-valid frames and
 five accepted user actions; the final accepted action measured `-70.5 dBm`.
 
+The correlation path was subsequently verified on the production ESPHome
+2026.7.4 build. One deliberately large wheel turn produced two real clockwise
+detents and no STOP/MY event. DOWN followed by MY while moving produced exactly
+one CLOSE and one STOP/MY event, and a second MY while idle produced exactly
+one STOP/MY event and recalled the saved position. Thus the UI sees the user's
+logical actions while the motor retains its native stop-then-tilt behaviour.
+
 ## Situo group and All-channels mode
 
 The tested Situo 5 does not replay every individual channel when **All
@@ -120,3 +132,10 @@ motor pairing slot, and never changes a transmitter's rolling-code stream.
 Hardware testing confirmed that an All-channels DOWN followed by MY was
 accepted for an assigned shutter and that the alias remained active after an
 ESP reboot.
+
+All-channels wheel control was also hardware verified. Four clockwise detents
+physically tilted both assigned Venetian blinds and were decoded as four tilt
+actions without false STOP/MY events. When a physical group targets several
+managed shutters, the manager publishes one status event containing the full
+slot list. This avoids native-API coalescing of back-to-back text-sensor states
+and lets every Home Assistant diagnostic sensor observe the same user action.

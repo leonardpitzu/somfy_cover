@@ -74,6 +74,25 @@ def test_lift_and_my_commands_publish_verified_venetian_tilt_states():
     assert "? 0.5f" not in lift_tilt
 
 
+def test_rx_correlates_wheel_prefix_without_emitting_false_stop():
+    assert "RX_GESTURE_CORRELATION_MS = 350" in COVER_H
+    receiver = COVER_CPP.split(
+        "void SomfyIohcCover::on_iohc_packet_", 1
+    )[1].split("bool SomfyIohcCover::is_allowed_remote_", 1)[0]
+    assert "this->stage_rx_stop_(" in receiver
+    assert "this->cancel_rx_stop_for_(pkt.src_node);" in receiver
+    assert "this->flush_pending_rx_stop_();" in receiver
+
+    stage = COVER_CPP.split("void SomfyIohcCover::stage_rx_stop_", 1)[1]
+    stage = stage.split("bool SomfyIohcCover::cancel_rx_stop_for_", 1)[0]
+    assert "millis() + iohc_cmd::RX_GESTURE_CORRELATION_MS" in stage
+
+    loop = COVER_CPP.split("void SomfyIohcCover::loop()", 1)[1]
+    loop = loop.split("#endif  // USE_SOMFY_IOHC_RX", 1)[0]
+    assert "this->pending_rx_stop_deadline_ms_" in loop
+    assert "this->flush_pending_rx_stop_();" in loop
+
+
 def test_remote_discovery_window_allows_gui_interaction_time():
     assert "DISCOVERY_TIMEOUT_MS = 120000" in MANAGER_CPP
 

@@ -65,6 +65,12 @@ static constexpr uint8_t BUTTON_ACTION_TILT_COUNTERCLOCKWISE = 0x0E;
 
 static constexpr uint32_t TILT_EVENT_DELAY_MS = 25;
 static constexpr uint32_t TILT_NEXT_STEP_DELAY_MS = 100;
+// A received wheel detent can expose an ordinary-looking D200 frame before
+// its direction-bearing private event. Hold D200 briefly so the UI receives
+// either STOP/MY or tilt, never both. Hardware measured a 57 ms gap; the wider
+// window tolerates missed early burst copies without making a real stop feel
+// materially delayed in Home Assistant.
+static constexpr uint32_t RX_GESTURE_CORRELATION_MS = 350;
 // Endpoint requests deliberately drive beyond the calibrated number of
 // effective detents. Motors ignore extra commands at their mechanical limit,
 // making 0% and 100% reliable resynchronisation points.
@@ -148,7 +154,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Runtime-manager hooks. Ordinary YAML-defined covers remain enabled by
   // default and continue to use the same paths. Managed slot covers are born
   // disabled, then receive their persisted identity before RF is enabled.
-  void set_runtime_enabled(bool enabled) { this->runtime_enabled_ = enabled; }
+  void set_runtime_enabled(bool enabled);
   bool is_runtime_enabled() const { return this->runtime_enabled_; }
   void reconfigure_storage(const char *ns, const char *key, uint16_t initial_code);
   void set_rolling_code_callback(std::function<void(uint16_t)> callback) {
@@ -292,6 +298,12 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Physical-remote UI animation state.
   RxSyncAnimator rx_sync_;
   bool my_tilt_pending_{false};
+  bool pending_rx_stop_{false};
+  uint32_t pending_rx_stop_remote_{0};
+  uint32_t pending_rx_stop_deadline_ms_{0};
+  float pending_rx_stop_rssi_{0.0f};
+  uint16_t pending_rx_stop_sequence_{0};
+  bool pending_rx_stop_has_sequence_{false};
 
   void start_rx_sync(cover::CoverOperation op);
   void start_rx_sync_to(float target_position);
@@ -302,6 +314,13 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   static bool decode_execute_param_(const IohcDecodedPacket &pkt, uint16_t &main_param);
   static bool decode_button_action_(const IohcDecodedPacket &pkt, uint8_t &action);
   static bool is_tilt_execute_(const IohcDecodedPacket &pkt);
+  void stage_rx_stop_(uint32_t remote, float rssi, uint16_t sequence,
+                      bool has_sequence);
+  bool cancel_rx_stop_for_(uint32_t remote);
+  void clear_pending_rx_stop_();
+  void flush_pending_rx_stop_();
+  void emit_rx_command_(uint16_t main_param, uint32_t remote, float rssi,
+                        uint16_t sequence, bool has_sequence);
   // Drive the HA UI animation in response to a recognised foreign command.
   void handle_rx_command_(uint16_t main_param);
   void handle_rx_tilt_step_(bool clockwise);

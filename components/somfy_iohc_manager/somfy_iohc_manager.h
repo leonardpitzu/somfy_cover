@@ -114,6 +114,14 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
     bool has_record{false};
   };
 
+  struct PendingRemoteCommand {
+    bool active{false};
+    uint16_t main_param{0};
+    uint32_t remote{0};
+    float rssi{0.0f};
+    uint32_t slot_mask{0};
+  };
+
   SomfyIohcHub *hub_{nullptr};
   text_sensor::TextSensor *status_sensor_{nullptr};
   text_sensor::TextSensor *backup_sensor_{nullptr};
@@ -124,6 +132,7 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   std::vector<Slot> slots_;
   std::vector<std::pair<uint8_t, ManagedSlotRecord>> imports_;
   std::vector<RemoteAlias> remote_aliases_;
+  PendingRemoteCommand pending_remote_command_;
 
   nvs_handle registry_handle_{0};
   bool registry_open_{false};
@@ -207,8 +216,12 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void transmit_pairing_(uint8_t slot);
   void confirm_pairing_(uint8_t slot);
   void discard_staged_(uint8_t slot);
+  void stage_remote_command_(uint8_t slot, uint16_t main_param,
+                             uint32_t remote, float rssi);
+  void flush_pending_remote_command_();
   void publish_status_(const char *action, int32_t slot, const char *detail = "",
-                       float rssi = 0.0f, uint32_t remote_override = 0);
+                       float rssi = 0.0f, uint32_t remote_override = 0,
+                       uint32_t slot_mask = 0);
   void publish_rx_stats_(int32_t slot);
   void publish_backup_(uint8_t slot);
   void on_rolling_code_(uint8_t slot, uint16_t next_code);
