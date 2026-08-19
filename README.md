@@ -340,6 +340,14 @@ physical commands to all assigned state estimates. One received group command
 is published with its complete target-slot list, so Home Assistant updates
 every member without losing intermediate status to state coalescing.
 
+Simultaneous managed MY requests are serialized as complete transactions.
+Each shutter receives its uninterrupted STOP, extended execute, press, and
+release sequence; the next queued shutter starts after the release burst and a
+20 ms radio handoff gap. Duplicate pending MY targets are coalesced because MY
+is an idempotent destination. This queue currently covers managed MY requests;
+a general scheduler for movement, timed STOP, and Venetian transactions remains
+future work.
+
 ### Home Assistant
 
 Install the companion

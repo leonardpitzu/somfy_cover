@@ -180,6 +180,9 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
       std::function<void(uint16_t, uint32_t, float, uint8_t)> callback) {
     this->remote_command_callback_ = std::move(callback);
   }
+  void set_my_sequence_complete_callback(std::function<void()> callback) {
+    this->my_sequence_complete_callback_ = std::move(callback);
+  }
   uint16_t peek_next_rolling_code() const;
   void runtime_clear_receive_remote_codes();
   bool runtime_program();
@@ -256,6 +259,8 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   std::function<void(uint16_t)> rolling_code_callback_;
   std::function<void(uint16_t, uint32_t, float, uint8_t)>
       remote_command_callback_;
+  std::function<void()> my_sequence_complete_callback_;
+  bool my_sequence_active_{false};
 
   // Cover trigger wiring (open/close/stop -> radio commands)
   std::unique_ptr<Automation<>> open_automation_;
@@ -279,6 +284,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   bool send_1w_button_event(uint8_t action, bool released);
   bool send_1w_my_sequence();
   void cancel_1w_my_sequence();
+  void finish_1w_my_sequence_();
   bool send_1w_tilt_execute(bool clockwise, uint16_t steps);
   void set_tilt_target_(float target);
   float logical_tilt_for_physical_step_(uint8_t physical_step) const;

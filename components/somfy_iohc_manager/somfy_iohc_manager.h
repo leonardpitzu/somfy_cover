@@ -6,6 +6,7 @@
 #include "esphome/core/component.h"
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <vector>
@@ -134,6 +135,8 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   std::vector<std::pair<uint8_t, ManagedSlotRecord>> imports_;
   std::vector<RemoteAlias> remote_aliases_;
   PendingRemoteCommand pending_remote_command_;
+  std::deque<uint8_t> my_queue_;
+  int8_t active_my_slot_{-1};
 
   nvs_handle registry_handle_{0};
   bool registry_open_{false};
@@ -155,6 +158,9 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void venetian_service(int32_t slot, bool enabled, int32_t tilt_steps,
                         bool tilt_inverted, int32_t my_tilt_step);
   void control_service(int32_t slot, std::string command, float position_percent);
+  void queue_my_(uint8_t slot);
+  void start_next_my_();
+  void on_my_sequence_complete_(uint8_t slot);
   void restore_service(std::string encrypted_backup, int32_t slot);
   void move_service(int32_t slot, int32_t target_slot);
   void swap_service(int32_t slot, int32_t target_slot);

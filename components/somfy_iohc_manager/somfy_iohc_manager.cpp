@@ -28,6 +28,11 @@ constexpr const char *REGISTRY_NAMESPACE = "somfy_mgr";
 constexpr uint32_t DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t ALIAS_DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t PAIR_ARM_TIMEOUT_MS = 60000;
+// A complete MY gesture ends when its authenticated release burst returns the
+// CC1101 to RX. This tiny handoff gap is enough for the radio state transition
+// without imposing the conservative two-second delay previously recommended
+// for Home Assistant automations.
+constexpr uint32_t MY_INTER_TRANSACTION_GAP_MS = 20;
 constexpr uint8_t BACKUP_FORMAT_VERSION = 1;
 constexpr size_t GCM_NONCE_SIZE = 12;
 constexpr size_t GCM_TAG_SIZE = 16;
@@ -192,6 +197,8 @@ void SomfyIohcManager::create_slots() {
                       uint8_t step_count) {
       this->stage_remote_command_(index, main_param, remote, rssi, step_count);
     });
+    slot.cover->set_my_sequence_complete_callback(
+        [this, index]() { this->on_my_sequence_complete_(index); });
 
     // Slot entities are intentionally disabled until the HA commissioning flow
     // confirms a motor jog and enables/renames the chosen one.
@@ -484,8 +491,10 @@ void SomfyIohcManager::control_service(
   if (command == "open") managed.cover->runtime_open();
   else if (command == "close") managed.cover->runtime_close();
   else if (command == "stop") managed.cover->runtime_stop();
-  else if (command == "my") managed.cover->runtime_my();
-  else if (command == "position") {
+  else if (command == "my") {
+    this->queue_my_(static_cast<uint8_t>(slot));
+    return;
+  } else if (command == "position") {
     managed.cover->runtime_set_position(clamp(position_percent, 0.0f, 100.0f) / 100.0f);
   } else if (command == "tilt_position") {
     managed.cover->runtime_set_tilt(clamp(position_percent, 0.0f, 100.0f) / 100.0f);
@@ -500,6 +509,58 @@ void SomfyIohcManager::control_service(
     return;
   }
   this->publish_status_("command_sent", slot, command.c_str());
+}
+
+void SomfyIohcManager::queue_my_(uint8_t slot) {
+  // MY is an idempotent target. Coalesce a duplicate request that is already
+  // active or waiting instead of recalling the same favourite twice.
+  if (this->active_my_slot_ == static_cast<int8_t>(slot) ||
+      std::find(this->my_queue_.begin(), this->my_queue_.end(), slot) !=
+          this->my_queue_.end()) {
+    this->publish_status_("command_queued", slot, "my_coalesced");
+    return;
+  }
+
+  this->my_queue_.push_back(slot);
+  if (this->active_my_slot_ >= 0) {
+    this->publish_status_("command_queued", slot, "my");
+    return;
+  }
+  this->start_next_my_();
+}
+
+void SomfyIohcManager::start_next_my_() {
+  if (this->active_my_slot_ >= 0)
+    return;
+
+  while (!this->my_queue_.empty()) {
+    const uint8_t slot = this->my_queue_.front();
+    this->my_queue_.pop_front();
+    if (slot >= this->slots_.size())
+      continue;
+    auto &managed = this->slots_[slot];
+    const auto state = static_cast<ManagedSlotState>(managed.record.state);
+    if (state != ManagedSlotState::ACTIVE &&
+        state != ManagedSlotState::PAIR_SENT) {
+      this->publish_status_("error", slot, "slot_not_paired");
+      continue;
+    }
+
+    this->active_my_slot_ = static_cast<int8_t>(slot);
+    managed.cover->runtime_my();
+    this->publish_status_("command_sent", slot, "my");
+    return;
+  }
+}
+
+void SomfyIohcManager::on_my_sequence_complete_(uint8_t slot) {
+  if (this->active_my_slot_ != static_cast<int8_t>(slot))
+    return;
+  this->active_my_slot_ = -1;
+  // Defer the handoff so a cancellation callback cannot start the next MY in
+  // the middle of the OPEN/CLOSE/STOP command that cancelled this one.
+  this->set_timeout("iohc-my-next", MY_INTER_TRANSACTION_GAP_MS,
+                    [this]() { this->start_next_my_(); });
 }
 
 void SomfyIohcManager::restore_service(std::string encrypted_backup, int32_t slot) {
@@ -1637,7 +1698,7 @@ void SomfyIohcManager::publish_status_(
   slots += ']';
   char output[384];
   snprintf(output, sizeof(output),
-           "{\"v\":1,\"pair_retry\":true,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
+           "{\"v\":1,\"pair_retry\":true,\"my_queue\":true,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
            ",\"slots\":%s"
            ",\"steps\":%u"
            ",\"state\":\"%s\",\"node\":\"0x%06" PRIX32 "\",\"remote\":\"0x%06" PRIX32

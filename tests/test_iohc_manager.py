@@ -107,6 +107,43 @@ def test_manager_advertises_same_identity_pairing_retry_capability():
     assert r'\"pair_retry\":true' in _manager_cpp()
 
 
+def test_manager_serializes_complete_my_gestures_across_slots():
+    root = Path(__file__).parent.parent
+    source = _manager_cpp()
+    header = (
+        root
+        / "components"
+        / "somfy_iohc_manager"
+        / "somfy_iohc_manager.h"
+    ).read_text()
+    cover_header = (
+        root / "components" / "somfy" / "somfy_iohc.h"
+    ).read_text()
+    cover_source = (
+        root / "components" / "somfy" / "somfy_iohc.cpp"
+    ).read_text()
+
+    assert "std::deque<uint8_t> my_queue_" in header
+    assert "active_my_slot_" in header
+    assert 'command == "my"' in source
+    assert "queue_my_(static_cast<uint8_t>(slot))" in source
+    assert 'publish_status_("command_queued", slot, "my")' in source
+    assert "managed.cover->runtime_my()" in source
+    assert "MY_INTER_TRANSACTION_GAP_MS" in source
+    assert 'set_timeout("iohc-my-next"' in source
+    assert r'\"my_queue\":true' in source
+
+    assert "set_my_sequence_complete_callback" in cover_header
+    assert "my_sequence_active_" in cover_header
+    assert "finish_1w_my_sequence_" in cover_source
+    release = cover_source.split(
+        'this->set_timeout("iohc-my-release"', 1
+    )[1]
+    assert release.index("send_1w_button_event") < release.index(
+        "finish_1w_my_sequence_"
+    )
+
+
 def test_exhausted_rolling_code_backup_cannot_be_restored():
     source = _manager_cpp()
     function = source.split("void SomfyIohcManager::restore_service", 1)[1]

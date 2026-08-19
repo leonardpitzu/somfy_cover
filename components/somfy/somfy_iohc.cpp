@@ -681,6 +681,15 @@ void SomfyIohcCover::cancel_1w_my_sequence() {
   this->cancel_timeout("iohc-my-recall");
   this->cancel_timeout("iohc-my-press");
   this->cancel_timeout("iohc-my-release");
+  this->finish_1w_my_sequence_();
+}
+
+void SomfyIohcCover::finish_1w_my_sequence_() {
+  if (!this->my_sequence_active_)
+    return;
+  this->my_sequence_active_ = false;
+  if (this->my_sequence_complete_callback_)
+    this->my_sequence_complete_callback_();
 }
 
 bool SomfyIohcCover::send_1w_my_sequence() {
@@ -689,21 +698,29 @@ bool SomfyIohcCover::send_1w_my_sequence() {
   // does nothing while idle. Once the motor has settled, reproduce a complete
   // native MY press. Sending two complete MY presses would be wrong from idle,
   // because the second one would stop the recall started by the first.
-  if (!this->send_1w_command(iohc_cmd::MP_STOP))
+  this->my_sequence_active_ = true;
+  if (!this->send_1w_command(iohc_cmd::MP_STOP)) {
+    this->finish_1w_my_sequence_();
     return false;
+  }
 
   this->set_timeout("iohc-my-recall", iohc_cmd::MY_PRESTOP_SETTLE_MS, [this]() {
-    if (!this->send_1w_my_execute())
+    if (!this->send_1w_my_execute()) {
+      this->finish_1w_my_sequence_();
       return;
+    }
     this->set_timeout("iohc-my-press", iohc_cmd::MY_EVENT_DELAY_MS, [this]() {
-      if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false))
+      if (!this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, false)) {
+        this->finish_1w_my_sequence_();
         return;
+      }
 #ifdef USE_SOMFY_IOHC_RX
       if (this->has_my_position_)
         this->start_rx_sync_to(this->my_position_);
 #endif
       this->set_timeout("iohc-my-release", iohc_cmd::MY_RELEASE_DELAY_MS, [this]() {
         this->send_1w_button_event(iohc_cmd::BUTTON_ACTION_STOP_MY, true);
+        this->finish_1w_my_sequence_();
       });
     });
   });
