@@ -71,6 +71,22 @@ static constexpr uint32_t TILT_NEXT_STEP_DELAY_MS = 100;
 // window tolerates missed early burst copies without making a real stop feel
 // materially delayed in Home Assistant.
 static constexpr uint32_t RX_GESTURE_CORRELATION_MS = 350;
+// The Situo Variation wheel encodes signed travel around 0xCCE8 in the FP
+// word of the leading D200 EXECUTE. Hardware captures in both directions show
+// one wheel unit per 0x0046; the following private 0x0D/0x0E event remains the
+// authoritative direction indicator.
+static constexpr uint16_t TILT_MAGNITUDE_CENTER = 0xCCE8;
+static constexpr uint16_t TILT_MAGNITUDE_UNIT = 0x0046;
+// A native one-unit wheel frame is the motor's minimum one-step gesture. For
+// larger rolls, hardware trials show approximately two encoded magnitude
+// units per effective calibrated slat step. Keep the exact minimum gesture,
+// and apply this scale to compound TX and RX estimates.
+static constexpr uint8_t TILT_MAGNITUDE_UNITS_PER_STEP = 2;
+// Hardware trials found raw magnitude 4 reliably moves two effective steps in
+// both directions. Larger synthetic magnitudes become non-linear and raw 20
+// was rejected entirely, so long moves are deliberately split into exact,
+// smoother two-step chunks instead of depending on unsupported large rolls.
+static constexpr uint16_t TILT_MAX_GESTURE_STEPS = 2;
 // Endpoint requests deliberately drive beyond the calibrated number of
 // effective detents. Motors ignore extra commands at their mechanical limit,
 // making 0% and 100% reliable resynchronisation points.
@@ -161,7 +177,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
     this->rolling_code_callback_ = std::move(callback);
   }
   void set_remote_command_callback(
-      std::function<void(uint16_t, uint32_t, float)> callback) {
+      std::function<void(uint16_t, uint32_t, float, uint8_t)> callback) {
     this->remote_command_callback_ = std::move(callback);
   }
   uint16_t peek_next_rolling_code() const;
@@ -238,7 +254,8 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Rolling code storage
   std::unique_ptr<NVSRollingCodeStorage> storage_;
   std::function<void(uint16_t)> rolling_code_callback_;
-  std::function<void(uint16_t, uint32_t, float)> remote_command_callback_;
+  std::function<void(uint16_t, uint32_t, float, uint8_t)>
+      remote_command_callback_;
 
   // Cover trigger wiring (open/close/stop -> radio commands)
   std::unique_ptr<Automation<>> open_automation_;
@@ -262,7 +279,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   bool send_1w_button_event(uint8_t action, bool released);
   bool send_1w_my_sequence();
   void cancel_1w_my_sequence();
-  bool send_1w_tilt_execute(bool clockwise);
+  bool send_1w_tilt_execute(bool clockwise, uint16_t steps);
   void set_tilt_target_(float target);
   float logical_tilt_for_physical_step_(uint8_t physical_step) const;
   void set_lift_tilt_(bool opening, bool publish = true);
@@ -304,6 +321,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   float pending_rx_stop_rssi_{0.0f};
   uint16_t pending_rx_stop_sequence_{0};
   bool pending_rx_stop_has_sequence_{false};
+  uint8_t pending_rx_tilt_steps_{1};
 
   void start_rx_sync(cover::CoverOperation op);
   void start_rx_sync_to(float target_position);
@@ -313,17 +331,18 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Decode the MainParameter from a CMD_EXECUTE packet (foreign remote command).
   static bool decode_execute_param_(const IohcDecodedPacket &pkt, uint16_t &main_param);
   static bool decode_button_action_(const IohcDecodedPacket &pkt, uint8_t &action);
-  static bool is_tilt_execute_(const IohcDecodedPacket &pkt);
+  static bool decode_tilt_execute_steps_(const IohcDecodedPacket &pkt,
+                                         uint8_t &steps);
   void stage_rx_stop_(uint32_t remote, float rssi, uint16_t sequence,
-                      bool has_sequence);
-  bool cancel_rx_stop_for_(uint32_t remote);
+                      bool has_sequence, uint8_t tilt_steps);
+  uint8_t consume_rx_tilt_steps_for_(uint32_t remote);
   void clear_pending_rx_stop_();
   void flush_pending_rx_stop_();
   void emit_rx_command_(uint16_t main_param, uint32_t remote, float rssi,
                         uint16_t sequence, bool has_sequence);
   // Drive the HA UI animation in response to a recognised foreign command.
   void handle_rx_command_(uint16_t main_param);
-  void handle_rx_tilt_step_(bool clockwise);
+  void handle_rx_tilt_steps_(bool clockwise, uint8_t steps);
 #endif
 };
 

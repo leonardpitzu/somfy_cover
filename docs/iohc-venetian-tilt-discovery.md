@@ -24,6 +24,13 @@ One wheel detent sends one complete frame pair. No release event was observed
 for either wheel direction. Multiple deliberately separated detents advanced
 the rolling sequence and reproduced the same clear payloads.
 
+Larger wheel rolls encode a signed magnitude in bytes 5–6 of the leading
+extended `D200` payload. The neutral centre is `0xCCE8`, and each raw magnitude
+unit is `0x0046` away from that centre. Captures included `0xCC5C` (two raw
+units counterclockwise), `0xCDBA` (three clockwise), and `0xD0D0` (about
+fourteen clockwise). The following private `0x0D` or `0x0E` remains the
+authoritative direction indication.
+
 A short STOP/MY press additionally ends with the release event
 `02 FF 01 43 02 05 FF 00`. On the tested blind, a press while idle recalled
 the MY position and a press while moving stopped the lift. A dedicated STOP
@@ -45,8 +52,9 @@ complete native MY sequence shown above.
   matching tilt action consumes it, a matching STOP/MY action releases it
   immediately, and expiry releases a standalone stop. The motor still stops
   before tilting; only the duplicate Home Assistant event is suppressed.
-- Sending tilt consumes two rolling codes per detent because both frames are
-  independently authenticated.
+- Sending one tilt gesture consumes two rolling codes because both frames are
+  independently authenticated. A gesture may represent one or two effective
+  slat steps in the final transmitter.
 - Home Assistant defines 0% tilt as fully closed and 100% as fully open. The
   physical direction that increases that value is installation-dependent and
   must remain configurable. On the tested blind, counterclockwise opens the
@@ -57,9 +65,10 @@ complete native MY sequence shown above.
   times. Do not count an extra click used to verify that an endpoint has been
   reached. The tested blind used eight effective detents; this is calibration
   data, not a protocol-wide constant.
-- A 0% or 100% request sends the calibrated full range plus two margin detents.
-  The motor ignores commands beyond its physical endpoint, so these requests
+- A 0% or 100% request sends the calibrated full range plus two margin steps.
+  The motor ignores movement beyond its physical endpoint, so these requests
   are reliable resynchronisation operations even when the estimate was stale.
+  The movement is split into the verified compound chunks described below.
 - Intermediate requests are quantized to the nearest reachable detent. The
   final published tilt state is that quantized value, not the unachievable raw
   percentage requested by the caller.
@@ -79,6 +88,38 @@ complete native MY sequence shown above.
   Home Assistant. Both settings, the Venetian flag, direction mapping, and the
   paired controller identity survived an ESP reboot and were verified again
   with endpoint and MY commands.
+
+## Magnitude scaling and smooth Home Assistant movement
+
+The raw wheel magnitude is not an arbitrary exact slat-position count. Repeated
+motor tests from known endpoints established these practical properties:
+
+- the captured one-unit gesture remains the exact minimum one-step command;
+- raw magnitude 4 repeatedly moved exactly two effective steps, clockwise and
+  counterclockwise;
+- larger synthetic rolls were not safe for exact positioning: raw magnitude 6
+  could leave four or five of the eight steps to an endpoint, raw 10 moved five
+  effective steps, and raw 20 was rejected without movement;
+- three repeated raw-4 clockwise trials each left six single steps to the
+  opposite endpoint, and counterclockwise trials required two steps to return
+  to their starting endpoint.
+
+The transmitter therefore never emits an unbounded synthetic roll. It sends
+at most two effective steps per authenticated frame pair, encoded as raw
+magnitude 4, and uses the original raw-one gesture for an odd remainder. An
+eight-step endpoint sweep plus two margin steps becomes five verified compound
+gestures. A four-step midpoint move becomes two. This is smoother and consumes
+fewer rolling codes than one frame pair per step while preserving exact
+reachable positions and dependable endpoint resynchronisation.
+
+For reception, one raw magnitude unit decodes as one effective step. Larger
+physical-remote rolls use the observed approximate 2:1 raw-to-effective scale,
+rounded to the nearest usable step and clamped to the shutter's calibrated
+range. This makes a large Situo roll visible as a multi-step action in Home
+Assistant, but it remains an estimate because the 1W motor reports no absolute
+slat position. A final production capture of one deliberately large physical
+roll produced two distinct counterclockwise authenticated gestures; each was
+reported as seven estimated effective steps rather than one.
 
 ## Receiver note
 

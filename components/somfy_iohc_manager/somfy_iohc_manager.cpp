@@ -188,8 +188,9 @@ void SomfyIohcManager::create_slots() {
     slot.cover->set_rolling_code_callback(
         [this, index](uint16_t next_code) { this->on_rolling_code_(index, next_code); });
     slot.cover->set_remote_command_callback(
-        [this, index](uint16_t main_param, uint32_t remote, float rssi) {
-      this->stage_remote_command_(index, main_param, remote, rssi);
+        [this, index](uint16_t main_param, uint32_t remote, float rssi,
+                      uint8_t step_count) {
+      this->stage_remote_command_(index, main_param, remote, rssi, step_count);
     });
 
     // Slot entities are intentionally disabled until the HA commissioning flow
@@ -1588,7 +1589,7 @@ void SomfyIohcManager::discard_staged_(uint8_t slot) {
 
 void SomfyIohcManager::publish_status_(
     const char *action, int32_t slot, const char *detail, float rssi,
-    uint32_t remote_override, uint32_t slot_mask) {
+    uint32_t remote_override, uint32_t slot_mask, uint8_t step_count) {
   if (this->status_sensor_ == nullptr)
     return;
   this->event_counter_++;
@@ -1620,20 +1621,23 @@ void SomfyIohcManager::publish_status_(
   snprintf(output, sizeof(output),
            "{\"v\":1,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
            ",\"slots\":%s"
+           ",\"steps\":%u"
            ",\"state\":\"%s\",\"node\":\"0x%06" PRIX32 "\",\"remote\":\"0x%06" PRIX32
            "\",\"next\":%u,\"rssi\":%.1f,\"detail\":\"%s\"}",
-           this->event_counter_, action, slot, slots.c_str(), state, node,
-           remote, next, rssi, detail);
+           this->event_counter_, action, slot, slots.c_str(), step_count,
+           state, node, remote, next, rssi, detail);
   this->status_sensor_->publish_state(output);
 }
 
 void SomfyIohcManager::stage_remote_command_(uint8_t slot,
                                              uint16_t main_param,
-                                             uint32_t remote, float rssi) {
+                                             uint32_t remote, float rssi,
+                                             uint8_t step_count) {
   remote &= 0x00FFFFFF;
   if (this->pending_remote_command_.active &&
       (this->pending_remote_command_.main_param != main_param ||
-       this->pending_remote_command_.remote != remote)) {
+       this->pending_remote_command_.remote != remote ||
+       this->pending_remote_command_.step_count != step_count)) {
     this->flush_pending_remote_command_();
   }
   auto &pending = this->pending_remote_command_;
@@ -1642,6 +1646,7 @@ void SomfyIohcManager::stage_remote_command_(uint8_t slot,
     pending.main_param = main_param;
     pending.remote = remote;
     pending.rssi = rssi;
+    pending.step_count = std::max<uint8_t>(step_count, 1);
   } else if (rssi > pending.rssi) {
     pending.rssi = rssi;
   }
@@ -1668,7 +1673,8 @@ void SomfyIohcManager::flush_pending_remote_command_() {
   char detail[7];
   snprintf(detail, sizeof(detail), "0x%04X", pending.main_param);
   this->publish_status_("remote_command", first_slot, detail, pending.rssi,
-                        pending.remote, pending.slot_mask);
+                        pending.remote, pending.slot_mask,
+                        pending.step_count);
 }
 
 void SomfyIohcManager::publish_rx_stats_(int32_t slot) {

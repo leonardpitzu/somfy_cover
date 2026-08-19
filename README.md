@@ -217,7 +217,11 @@ cover:
 - On Venetian remotes, a wheel gesture can intentionally stop lift movement
   with a `D200` frame before sending its direction-bearing tilt event. The
   receiver correlates that pair into one tilt action for Home Assistant; a
-  genuine standalone STOP/MY remains visible and functional.
+  genuine standalone STOP/MY remains visible and functional. Larger wheel
+  rolls carry a signed magnitude around `0xCCE8`; received rolls are converted
+  to an estimated effective step count. Home Assistant tilt transmission uses
+  hardware-verified two-step compound gestures plus an exact one-step remainder
+  instead of unsafe arbitrary-size synthetic rolls.
 - For bidirectional (2W) support, see the next section.
 
 ### Receive-only raw capture (experimental)

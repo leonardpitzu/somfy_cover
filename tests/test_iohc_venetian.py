@@ -19,9 +19,36 @@ SOMFY_PY = (ROOT / "components/somfy/__init__.py").read_text()
 def test_captured_wheel_vectors_are_encoded_exactly():
     assert "BUTTON_ACTION_TILT_CLOCKWISE = 0x0D" in COVER_H
     assert "BUTTON_ACTION_TILT_COUNTERCLOCKWISE = 0x0E" in COVER_H
-    assert "clockwise ? 0xCD : 0xCC" in COVER_CPP
-    assert "clockwise ? 0x2E : 0xA2" in COVER_CPP
+    assert "TILT_MAGNITUDE_CENTER = 0xCCE8" in COVER_H
+    assert "TILT_MAGNITUDE_UNIT = 0x0046" in COVER_H
+    assert "TILT_MAGNITUDE_UNITS_PER_STEP = 2" in COVER_H
+    assert "magnitude_units" in COVER_CPP
+    assert "signed_distance" in COVER_CPP
+    assert "magnitude >> 8" in COVER_CPP
     assert "send_1w_button_event(action, false)" in COVER_CPP
+
+
+def test_captured_wheel_magnitudes_decode_to_multiple_steps():
+    center = 0xCCE8
+    unit = 0x0046
+
+    def steps(value: int) -> int:
+        magnitude_units = max(1, (abs(value - center) + unit // 2) // unit)
+        return max(1, (magnitude_units + 1) // 2)
+
+    assert steps(0xCD2E) == 1  # one clockwise
+    assert steps(0xCCA2) == 1  # one counterclockwise
+    assert steps(0xCC5C) == 1  # two magnitude units, about one effective step
+    assert steps(0xD0D0) == 7  # captured huge clockwise roll
+
+
+def test_ha_tilt_uses_verified_two_step_native_magnitude_chunks():
+    sender = COVER_CPP.split("void SomfyIohcCover::send_next_tilt_step_", 1)[1]
+    sender = sender.split("void SomfyIohcCover::cancel_1w_tilt_sequence", 1)[0]
+    assert "gesture_steps" in sender
+    assert "send_1w_tilt_execute(clockwise, gesture_steps)" in sender
+    assert "this->tilt_steps_remaining_ -= gesture_steps" in sender
+    assert "TILT_MAX_GESTURE_STEPS = 2" in COVER_H
 
 
 def test_situo_my_uses_extended_execute_but_stop_stays_distinct():
@@ -80,11 +107,11 @@ def test_rx_correlates_wheel_prefix_without_emitting_false_stop():
         "void SomfyIohcCover::on_iohc_packet_", 1
     )[1].split("bool SomfyIohcCover::is_allowed_remote_", 1)[0]
     assert "this->stage_rx_stop_(" in receiver
-    assert "this->cancel_rx_stop_for_(pkt.src_node);" in receiver
+    assert "this->consume_rx_tilt_steps_for_(pkt.src_node)" in receiver
     assert "this->flush_pending_rx_stop_();" in receiver
 
     stage = COVER_CPP.split("void SomfyIohcCover::stage_rx_stop_", 1)[1]
-    stage = stage.split("bool SomfyIohcCover::cancel_rx_stop_for_", 1)[0]
+    stage = stage.split("uint8_t SomfyIohcCover::consume_rx_tilt_steps_for_", 1)[0]
     assert "millis() + iohc_cmd::RX_GESTURE_CORRELATION_MS" in stage
 
     loop = COVER_CPP.split("void SomfyIohcCover::loop()", 1)[1]

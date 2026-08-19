@@ -120,6 +120,7 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
     uint32_t remote{0};
     float rssi{0.0f};
     uint32_t slot_mask{0};
+    uint8_t step_count{1};
   };
 
   SomfyIohcHub *hub_{nullptr};
@@ -217,11 +218,12 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void confirm_pairing_(uint8_t slot);
   void discard_staged_(uint8_t slot);
   void stage_remote_command_(uint8_t slot, uint16_t main_param,
-                             uint32_t remote, float rssi);
+                             uint32_t remote, float rssi,
+                             uint8_t step_count);
   void flush_pending_remote_command_();
   void publish_status_(const char *action, int32_t slot, const char *detail = "",
                        float rssi = 0.0f, uint32_t remote_override = 0,
-                       uint32_t slot_mask = 0);
+                       uint32_t slot_mask = 0, uint8_t step_count = 0);
   void publish_rx_stats_(int32_t slot);
   void publish_backup_(uint8_t slot);
   void on_rolling_code_(uint8_t slot, uint16_t next_code);

@@ -498,24 +498,37 @@ bool SomfyIohcCover::send_1w_my_execute() {
   return true;
 }
 
-bool SomfyIohcCover::send_1w_tilt_execute(bool clockwise) {
-  // Exact clear EXECUTE payloads captured from the Situo Variation wheel:
-  //   clockwise:        01 43 D2 00 20 CD 2E 00
-  //   counterclockwise: 01 43 D2 00 20 CC A2 00
+bool SomfyIohcCover::send_1w_tilt_execute(bool clockwise, uint16_t steps) {
+  // The Situo Variation encodes wheel-roll magnitude in the FP word around
+  // 0xCCE8, at 0x0046 per raw unit. Hardware-verified compound TX is capped at
+  // two effective steps (four raw units); longer movement is chunked:
+  //   one clockwise unit:        01 43 D2 00 20 CD 2E 00
+  //   one counterclockwise unit: 01 43 D2 00 20 CC A2 00
   // The following private 0x20 action carries the authoritative direction,
   // but the motor expects this complete leading frame as part of the gesture.
+  steps = clamp<uint16_t>(steps, 1, iohc_cmd::TILT_MAX_GESTURE_STEPS);
+  const uint16_t magnitude_units =
+      steps == 1 ? 1 : steps * iohc_cmd::TILT_MAGNITUDE_UNITS_PER_STEP;
+  const int32_t signed_distance =
+      static_cast<int32_t>(iohc_cmd::TILT_MAGNITUDE_UNIT) * magnitude_units *
+      (clockwise ? 1 : -1);
+  const uint16_t magnitude = static_cast<uint16_t>(
+      static_cast<int32_t>(iohc_cmd::TILT_MAGNITUDE_CENTER) + signed_distance);
   uint8_t data[8] = {
       iohc_cmd::ORIGINATOR_USER,
       iohc_cmd::ACEI_DEFAULT,
       static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8),
       static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF),
       0x20,
-      static_cast<uint8_t>(clockwise ? 0xCD : 0xCC),
-      static_cast<uint8_t>(clockwise ? 0x2E : 0xA2),
+      static_cast<uint8_t>(magnitude >> 8),
+      static_cast<uint8_t>(magnitude & 0xFF),
       0x00,
   };
-  ESP_LOGD(TAG, "TX TILT EXECUTE 1W: src=0x%06" PRIX32 " direction=%s",
-           this->node_id_, clockwise ? "clockwise" : "counterclockwise");
+  ESP_LOGD(TAG,
+           "TX TILT EXECUTE 1W: src=0x%06" PRIX32
+           " direction=%s steps=%u magnitude_units=%u magnitude=0x%04X",
+           this->node_id_, clockwise ? "clockwise" : "counterclockwise",
+           steps, magnitude_units, magnitude);
   auto frame = this->build_1w_frame(iohc_cmd::CMD_EXECUTE, data, sizeof(data),
                                     iohc::BROADCAST_ADDR);
   if (frame.empty()) {
@@ -623,13 +636,15 @@ void SomfyIohcCover::send_next_tilt_step_() {
     return;
 
   const bool clockwise = (this->tilt_direction_ > 0) != this->tilt_inverted_;
-  if (!this->send_1w_tilt_execute(clockwise)) {
+  const uint16_t gesture_steps = std::min<uint16_t>(
+      this->tilt_steps_remaining_, iohc_cmd::TILT_MAX_GESTURE_STEPS);
+  if (!this->send_1w_tilt_execute(clockwise, gesture_steps)) {
     this->cancel_1w_tilt_sequence();
     return;
   }
 
   this->set_timeout("iohc-tilt-event", iohc_cmd::TILT_EVENT_DELAY_MS,
-                    [this, clockwise]() {
+                    [this, clockwise, gesture_steps]() {
     const uint8_t action = clockwise ? iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE
                                      : iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE;
     if (!this->send_1w_button_event(action, false)) {
@@ -637,7 +652,7 @@ void SomfyIohcCover::send_next_tilt_step_() {
       return;
     }
 
-    this->tilt_steps_remaining_--;
+    this->tilt_steps_remaining_ -= gesture_steps;
     if (this->tilt_steps_remaining_ <= 0) {
       this->tilt = this->tilt_target_;
       this->tilt_direction_ = 0;
@@ -645,9 +660,10 @@ void SomfyIohcCover::send_next_tilt_step_() {
       return;
     }
 
-    this->tilt = clamp(this->tilt + this->tilt_direction_ /
-                                      static_cast<float>(this->tilt_steps_),
-                       0.0f, 1.0f);
+    this->tilt = clamp(
+        this->tilt + this->tilt_direction_ * gesture_steps /
+                         static_cast<float>(this->tilt_steps_),
+        0.0f, 1.0f);
     this->publish_state();
     this->set_timeout("iohc-tilt-next", iohc_cmd::TILT_NEXT_STEP_DELAY_MS,
                       [this]() { this->send_next_tilt_step_(); });
@@ -803,7 +819,8 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
       // The direction-bearing private action is authoritative. Any preceding
       // ordinary-looking D200 from this same physical source belongs to this
       // gesture and must never surface as a separate STOP/MY event.
-      this->cancel_rx_stop_for_(pkt.src_node);
+      uint8_t tilt_steps = this->consume_rx_tilt_steps_for_(pkt.src_node);
+      tilt_steps = std::min<uint8_t>(tilt_steps, this->tilt_steps_);
       uint16_t sequence = 0;
       const bool has_sequence = iohc_proto::extract_sequence_1w(
           pkt.data, pkt.data_len, sequence);
@@ -815,21 +832,25 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
         char buf[112];
         this->rx_event_counter_++;
         if (has_sequence)
-          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s seq=0x%04X event=%" PRIu32,
-                   pkt.src_node, button_action_name(action), sequence,
-                   this->rx_event_counter_);
+          snprintf(buf, sizeof(buf),
+                   "0x%06" PRIX32 " %s steps=%u seq=0x%04X event=%" PRIu32,
+                   pkt.src_node, button_action_name(action), tilt_steps,
+                   sequence, this->rx_event_counter_);
         else
-          snprintf(buf, sizeof(buf), "0x%06" PRIX32 " %s event=%" PRIu32,
-                   pkt.src_node, button_action_name(action), this->rx_event_counter_);
+          snprintf(buf, sizeof(buf),
+                   "0x%06" PRIX32 " %s steps=%u event=%" PRIu32,
+                   pkt.src_node, button_action_name(action), tilt_steps,
+                   this->rx_event_counter_);
         this->log_text_sensor_->publish_state(buf);
       }
       if (this->is_allowed_remote_(pkt.src_node)) {
         if (duplicate)
           return;
         if (this->remote_command_callback_)
-          this->remote_command_callback_(event_code, pkt.src_node, pkt.rssi);
-        this->handle_rx_tilt_step_(
-            action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE);
+          this->remote_command_callback_(event_code, pkt.src_node, pkt.rssi,
+                                         tilt_steps);
+        this->handle_rx_tilt_steps_(
+            action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE, tilt_steps);
         return;
       }
     }
@@ -845,7 +866,10 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     const bool decoded = decode_execute_param_(pkt, main_param);
     uint16_t sequence = 0;
     const bool has_sequence = decoded && iohc_proto::extract_sequence_1w(pkt.data, pkt.data_len, sequence);
-    const bool tilt_execute = decoded && this->venetian_ && is_tilt_execute_(pkt);
+    uint8_t tilt_steps = 1;
+    if (!(decoded && this->venetian_ &&
+          decode_tilt_execute_steps_(pkt, tilt_steps)))
+      tilt_steps = 1;
     const bool duplicate = decoded && this->rx_deduplicator_.is_duplicate(
                                           millis(), pkt.src_node, main_param, sequence,
                                           has_sequence, RX_DEDUP_WINDOW_MS);
@@ -853,10 +877,9 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     if (decoded) {
       if (duplicate)
         return;  // repeat frame from the remote's burst — already handled
-      if (tilt_execute)
-        return;  // the following private 0x20 action supplies the direction
       if (this->venetian_ && main_param == iohc_cmd::MP_STOP) {
-        this->stage_rx_stop_(pkt.src_node, pkt.rssi, sequence, has_sequence);
+        this->stage_rx_stop_(pkt.src_node, pkt.rssi, sequence, has_sequence,
+                             tilt_steps);
         return;
       }
       if (this->pending_rx_stop_ &&
@@ -923,18 +946,36 @@ bool SomfyIohcCover::decode_button_action_(const IohcDecodedPacket &pkt, uint8_t
   return true;
 }
 
-bool SomfyIohcCover::is_tilt_execute_(const IohcDecodedPacket &pkt) {
+bool SomfyIohcCover::decode_tilt_execute_steps_(const IohcDecodedPacket &pkt,
+                                                uint8_t &steps) {
   if (pkt.cmd != iohc_cmd::CMD_EXECUTE || pkt.data == nullptr || pkt.data_len < 8)
     return false;
-  return pkt.data[2] == static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8) &&
-         pkt.data[3] == static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF) &&
-         pkt.data[4] == 0x20 && pkt.data[7] == 0x00 &&
-         ((pkt.data[5] == 0xCD && pkt.data[6] == 0x2E) ||
-          (pkt.data[5] == 0xCC && pkt.data[6] == 0xA2));
+  if (pkt.data[2] != static_cast<uint8_t>(iohc_cmd::MP_STOP >> 8) ||
+      pkt.data[3] != static_cast<uint8_t>(iohc_cmd::MP_STOP & 0xFF) ||
+      pkt.data[4] != 0x20 || pkt.data[7] != 0x00)
+    return false;
+  const uint16_t magnitude =
+      (static_cast<uint16_t>(pkt.data[5]) << 8) | pkt.data[6];
+  const int32_t delta = static_cast<int32_t>(magnitude) -
+                        iohc_cmd::TILT_MAGNITUDE_CENTER;
+  const uint32_t distance = delta < 0 ? static_cast<uint32_t>(-delta)
+                                      : static_cast<uint32_t>(delta);
+  const uint32_t magnitude_units =
+      (distance + iohc_cmd::TILT_MAGNITUDE_UNIT / 2U) /
+      iohc_cmd::TILT_MAGNITUDE_UNIT;
+  const uint32_t effective_steps =
+      magnitude_units <= 1
+          ? 1
+          : (magnitude_units +
+             iohc_cmd::TILT_MAGNITUDE_UNITS_PER_STEP / 2U) /
+                iohc_cmd::TILT_MAGNITUDE_UNITS_PER_STEP;
+  steps = static_cast<uint8_t>(clamp<uint32_t>(effective_steps, 1U, 255U));
+  return true;
 }
 
 void SomfyIohcCover::stage_rx_stop_(uint32_t remote, float rssi,
-                                    uint16_t sequence, bool has_sequence) {
+                                    uint16_t sequence, bool has_sequence,
+                                    uint8_t tilt_steps) {
   if (this->pending_rx_stop_ && this->pending_rx_stop_remote_ != remote)
     this->flush_pending_rx_stop_();
   this->pending_rx_stop_ = true;
@@ -944,14 +985,16 @@ void SomfyIohcCover::stage_rx_stop_(uint32_t remote, float rssi,
   this->pending_rx_stop_rssi_ = rssi;
   this->pending_rx_stop_sequence_ = sequence;
   this->pending_rx_stop_has_sequence_ = has_sequence;
+  this->pending_rx_tilt_steps_ = std::max<uint8_t>(tilt_steps, 1);
 }
 
-bool SomfyIohcCover::cancel_rx_stop_for_(uint32_t remote) {
+uint8_t SomfyIohcCover::consume_rx_tilt_steps_for_(uint32_t remote) {
   if (!this->pending_rx_stop_ ||
       this->pending_rx_stop_remote_ != (remote & 0x00FFFFFF))
-    return false;
+    return 1;
+  const uint8_t steps = this->pending_rx_tilt_steps_;
   this->clear_pending_rx_stop_();
-  return true;
+  return std::max<uint8_t>(steps, 1);
 }
 
 void SomfyIohcCover::clear_pending_rx_stop_() {
@@ -961,6 +1004,7 @@ void SomfyIohcCover::clear_pending_rx_stop_() {
   this->pending_rx_stop_rssi_ = 0.0f;
   this->pending_rx_stop_sequence_ = 0;
   this->pending_rx_stop_has_sequence_ = false;
+  this->pending_rx_tilt_steps_ = 1;
 }
 
 void SomfyIohcCover::flush_pending_rx_stop_() {
@@ -1002,7 +1046,7 @@ void SomfyIohcCover::emit_rx_command_(uint16_t main_param, uint32_t remote,
            "RX sync: remote 0x%06" PRIX32 " %s (mp=0x%04X) rssi=%.1f",
            remote, main_param_name(main_param), main_param, rssi);
   if (this->remote_command_callback_)
-    this->remote_command_callback_(main_param, remote, rssi);
+    this->remote_command_callback_(main_param, remote, rssi, 1);
   this->handle_rx_command_(main_param);
 }
 
@@ -1033,7 +1077,7 @@ void SomfyIohcCover::handle_rx_command_(uint16_t main_param) {
   }
 }
 
-void SomfyIohcCover::handle_rx_tilt_step_(bool clockwise) {
+void SomfyIohcCover::handle_rx_tilt_steps_(bool clockwise, uint8_t steps) {
   this->cancel_1w_tilt_sequence();
   // A physical wheel gesture begins with D200 and therefore stops lift motion.
   // The private direction event arrives afterward and is the point at which we
@@ -1046,10 +1090,12 @@ void SomfyIohcCover::handle_rx_tilt_step_(bool clockwise) {
     this->stop_prev_trigger_();
   }
   const int8_t direction = (clockwise != this->tilt_inverted_) ? 1 : -1;
-  this->tilt = clamp(this->tilt + direction / static_cast<float>(this->tilt_steps_),
-                     0.0f, 1.0f);
-  ESP_LOGD(TAG, "RX sync: Venetian tilt %s -> %.0f%%",
-           clockwise ? "clockwise" : "counterclockwise", this->tilt * 100.0f);
+  this->tilt = clamp(
+      this->tilt + direction * steps / static_cast<float>(this->tilt_steps_),
+      0.0f, 1.0f);
+  ESP_LOGD(TAG, "RX sync: Venetian tilt %s %u step(s) -> %.0f%%",
+           clockwise ? "clockwise" : "counterclockwise", steps,
+           this->tilt * 100.0f);
   this->publish_state();
 }
 
