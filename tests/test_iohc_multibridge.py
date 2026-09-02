@@ -169,6 +169,22 @@ def test_relay_arm_is_single_use_and_does_not_touch_rolling_storage():
         assert forbidden not in relay
 
 
+def test_stop_relay_ack_survives_delayed_stop_observation_batching():
+    relay = _function(
+        MANAGER_CPP,
+        "void SomfyIohcManager::relay_service",
+        "void SomfyIohcManager::observe_service",
+    )
+    assert "RELAY_STOP_ACK_DELAY_MS" in MANAGER_CPP
+    assert "iohc_cmd::RX_GESTURE_CORRELATION_MS + 150" in MANAGER_CPP
+    stop_ack = relay.split("if (main_param == iohc_cmd::MP_STOP)", 1)[1]
+    assert "set_timeout" in stop_ack
+    assert 'publish_relay_event_("relay_sent", -1, "stop"' in stop_ack
+    assert stop_ack.index("set_timeout") < stop_ack.index(
+        'publish_relay_event_("relay_sent", -1, "stop"'
+    )
+
+
 def test_manager_decodes_globally_even_when_it_has_no_matching_slot():
     setup = _function(
         MANAGER_CPP,

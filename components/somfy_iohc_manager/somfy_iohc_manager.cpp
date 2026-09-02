@@ -29,6 +29,12 @@ constexpr uint32_t DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t ALIAS_DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t PAIR_ARM_TIMEOUT_MS = 60000;
 constexpr uint32_t RELAY_ARM_TIMEOUT_MS = 5000;
+// A relayed ordinary STOP is also heard as a D200 prefix by the secondary.
+// Let its 350 ms STOP/MY correlation window flush before publishing the relay
+// acknowledgement, otherwise native-API state batching can coalesce away the
+// short-lived relay_sent response that Home Assistant is waiting for.
+constexpr uint32_t RELAY_STOP_ACK_DELAY_MS =
+    iohc_cmd::RX_GESTURE_CORRELATION_MS + 150;
 constexpr uint32_t OBSERVATION_DEDUP_WINDOW_MS = 1500;
 constexpr size_t OBSERVATION_DEDUP_CAPACITY = 16;
 // A complete MY gesture ends when its authenticated release burst returns the
@@ -1002,9 +1008,20 @@ void SomfyIohcManager::relay_service(std::string action,
                             ? "open"
                             : (main_param == iohc_cmd::MP_CLOSE ? "close"
                                                                 : "stop");
-  char detail[24];
-  snprintf(detail, sizeof(detail), "sequence_%u", sequence);
-  this->publish_relay_event_("relay_sent", -1, command, token, "", detail);
+  if (main_param == iohc_cmd::MP_STOP) {
+    const uint32_t timeout_id = 0x524C0000UL | sequence;
+    this->set_timeout(timeout_id, RELAY_STOP_ACK_DELAY_MS,
+                      [this, token, sequence]() {
+      char detail[24];
+      snprintf(detail, sizeof(detail), "sequence_%u", sequence);
+      this->publish_relay_event_("relay_sent", -1, "stop", token, "",
+                                 detail);
+    });
+  } else {
+    char detail[24];
+    snprintf(detail, sizeof(detail), "sequence_%u", sequence);
+    this->publish_relay_event_("relay_sent", -1, command, token, "", detail);
+  }
 }
 
 void SomfyIohcManager::observe_service(int32_t slot, std::string command,
