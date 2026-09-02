@@ -75,6 +75,18 @@ bool build_key_transfer_frame_1w(uint32_t src_node, uint32_t dest_node,
 // of the command payload length.
 bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequence);
 
+// Decide whether a direction/STOP-MY terminal event completes a previously
+// staged D200 prefix while the caller's short gesture window is still open.
+// When both frames expose rolling sequences, a real terminal consumes exactly
+// the next sequence. Sequence-less captures fall back to the already-bounded
+// same-remote time correlation rather than inventing a sequence relation.
+bool gesture_terminal_matches_prefix(uint32_t prefix_remote,
+                                     uint16_t prefix_sequence,
+                                     bool prefix_has_sequence,
+                                     uint32_t terminal_remote,
+                                     uint16_t terminal_sequence,
+                                     bool terminal_has_sequence);
+
 // Collapses repeated RF copies of one logical frame while preserving rapid new
 // presses of the same button. Sequence-aware frames compare their rolling
 // sequence; legacy/fallback frames compare their main parameter.

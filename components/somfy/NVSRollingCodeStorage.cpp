@@ -77,6 +77,21 @@ uint16_t NVSRollingCodeStorage::peekNextCode() {
   return this->read_next_(code) ? code : 0;
 }
 
+bool NVSRollingCodeStorage::seedNextCode(uint16_t code) {
+  if (code == 0 || !this->open_())
+    return false;
+  esp_err_t err = nvs_set_u16(this->handle_, this->key_, code);
+  if (err == ESP_OK)
+    err = nvs_commit(this->handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "seeding rolling code '%s' failed: %s", this->key_,
+             esp_err_to_name(err));
+    return false;
+  }
+  this->initial_code_ = code;
+  return true;
+}
+
 uint16_t NVSRollingCodeStorage::nextCode() {
   uint16_t code;
   if (!this->read_next_(code))

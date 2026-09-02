@@ -61,6 +61,28 @@ struct __attribute__((packed)) ManagedSwapJournal {
   uint32_t checksum;
 };
 
+enum class ManagedTransferRole : uint8_t {
+  NONE = 0,
+  SOURCE = 1,
+  DESTINATION = 2,
+};
+
+// One durable cross-bridge transaction per bridge. The source journal holds
+// the original ACTIVE record before the slot is archived; the destination
+// journal holds the imported ARCHIVED record. Reboot recovery is deliberately
+// fail-disabled until the integration explicitly commits/activates or rolls
+// back/aborts the matching token.
+struct __attribute__((packed)) ManagedTransferJournal {
+  uint32_t magic;
+  uint8_t version;
+  uint8_t role;
+  uint8_t slot;
+  uint8_t reserved;
+  uint64_t token;
+  ManagedSlotRecord record;
+  uint32_t checksum;
+};
+
 // Receive-only physical-remote alias. Storing permanent controller node IDs
 // instead of slot numbers makes group membership survive slot moves and swaps
 // without rewriting this record. One physical group identity can target every
@@ -83,6 +105,7 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void set_status_sensor(text_sensor::TextSensor *sensor) { this->status_sensor_ = sensor; }
   void set_backup_sensor(text_sensor::TextSensor *sensor) { this->backup_sensor_ = sensor; }
   void set_backup_key(const char *hex_key);
+  void set_relay_key(const char *hex_key);
   void set_max_shutters(uint8_t count) { this->max_shutters_ = count; }
   void set_cover_device_class_index(uint8_t index) { this->cover_device_class_index_ = index; }
 
@@ -124,11 +147,31 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
     uint8_t step_count{1};
   };
 
+  struct PendingObservedStop {
+    bool active{false};
+    uint32_t remote{0};
+    float rssi{0.0f};
+    uint32_t deadline_ms{0};
+    uint16_t sequence{0};
+    bool has_sequence{false};
+    uint8_t steps{1};
+  };
+
+  struct RecentObservedFrame {
+    uint32_t remote{0};
+    uint16_t code{0};
+    uint16_t sequence{0};
+    uint32_t seen_ms{0};
+    bool has_sequence{false};
+  };
+
   SomfyIohcHub *hub_{nullptr};
   text_sensor::TextSensor *status_sensor_{nullptr};
   text_sensor::TextSensor *backup_sensor_{nullptr};
   uint8_t backup_key_[16]{};
   bool has_backup_key_{false};
+  uint8_t relay_key_[16]{};
+  bool has_relay_key_{false};
   uint8_t max_shutters_{IOHC_MANAGER_MAX_SHUTTERS};
   uint8_t cover_device_class_index_{0};
   std::vector<Slot> slots_;
@@ -137,6 +180,17 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   PendingRemoteCommand pending_remote_command_;
   std::deque<uint8_t> my_queue_;
   int8_t active_my_slot_{-1};
+  PendingObservedStop pending_observed_stop_;
+  std::deque<RecentObservedFrame> recent_observed_frames_;
+
+  bool relay_armed_{false};
+  uint64_t relay_token_{0};
+  uint32_t relay_deadline_ms_{0};
+  bool relay_capture_active_{false};
+  uint64_t relay_capture_token_{0};
+  uint8_t relay_capture_slot_{0};
+  uint16_t relay_capture_param_{0};
+  bool relay_capture_completed_{false};
 
   nvs_handle registry_handle_{0};
   bool registry_open_{false};
@@ -161,11 +215,19 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void queue_my_(uint8_t slot);
   void start_next_my_();
   void on_my_sequence_complete_(uint8_t slot);
+  void on_tilt_sequence_complete_(uint8_t slot);
   void restore_service(std::string encrypted_backup, int32_t slot);
   void move_service(int32_t slot, int32_t target_slot);
   void swap_service(int32_t slot, int32_t target_slot);
   void remote_alias_service(std::string action, std::string remote,
                             std::string slots);
+  void redundant_control_service(int32_t slot, std::string command,
+                                 std::string relay_token);
+  void relay_service(std::string action, std::string payload);
+  void observe_service(int32_t slot, std::string command, int32_t steps);
+  void transfer_service(std::string action, int32_t slot,
+                        std::string transfer_token,
+                        std::string encrypted_backup);
 
   bool open_registry_();
   bool read_imports_bootstrapped_(bool &bootstrapped);
@@ -176,6 +238,9 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   bool read_swap_journal_(ManagedSwapJournal &journal, bool &found);
   bool save_swap_journal_(ManagedSwapJournal &journal);
   bool erase_swap_journal_();
+  bool read_transfer_journal_(ManagedTransferJournal &journal, bool &found);
+  bool save_transfer_journal_(ManagedTransferJournal &journal);
+  bool erase_transfer_journal_();
   bool load_remote_aliases_();
   bool load_remote_alias_record_(uint8_t index,
                                  ManagedRemoteAliasRecord &record,
@@ -185,10 +250,12 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   static ManagedSlotRecord default_record_(uint8_t slot);
   static uint32_t record_checksum_(const ManagedSlotRecord &record);
   static uint32_t swap_checksum_(const ManagedSwapJournal &journal);
+  static uint32_t transfer_checksum_(const ManagedTransferJournal &journal);
   static uint32_t remote_alias_checksum_(
       const ManagedRemoteAliasRecord &record);
   static bool record_is_valid_(const ManagedSlotRecord &record);
   static bool swap_is_valid_(const ManagedSwapJournal &journal);
+  static bool transfer_is_valid_(const ManagedTransferJournal &journal);
   static bool remote_alias_is_valid_(
       const ManagedRemoteAliasRecord &record);
   static const char *state_name_(ManagedSlotState state);
@@ -213,11 +280,13 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
                          const std::vector<uint32_t> &node_ids);
   void remove_remote_alias_(uint32_t remote);
   void apply_slot_(uint8_t slot);
+  bool seed_slot_rolling_code_(uint8_t slot, uint16_t next_code);
   void stage_slot_(int32_t requested_slot);
   bool complete_move_(uint8_t source_slot, uint8_t target_slot);
   void recover_pending_moves_();
   bool complete_swap_(const ManagedSwapJournal &journal);
   bool recover_pending_swap_();
+  bool recover_pending_transfer_();
   void start_discovery_(uint8_t slot);
   void arm_pairing_(uint8_t slot, bool retry);
   void transmit_pairing_(uint8_t slot);
@@ -230,10 +299,50 @@ class SomfyIohcManager : public Component, public api::CustomAPIDevice {
   void publish_status_(const char *action, int32_t slot, const char *detail = "",
                        float rssi = 0.0f, uint32_t remote_override = 0,
                        uint32_t slot_mask = 0, uint8_t step_count = 0);
+  void publish_remote_observation_(const char *command, uint32_t remote,
+                                   uint16_t sequence, bool has_sequence,
+                                   bool complete, uint8_t steps, float rssi,
+                                   uint32_t slot_mask);
+  void publish_relay_event_(const char *action, int32_t slot,
+                            const char *command, uint64_t token,
+                            const std::string &envelope = "",
+                            const char *detail = "");
+  void publish_transfer_event_(const char *action, int32_t slot,
+                               uint64_t token, const char *detail = "");
+  void publish_transfer_state_(int32_t slot, uint64_t token,
+                               const char *role, const char *phase);
   void publish_rx_stats_(int32_t slot);
   void publish_backup_(uint8_t slot);
   void on_rolling_code_(uint8_t slot, uint16_t next_code);
   void on_iohc_packet_(const IohcDecodedPacket &packet);
+  void on_relayable_frame_(uint8_t slot, uint16_t main_param,
+                           const std::vector<uint8_t> &frame,
+                           uint8_t repeat_count);
+  void stage_observed_stop_(uint32_t remote, float rssi, uint16_t sequence,
+                            bool has_sequence, uint8_t steps);
+  void flush_observed_stop_();
+  void emit_observation_(const char *command, uint32_t remote, float rssi,
+                         uint16_t sequence, bool has_sequence,
+                         uint8_t steps = 1, bool complete = true);
+  bool observed_frame_duplicate_(uint32_t remote, uint16_t code,
+                                 uint16_t sequence, bool has_sequence);
+  uint32_t slots_for_remote_(uint32_t remote) const;
+  bool apply_observation_to_slot_(uint8_t slot, const std::string &command,
+                                  uint8_t steps);
+
+  bool encrypt_relay_envelope_(uint64_t token, uint16_t main_param,
+                               const std::vector<uint8_t> &frame,
+                               uint8_t repeat_count,
+                               std::string &output) const;
+  bool decrypt_relay_envelope_(const std::string &input, uint64_t &token,
+                               uint16_t &main_param,
+                               std::vector<uint8_t> &frame,
+                               uint8_t &repeat_count) const;
+  static bool validate_relay_frame_(const std::vector<uint8_t> &frame,
+                                    uint16_t &main_param,
+                                    uint16_t &sequence);
+  static bool parse_token_(const std::string &value, uint64_t &token);
+  static std::string format_token_(uint64_t token);
 
   bool encrypt_record_(const ManagedSlotRecord &record, std::string &output) const;
   bool decrypt_record_(const std::string &input, ManagedSlotRecord &record) const;

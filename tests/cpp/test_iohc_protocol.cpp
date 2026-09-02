@@ -112,6 +112,22 @@ int main() {
   expect(iohc_proto::crc16(stop_frame.data(), stop_frame.size()) == 0,
          "STOP CRC residue is zero");
 
+  expect(iohc_proto::gesture_terminal_matches_prefix(
+             0x61620C, 0x0599, true, 0x61620C, 0x059A, true),
+         "adjacent terminal sequence completes a D200 prefix");
+  expect(!iohc_proto::gesture_terminal_matches_prefix(
+             0x61620C, 0x0599, true, 0x61620C, 0x059B, true),
+         "non-adjacent terminal sequence does not consume a prefix");
+  expect(!iohc_proto::gesture_terminal_matches_prefix(
+             0x61620C, 0x0599, true, 0x61620D, 0x059A, true),
+         "terminal from another remote does not consume a prefix");
+  expect(iohc_proto::gesture_terminal_matches_prefix(
+             0xFF61620C, 0, false, 0x0061620C, 0x059A, true),
+         "sequence-less evidence falls back to masked same-remote correlation");
+  expect(iohc_proto::gesture_terminal_matches_prefix(
+             0x61620C, 0xFFFF, true, 0x61620C, 0x0000, true),
+         "terminal correlation handles the uint16 sequence boundary");
+
   std::vector<uint8_t> encoded;
   iohc_proto::uart_encode(stop_frame.data(), stop_frame.size(), encoded);
   expect(!encoded.empty() && encoded[0] == 0x99,

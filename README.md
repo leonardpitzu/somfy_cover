@@ -348,6 +348,18 @@ is an idempotent destination. This queue currently covers managed MY requests;
 a general scheduler for movement, timed STOP, and Venetian transactions remains
 future work.
 
+The experimental multi-bridge manager extends that model without duplicating
+controller identities. Every bridge publishes normalized physical-remote
+observations, while Home Assistant deduplicates them and forwards only
+estimator updates to an owner that missed RF. A shutter may also use one
+stateless secondary transmitter for OPEN, CLOSE, and STOP: the secondary
+replays the primary's exact authenticated frame and rolling sequence from a
+short-lived, challenge-bound envelope, and never receives the controller key.
+Guarded cross-bridge ownership transfer archives and hard-disables the source
+before activating the same identity on the destination. See
+[`docs/iohc-multi-bridge.md`](docs/iohc-multi-bridge.md) for the protocol,
+failure rules, and two-radio validation checklist.
+
 ### Home Assistant
 
 Install the companion

@@ -28,17 +28,24 @@ constexpr const char *REGISTRY_NAMESPACE = "somfy_mgr";
 constexpr uint32_t DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t ALIAS_DISCOVERY_TIMEOUT_MS = 120000;
 constexpr uint32_t PAIR_ARM_TIMEOUT_MS = 60000;
+constexpr uint32_t RELAY_ARM_TIMEOUT_MS = 5000;
+constexpr uint32_t OBSERVATION_DEDUP_WINDOW_MS = 1500;
+constexpr size_t OBSERVATION_DEDUP_CAPACITY = 16;
 // A complete MY gesture ends when its authenticated release burst returns the
 // CC1101 to RX. This tiny handoff gap is enough for the radio state transition
 // without imposing the conservative two-second delay previously recommended
 // for Home Assistant automations.
-constexpr uint32_t MY_INTER_TRANSACTION_GAP_MS = 20;
+// Default ESPHome native-API batching is 100 ms. Keep the completed state
+// visible beyond that window before the next MY can publish rolling-code
+// updates, while remaining much faster than the former two-second advice.
+constexpr uint32_t MY_INTER_TRANSACTION_GAP_MS = 150;
 constexpr uint8_t BACKUP_FORMAT_VERSION = 1;
 constexpr size_t GCM_NONCE_SIZE = 12;
 constexpr size_t GCM_TAG_SIZE = 16;
 constexpr char GCM_AAD[] = "somfy-io-manager-v1";
 constexpr char IMPORTS_BOOTSTRAPPED_KEY[] = "imports_v1";
 constexpr char SWAP_JOURNAL_KEY[] = "swap_v1";
+constexpr char TRANSFER_JOURNAL_KEY[] = "xfer_v1";
 constexpr uint16_t FLAG_MOVE_PENDING = 0x8000;
 constexpr uint16_t FLAG_MOVE_TARGET_MASK = 0x001F;
 // Record v1 intentionally reserved this field. Keep the packed record and
@@ -63,6 +70,10 @@ constexpr uint32_t SWAP_JOURNAL_MAGIC = 0x53574150;  // "SWAP"
 constexpr uint8_t SWAP_JOURNAL_VERSION = 1;
 constexpr uint32_t REMOTE_ALIAS_MAGIC = 0x5349414C;  // "SIAL"
 constexpr uint8_t REMOTE_ALIAS_VERSION = 1;
+constexpr uint32_t TRANSFER_JOURNAL_MAGIC = 0x58464552;  // "XFER"
+constexpr uint8_t TRANSFER_JOURNAL_VERSION = 1;
+constexpr uint8_t RELAY_ENVELOPE_VERSION = 1;
+constexpr char RELAY_GCM_AAD[] = "somfy-io-relay-v1";
 
 void record_key(uint8_t slot, char output[8]) {
   snprintf(output, 8, "slot%02u", static_cast<unsigned>(slot));
@@ -143,6 +154,12 @@ void SomfyIohcManager::set_backup_key(const char *hex_key) {
     ESP_LOGE(TAG, "Backup key must be exactly 32 hexadecimal characters");
 }
 
+void SomfyIohcManager::set_relay_key(const char *hex_key) {
+  this->has_relay_key_ = parse_hex_key_(hex_key, this->relay_key_);
+  if (!this->has_relay_key_)
+    ESP_LOGE(TAG, "Relay key must be exactly 32 hexadecimal characters");
+}
+
 void SomfyIohcManager::add_import(
     uint8_t slot, uint32_t node_id, const char *encryption_key,
     const char *storage_namespace, const char *storage_key,
@@ -197,8 +214,16 @@ void SomfyIohcManager::create_slots() {
                       uint8_t step_count) {
       this->stage_remote_command_(index, main_param, remote, rssi, step_count);
     });
+    slot.cover->set_relay_frame_callback(
+        [this, index](uint16_t main_param, const std::vector<uint8_t> &frame,
+                      uint8_t repeat_count) {
+          this->on_relayable_frame_(index, main_param, frame, repeat_count);
+        });
+    slot.cover->set_manager_rx_owned(true);
     slot.cover->set_my_sequence_complete_callback(
         [this, index]() { this->on_my_sequence_complete_(index); });
+    slot.cover->set_tilt_sequence_complete_callback(
+        [this, index]() { this->on_tilt_sequence_complete_(index); });
 
     // Slot entities are intentionally disabled until the HA commissioning flow
     // confirms a motor jog and enables/renames the chosen one.
@@ -211,7 +236,8 @@ void SomfyIohcManager::create_slots() {
 
 void SomfyIohcManager::setup() {
   if (this->hub_ == nullptr || this->status_sensor_ == nullptr ||
-      this->backup_sensor_ == nullptr || !this->has_backup_key_) {
+      this->backup_sensor_ == nullptr || !this->has_backup_key_ ||
+      !this->has_relay_key_) {
     ESP_LOGE(TAG, "Manager configuration is incomplete; commissioning is disabled");
     this->mark_failed();
     return;
@@ -268,6 +294,10 @@ void SomfyIohcManager::setup() {
     this->mark_failed();
     return;
   }
+  if (!this->recover_pending_transfer_()) {
+    this->mark_failed();
+    return;
+  }
   if (!this->load_remote_aliases_()) {
     this->mark_failed();
     return;
@@ -305,12 +335,41 @@ void SomfyIohcManager::setup() {
   this->register_service(
       &SomfyIohcManager::remote_alias_service, "somfy_remote_alias",
       {"action", "remote", "slots"});
+  this->register_service(
+      &SomfyIohcManager::redundant_control_service,
+      "somfy_redundant_control", {"slot", "command", "relay_token"});
+  this->register_service(
+      &SomfyIohcManager::relay_service, "somfy_relay",
+      {"action", "payload"});
+  this->register_service(
+      &SomfyIohcManager::observe_service, "somfy_observe",
+      {"slot", "command", "steps"});
+  this->register_service(
+      &SomfyIohcManager::transfer_service, "somfy_transfer",
+      {"action", "slot", "transfer_token", "encrypted_backup"});
 
   this->publish_status_("ready", -1);
   this->set_timeout("initial-backups", 1000, [this]() {
     for (uint8_t index = 0; index < this->slots_.size(); index++) {
       if (this->slots_[index].has_record)
         this->publish_backup_(index);
+    }
+    ManagedTransferJournal journal{};
+    bool found = false;
+    if (this->read_transfer_journal_(journal, found) && found) {
+      // Publish the transaction slot last, immediately followed by its token,
+      // so Home Assistant can resume safely after either bridge reboots.
+      this->publish_backup_(journal.slot);
+      const char *action =
+          static_cast<ManagedTransferRole>(journal.role) ==
+                  ManagedTransferRole::SOURCE
+              ? "transfer_prepared"
+              : (static_cast<ManagedSlotState>(journal.record.state) ==
+                         ManagedSlotState::ACTIVE
+                     ? "transfer_activated"
+                     : "transfer_imported");
+      this->publish_transfer_event_(action, journal.slot, journal.token,
+                                    "recovered_after_boot");
     }
   });
 }
@@ -326,6 +385,16 @@ void SomfyIohcManager::loop() {
   this->flush_pending_remote_command_();
 
   const uint32_t now = millis();
+  if (this->pending_observed_stop_.active &&
+      static_cast<int32_t>(now - this->pending_observed_stop_.deadline_ms) >= 0) {
+    this->flush_observed_stop_();
+  }
+  if (this->relay_armed_ &&
+      static_cast<int32_t>(now - this->relay_deadline_ms_) >= 0) {
+    this->relay_armed_ = false;
+    this->relay_token_ = 0;
+    this->publish_relay_event_("relay_expired", -1, "", 0);
+  }
   if (this->discovery_slot_ >= 0 &&
       static_cast<int32_t>(now - this->discovery_deadline_ms_) >= 0) {
     const int8_t slot = this->discovery_slot_;
@@ -363,6 +432,7 @@ void SomfyIohcManager::dump_config() {
   ESP_LOGCONFIG(TAG, "  Uncertain pairing attempts: %u", uncertain);
   ESP_LOGCONFIG(TAG, "  Receive-only group remotes: %u", aliases);
   ESP_LOGCONFIG(TAG, "  Encrypted recovery backup: enabled");
+  ESP_LOGCONFIG(TAG, "  Multi-bridge observation/relay/transfer: enabled");
 }
 
 void SomfyIohcManager::commission_service(std::string action, int32_t slot) {
@@ -557,10 +627,27 @@ void SomfyIohcManager::on_my_sequence_complete_(uint8_t slot) {
   if (this->active_my_slot_ != static_cast<int8_t>(slot))
     return;
   this->active_my_slot_ = -1;
+  // A storage/transmit failure can complete synchronously inside runtime_my().
+  // Defer the terminal state so the caller's command_sent/queued status is
+  // always observed first, just as with a zero-distance tilt request.
+  this->set_timeout("iohc-my-done", 1, [this, slot]() {
+    this->publish_status_("command_complete", slot, "my");
+  });
   // Defer the handoff so a cancellation callback cannot start the next MY in
   // the middle of the OPEN/CLOSE/STOP command that cancelled this one.
   this->set_timeout("iohc-my-next", MY_INTER_TRANSACTION_GAP_MS,
                     [this]() { this->start_next_my_(); });
+}
+
+void SomfyIohcManager::on_tilt_sequence_complete_(uint8_t slot) {
+  // A zero-distance tilt request can complete synchronously inside the API
+  // service. Defer one loop so command_sent is published first and consumers
+  // can reliably wait for the terminal event.
+  char timeout_name[24];
+  snprintf(timeout_name, sizeof(timeout_name), "iohc-tilt-done-%u", slot);
+  this->set_timeout(timeout_name, 1, [this, slot]() {
+    this->publish_status_("command_complete", slot, "tilt");
+  });
 }
 
 void SomfyIohcManager::restore_service(std::string encrypted_backup, int32_t slot) {
@@ -796,6 +883,504 @@ void SomfyIohcManager::remote_alias_service(
     return;
   }
   this->publish_status_("error", -1, "unknown_action");
+}
+
+void SomfyIohcManager::redundant_control_service(
+    int32_t slot, std::string command, std::string relay_token) {
+  uint64_t token = 0;
+  if (!this->valid_slot_(slot) || !parse_token_(relay_token, token)) {
+    this->publish_status_("error", slot, "invalid_redundant_request");
+    return;
+  }
+  auto &managed = this->slots_[slot];
+  if (!managed.has_record ||
+      static_cast<ManagedSlotState>(managed.record.state) !=
+          ManagedSlotState::ACTIVE) {
+    this->publish_status_("error", slot, "source_slot_not_active");
+    return;
+  }
+
+  uint16_t main_param = 0;
+  if (command == "open")
+    main_param = iohc_cmd::MP_OPEN;
+  else if (command == "close")
+    main_param = iohc_cmd::MP_CLOSE;
+  else if (command == "stop")
+    main_param = iohc_cmd::MP_STOP;
+  else {
+    // MY, position, Venetian tilt and every commissioning command are
+    // intentionally outside the redundant single-frame allowlist.
+    this->publish_status_("error", slot, "command_not_relayable");
+    return;
+  }
+
+  if (this->relay_capture_active_) {
+    this->publish_status_("error", slot, "relay_source_busy");
+    return;
+  }
+  this->relay_capture_active_ = true;
+  this->relay_capture_completed_ = false;
+  this->relay_capture_token_ = token;
+  this->relay_capture_slot_ = static_cast<uint8_t>(slot);
+  this->relay_capture_param_ = main_param;
+
+  // The normal cover path updates its time/tilt estimator and transmits from
+  // the primary bridge first. send_1w_command invokes on_relayable_frame_
+  // only after that physical transmit has completed.
+  if (main_param == iohc_cmd::MP_OPEN)
+    managed.cover->runtime_open();
+  else if (main_param == iohc_cmd::MP_CLOSE)
+    managed.cover->runtime_close();
+  else
+    managed.cover->runtime_stop();
+
+  const bool completed = this->relay_capture_completed_;
+  this->relay_capture_active_ = false;
+  this->relay_capture_token_ = 0;
+  if (!completed)
+    this->publish_status_("error", slot, "primary_transmit_failed");
+}
+
+void SomfyIohcManager::relay_service(std::string action,
+                                     std::string payload) {
+  if (action == "arm") {
+    uint64_t token = 0;
+    do {
+      token = (static_cast<uint64_t>(esp_random()) << 32U) | esp_random();
+    } while (token == 0);
+    this->relay_armed_ = true;
+    this->relay_token_ = token;
+    this->relay_deadline_ms_ = millis() + RELAY_ARM_TIMEOUT_MS;
+    this->publish_relay_event_("relay_armed", -1, "", token);
+    return;
+  }
+  if (action == "cancel") {
+    uint64_t token = 0;
+    if (!parse_token_(payload, token) || !this->relay_armed_ ||
+        token != this->relay_token_) {
+      this->publish_status_("error", -1, "relay_token_mismatch");
+      return;
+    }
+    this->relay_armed_ = false;
+    this->relay_token_ = 0;
+    this->publish_relay_event_("relay_cancelled", -1, "", token);
+    return;
+  }
+  if (action != "send") {
+    this->publish_status_("error", -1, "unknown_relay_action");
+    return;
+  }
+
+  uint64_t token = 0;
+  uint16_t main_param = 0;
+  uint16_t sequence = 0;
+  uint8_t repeat_count = 0;
+  std::vector<uint8_t> frame;
+  if (!this->decrypt_relay_envelope_(payload, token, main_param, frame,
+                                     repeat_count) ||
+      !validate_relay_frame_(frame, main_param, sequence)) {
+    this->publish_status_("error", -1, "invalid_relay_envelope");
+    return;
+  }
+  if (!this->relay_armed_ || token != this->relay_token_ ||
+      static_cast<int32_t>(millis() - this->relay_deadline_ms_) >= 0) {
+    this->publish_status_("error", -1, "relay_not_armed_or_expired");
+    return;
+  }
+  if (repeat_count < 1 || repeat_count > 20) {
+    this->publish_status_("error", -1, "invalid_relay_repeat_count");
+    return;
+  }
+
+  // Consume the challenge before the first RF byte. A disconnect, duplicate
+  // HA service call or delayed stale envelope can therefore never transmit a
+  // second independently-triggered copy.
+  this->relay_armed_ = false;
+  this->relay_token_ = 0;
+  this->hub_->transmit_packet(frame, repeat_count);
+  const char *command = main_param == iohc_cmd::MP_OPEN
+                            ? "open"
+                            : (main_param == iohc_cmd::MP_CLOSE ? "close"
+                                                                : "stop");
+  char detail[24];
+  snprintf(detail, sizeof(detail), "sequence_%u", sequence);
+  this->publish_relay_event_("relay_sent", -1, command, token, "", detail);
+}
+
+void SomfyIohcManager::observe_service(int32_t slot, std::string command,
+                                       int32_t steps) {
+  if (!this->valid_slot_(slot)) {
+    this->publish_status_("error", slot, "invalid_slot");
+    return;
+  }
+  if (steps < 1 || steps > 254 ||
+      !this->apply_observation_to_slot_(static_cast<uint8_t>(slot), command,
+                                        static_cast<uint8_t>(steps))) {
+    this->publish_status_("error", slot, "invalid_observation");
+    return;
+  }
+  this->publish_status_("observation_applied", slot, command.c_str(), 0.0f,
+                        0, uint32_t{1} << slot,
+                        static_cast<uint8_t>(steps));
+}
+
+void SomfyIohcManager::transfer_service(
+    std::string action, int32_t slot, std::string transfer_token,
+    std::string encrypted_backup) {
+  ManagedTransferJournal journal{};
+  bool found = false;
+  if (!this->read_transfer_journal_(journal, found)) {
+    this->publish_status_("error", slot, "transfer_journal_invalid");
+    return;
+  }
+
+  if (action == "query") {
+    if (found) {
+      if (slot >= 0 && slot != journal.slot) {
+        this->publish_status_("error", slot, "transfer_slot_mismatch");
+        return;
+      }
+      const bool source = static_cast<ManagedTransferRole>(journal.role) ==
+                          ManagedTransferRole::SOURCE;
+      const char *phase =
+          source ? "archived"
+                 : (static_cast<ManagedSlotState>(journal.record.state) ==
+                            ManagedSlotState::ACTIVE
+                        ? "active"
+                        : "archived");
+      this->publish_transfer_state_(journal.slot, journal.token,
+                                    source ? "source" : "destination",
+                                    phase);
+      return;
+    }
+    if (slot < 0) {
+      this->publish_transfer_state_(-1, 0, "none", "none");
+      return;
+    }
+    if (!this->valid_slot_(slot)) {
+      this->publish_status_("error", slot, "invalid_slot");
+      return;
+    }
+    const auto &managed = this->slots_[slot];
+    const char *phase =
+        !managed.has_record
+            ? "empty"
+            : state_name_(static_cast<ManagedSlotState>(managed.record.state));
+    this->publish_transfer_state_(slot, 0, "none", phase);
+    return;
+  }
+
+  if (!this->valid_slot_(slot)) {
+    this->publish_status_("error", slot, "invalid_slot");
+    return;
+  }
+
+  if (action == "prepare") {
+    if (found) {
+      if (journal.role == static_cast<uint8_t>(ManagedTransferRole::SOURCE) &&
+          journal.slot == slot) {
+        auto &managed = this->slots_[slot];
+        managed.cover->set_runtime_enabled(false);
+        managed.record = journal.record;
+        managed.record.state =
+            static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+        managed.record.flags &= FLAG_FEATURE_MASK;
+        managed.has_record = true;
+        if (!this->save_record_(static_cast<uint8_t>(slot))) {
+          this->publish_status_("error", slot,
+                                "transfer_archive_interrupted_safe_to_retry");
+          return;
+        }
+        this->apply_slot_(static_cast<uint8_t>(slot));
+        this->publish_backup_(static_cast<uint8_t>(slot));
+        this->publish_transfer_event_("transfer_prepared", slot,
+                                      journal.token, "resumed");
+      } else {
+        this->publish_status_("error", slot, "transfer_busy");
+      }
+      return;
+    }
+    auto &managed = this->slots_[slot];
+    if (!managed.has_record ||
+        static_cast<ManagedSlotState>(managed.record.state) !=
+            ManagedSlotState::ACTIVE) {
+      this->publish_status_("error", slot, "source_slot_not_active");
+      return;
+    }
+    const uint16_t next = managed.cover->peek_next_rolling_code();
+    if (next == 0) {
+      this->publish_status_("error", slot, "rolling_code_unavailable");
+      return;
+    }
+    uint64_t token = 0;
+    do {
+      token = (static_cast<uint64_t>(esp_random()) << 32U) | esp_random();
+    } while (token == 0);
+    journal.magic = TRANSFER_JOURNAL_MAGIC;
+    journal.version = TRANSFER_JOURNAL_VERSION;
+    journal.role = static_cast<uint8_t>(ManagedTransferRole::SOURCE);
+    journal.slot = static_cast<uint8_t>(slot);
+    journal.token = token;
+    journal.record = managed.record;
+    journal.record.initial_rolling_code = next;
+    journal.record.checksum = record_checksum_(journal.record);
+    if (!this->save_transfer_journal_(journal)) {
+      this->publish_status_("error", slot, "transfer_journal_save_failed");
+      return;
+    }
+
+    // Fail closed before mutating persistent state. The encrypted export is
+    // not published until ARCHIVED is durable.
+    managed.cover->set_runtime_enabled(false);
+    managed.record = journal.record;
+    managed.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+    managed.record.flags &= FLAG_FEATURE_MASK;
+    if (!this->save_record_(static_cast<uint8_t>(slot))) {
+      this->publish_status_("error", slot,
+                            "transfer_archive_interrupted_safe_to_retry");
+      return;
+    }
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_backup_(static_cast<uint8_t>(slot));
+    this->publish_transfer_event_("transfer_prepared", slot, token);
+    return;
+  }
+
+  uint64_t token = 0;
+  if (!parse_token_(transfer_token, token) || !found ||
+      journal.slot != static_cast<uint8_t>(slot) || journal.token != token) {
+    if (action != "import") {
+      this->publish_status_("error", slot, "transfer_token_mismatch");
+      return;
+    }
+  }
+
+  if (action == "rollback") {
+    if (!found || journal.role !=
+                      static_cast<uint8_t>(ManagedTransferRole::SOURCE) ||
+        journal.token != token || journal.slot != slot) {
+      this->publish_status_("error", slot, "transfer_source_not_prepared");
+      return;
+    }
+    auto &managed = this->slots_[slot];
+    managed.cover->set_runtime_enabled(false);
+    managed.record = journal.record;
+    managed.has_record = true;
+    if (!this->save_record_(static_cast<uint8_t>(slot))) {
+      managed.cover->set_runtime_enabled(false);
+      this->publish_status_("error", slot,
+                            "transfer_rollback_interrupted_safe_to_retry");
+      return;
+    }
+    if (!this->erase_transfer_journal_()) {
+      managed.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+      managed.record.flags &= FLAG_FEATURE_MASK;
+      this->save_record_(static_cast<uint8_t>(slot));
+      managed.cover->set_runtime_enabled(false);
+      this->publish_status_("error", slot,
+                            "transfer_rollback_interrupted_safe_to_retry");
+      return;
+    }
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_backup_(static_cast<uint8_t>(slot));
+    this->publish_transfer_event_("transfer_rolled_back", slot, token);
+    return;
+  }
+
+  if (action == "commit") {
+    if (journal.role != static_cast<uint8_t>(ManagedTransferRole::SOURCE) ||
+        static_cast<ManagedSlotState>(this->slots_[slot].record.state) !=
+            ManagedSlotState::ARCHIVED) {
+      this->publish_status_("error", slot, "transfer_source_not_prepared");
+      return;
+    }
+    this->slots_[slot].cover->set_runtime_enabled(false);
+    if (!this->erase_record_(static_cast<uint8_t>(slot)) ||
+        !this->erase_transfer_journal_()) {
+      this->publish_status_("error", slot,
+                            "transfer_commit_interrupted_safe_to_retry");
+      return;
+    }
+    this->slots_[slot].has_record = false;
+    this->slots_[slot].record = default_record_(static_cast<uint8_t>(slot));
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_transfer_event_("transfer_committed", slot, token);
+    return;
+  }
+
+  if (action == "import") {
+    if (found &&
+        journal.role ==
+            static_cast<uint8_t>(ManagedTransferRole::DESTINATION) &&
+        journal.slot == slot && journal.token == token) {
+      auto &managed = this->slots_[slot];
+      managed.cover->set_runtime_enabled(false);
+      managed.record = journal.record;
+      managed.record.flags &= FLAG_FEATURE_MASK;
+      managed.has_record = true;
+      if (!this->seed_slot_rolling_code_(static_cast<uint8_t>(slot),
+                                         managed.record.initial_rolling_code) ||
+          !this->save_record_(static_cast<uint8_t>(slot))) {
+        managed.cover->set_runtime_enabled(false);
+        this->publish_status_("error", slot,
+                              "transfer_import_interrupted_safe_to_retry");
+        return;
+      }
+      this->apply_slot_(static_cast<uint8_t>(slot));
+      const bool active =
+          static_cast<ManagedSlotState>(journal.record.state) ==
+          ManagedSlotState::ACTIVE;
+      this->publish_transfer_event_(active ? "transfer_activated"
+                                           : "transfer_imported",
+                                    slot, token, "resumed");
+      return;
+    }
+    if (found || this->slots_[slot].has_record ||
+        !parse_token_(transfer_token, token)) {
+      this->publish_status_("error", slot, "transfer_destination_not_empty");
+      return;
+    }
+    ManagedSlotRecord restored{};
+    if (!this->decrypt_record_(encrypted_backup, restored) ||
+        !record_is_valid_(restored) ||
+        static_cast<ManagedSlotState>(restored.state) !=
+            ManagedSlotState::ARCHIVED ||
+        restored.initial_rolling_code == 0 ||
+        this->node_id_in_use_(restored.node_id)) {
+      this->publish_status_("error", slot, "invalid_transfer_backup");
+      return;
+    }
+    const auto defaults = default_record_(static_cast<uint8_t>(slot));
+    strlcpy(restored.storage_namespace, defaults.storage_namespace,
+            sizeof(restored.storage_namespace));
+    strlcpy(restored.storage_key, defaults.storage_key,
+            sizeof(restored.storage_key));
+    restored.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+    restored.flags &= FLAG_FEATURE_MASK;
+    restored.checksum = record_checksum_(restored);
+    journal.magic = TRANSFER_JOURNAL_MAGIC;
+    journal.version = TRANSFER_JOURNAL_VERSION;
+    journal.role = static_cast<uint8_t>(ManagedTransferRole::DESTINATION);
+    journal.slot = static_cast<uint8_t>(slot);
+    journal.token = token;
+    journal.record = restored;
+    if (!this->save_transfer_journal_(journal)) {
+      this->publish_status_("error", slot, "transfer_journal_save_failed");
+      return;
+    }
+    auto &managed = this->slots_[slot];
+    managed.cover->set_runtime_enabled(false);
+    managed.record = restored;
+    managed.has_record = true;
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    if (!this->seed_slot_rolling_code_(static_cast<uint8_t>(slot),
+                                       restored.initial_rolling_code) ||
+        !this->save_record_(static_cast<uint8_t>(slot))) {
+      managed.cover->set_runtime_enabled(false);
+      this->publish_status_("error", slot,
+                            "transfer_import_interrupted_safe_to_retry");
+      return;
+    }
+    this->publish_transfer_event_("transfer_imported", slot, token);
+    return;
+  }
+
+  if (action == "abort") {
+    if (journal.role !=
+            static_cast<uint8_t>(ManagedTransferRole::DESTINATION) ||
+        static_cast<ManagedSlotState>(journal.record.state) !=
+            ManagedSlotState::ARCHIVED ||
+        static_cast<ManagedSlotState>(this->slots_[slot].record.state) !=
+            ManagedSlotState::ARCHIVED) {
+      this->publish_status_("error", slot, "transfer_destination_not_imported");
+      return;
+    }
+    this->slots_[slot].cover->set_runtime_enabled(false);
+    if (!this->erase_record_(static_cast<uint8_t>(slot)) ||
+        !this->erase_transfer_journal_()) {
+      this->publish_status_("error", slot,
+                            "transfer_abort_interrupted_safe_to_retry");
+      return;
+    }
+    this->slots_[slot].has_record = false;
+    this->slots_[slot].record = default_record_(static_cast<uint8_t>(slot));
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_transfer_event_("transfer_aborted", slot, token);
+    return;
+  }
+
+  if (action == "activate") {
+    if (journal.role !=
+        static_cast<uint8_t>(ManagedTransferRole::DESTINATION)) {
+      this->publish_status_("error", slot, "transfer_destination_not_imported");
+      return;
+    }
+    auto &managed = this->slots_[slot];
+    if (static_cast<ManagedSlotState>(journal.record.state) ==
+            ManagedSlotState::ACTIVE &&
+        managed.has_record &&
+        static_cast<ManagedSlotState>(managed.record.state) ==
+            ManagedSlotState::ACTIVE) {
+      this->apply_slot_(static_cast<uint8_t>(slot));
+      this->publish_transfer_event_("transfer_activated", slot, token,
+                                    "resumed");
+      return;
+    }
+    if (static_cast<ManagedSlotState>(journal.record.state) !=
+            ManagedSlotState::ARCHIVED ||
+        !managed.has_record ||
+        static_cast<ManagedSlotState>(managed.record.state) !=
+            ManagedSlotState::ARCHIVED) {
+      this->publish_status_("error", slot, "transfer_destination_not_imported");
+      return;
+    }
+    managed.cover->set_runtime_enabled(false);
+    managed.record.state = static_cast<uint8_t>(ManagedSlotState::ACTIVE);
+    if (!this->save_record_(static_cast<uint8_t>(slot))) {
+      managed.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+      managed.cover->set_runtime_enabled(false);
+      this->publish_status_("error", slot,
+                            "transfer_activate_interrupted_safe_to_retry");
+      return;
+    }
+    journal.record = managed.record;
+    journal.record.checksum = record_checksum_(journal.record);
+    if (!this->save_transfer_journal_(journal)) {
+      managed.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+      this->save_record_(static_cast<uint8_t>(slot));
+      managed.cover->set_runtime_enabled(false);
+      this->publish_status_("error", slot,
+                            "transfer_activate_interrupted_safe_to_retry");
+      return;
+    }
+    this->apply_slot_(static_cast<uint8_t>(slot));
+    this->publish_backup_(static_cast<uint8_t>(slot));
+    this->publish_transfer_event_("transfer_activated", slot, token);
+    return;
+  }
+
+  if (action == "finalize") {
+    if (journal.role !=
+            static_cast<uint8_t>(ManagedTransferRole::DESTINATION) ||
+        static_cast<ManagedSlotState>(journal.record.state) !=
+            ManagedSlotState::ACTIVE ||
+        !this->slots_[slot].has_record ||
+        static_cast<ManagedSlotState>(this->slots_[slot].record.state) !=
+            ManagedSlotState::ACTIVE) {
+      this->publish_status_("error", slot,
+                            "transfer_destination_not_activated");
+      return;
+    }
+    if (!this->erase_transfer_journal_()) {
+      this->publish_status_("error", slot,
+                            "transfer_finalize_interrupted_safe_to_retry");
+      return;
+    }
+    this->publish_transfer_event_("transfer_finalized", slot, token);
+    return;
+  }
+
+  this->publish_status_("error", slot, "unknown_transfer_action");
 }
 
 bool SomfyIohcManager::parse_remote_code_(const std::string &value,
@@ -1200,6 +1785,56 @@ bool SomfyIohcManager::erase_swap_journal_() {
   return err == ESP_OK;
 }
 
+bool SomfyIohcManager::read_transfer_journal_(
+    ManagedTransferJournal &journal, bool &found) {
+  found = false;
+  if (!this->registry_open_)
+    return false;
+  size_t size = sizeof(journal);
+  const esp_err_t err = nvs_get_blob(this->registry_handle_,
+                                     TRANSFER_JOURNAL_KEY, &journal, &size);
+  if (err == ESP_ERR_NVS_NOT_FOUND)
+    return true;
+  if (err != ESP_OK || size != sizeof(journal) ||
+      !transfer_is_valid_(journal)) {
+    ESP_LOGE(TAG,
+             "Cross-bridge transfer journal is invalid; preserving it and "
+             "disabling the manager");
+    return false;
+  }
+  found = true;
+  return true;
+}
+
+bool SomfyIohcManager::save_transfer_journal_(
+    ManagedTransferJournal &journal) {
+  if (!this->registry_open_)
+    return false;
+  journal.checksum = transfer_checksum_(journal);
+  esp_err_t err = nvs_set_blob(this->registry_handle_, TRANSFER_JOURNAL_KEY,
+                               &journal, sizeof(journal));
+  if (err == ESP_OK)
+    err = nvs_commit(this->registry_handle_);
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "Saving cross-bridge transfer journal failed: %s",
+             esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
+bool SomfyIohcManager::erase_transfer_journal_() {
+  if (!this->registry_open_)
+    return false;
+  esp_err_t err = nvs_erase_key(this->registry_handle_, TRANSFER_JOURNAL_KEY);
+  if (err == ESP_ERR_NVS_NOT_FOUND)
+    return true;
+  if (err == ESP_OK)
+    err = nvs_commit(this->registry_handle_);
+  if (err != ESP_OK)
+    ESP_LOGE(TAG, "Erasing cross-bridge transfer journal failed: %s",
+             esp_err_to_name(err));
+  return err == ESP_OK;
+}
+
 ManagedSlotRecord SomfyIohcManager::default_record_(uint8_t slot) {
   ManagedSlotRecord record{};
   record.magic = RECORD_MAGIC;
@@ -1230,6 +1865,17 @@ uint32_t SomfyIohcManager::swap_checksum_(const ManagedSwapJournal &journal) {
   const auto *bytes = reinterpret_cast<const uint8_t *>(&journal);
   uint32_t hash = 2166136261UL;
   for (size_t i = 0; i < offsetof(ManagedSwapJournal, checksum); i++) {
+    hash ^= bytes[i];
+    hash *= 16777619UL;
+  }
+  return hash;
+}
+
+uint32_t SomfyIohcManager::transfer_checksum_(
+    const ManagedTransferJournal &journal) {
+  const auto *bytes = reinterpret_cast<const uint8_t *>(&journal);
+  uint32_t hash = 2166136261UL;
+  for (size_t i = 0; i < offsetof(ManagedTransferJournal, checksum); i++) {
     hash ^= bytes[i];
     hash *= 16777619UL;
   }
@@ -1279,6 +1925,26 @@ bool SomfyIohcManager::swap_is_valid_(const ManagedSwapJournal &journal) {
          (journal.first_record.flags & FLAG_MOVE_PENDING) == 0 &&
          (journal.second_record.flags & FLAG_MOVE_PENDING) == 0 &&
          journal.checksum == swap_checksum_(journal);
+}
+
+bool SomfyIohcManager::transfer_is_valid_(
+    const ManagedTransferJournal &journal) {
+  const auto role = static_cast<ManagedTransferRole>(journal.role);
+  const auto record_state =
+      static_cast<ManagedSlotState>(journal.record.state);
+  return journal.magic == TRANSFER_JOURNAL_MAGIC &&
+         journal.version == TRANSFER_JOURNAL_VERSION &&
+         (role == ManagedTransferRole::SOURCE ||
+          role == ManagedTransferRole::DESTINATION) &&
+         journal.slot < IOHC_MANAGER_MAX_SHUTTERS && journal.reserved == 0 &&
+         journal.token != 0 && record_is_valid_(journal.record) &&
+         ((role == ManagedTransferRole::SOURCE &&
+           record_state == ManagedSlotState::ACTIVE) ||
+          (role == ManagedTransferRole::DESTINATION &&
+           (record_state == ManagedSlotState::ARCHIVED ||
+            record_state == ManagedSlotState::ACTIVE))) &&
+         (journal.record.flags & FLAG_MOVE_PENDING) == 0 &&
+         journal.checksum == transfer_checksum_(journal);
 }
 
 bool SomfyIohcManager::remote_alias_is_valid_(
@@ -1379,6 +2045,20 @@ void SomfyIohcManager::apply_slot_(uint8_t slot) {
   cover->set_runtime_enabled(state == ManagedSlotState::STAGED ||
                              state == ManagedSlotState::PAIR_SENT ||
                              state == ManagedSlotState::ACTIVE);
+}
+
+bool SomfyIohcManager::seed_slot_rolling_code_(uint8_t slot,
+                                               uint16_t next_code) {
+  if (!this->valid_slot_(slot) || next_code == 0)
+    return false;
+  auto &managed = this->slots_[slot];
+  // Always address the journaled destination record's local stream directly.
+  // During early boot the cover storage object does not exist; during a retry
+  // it could still point at the previous empty-slot defaults. The record is
+  // the authoritative transfer destination in both cases.
+  NVSRollingCodeStorage storage(managed.record.storage_namespace,
+                                managed.record.storage_key, next_code);
+  return storage.seedNextCode(next_code);
 }
 
 void SomfyIohcManager::apply_slot_remote_filters_(uint8_t slot) {
@@ -1513,6 +2193,62 @@ bool SomfyIohcManager::recover_pending_swap_() {
   }
   ESP_LOGI(TAG, "Recovered interrupted slot swap %u <-> %u", journal.first_slot,
            journal.second_slot);
+  return true;
+}
+
+bool SomfyIohcManager::recover_pending_transfer_() {
+  ManagedTransferJournal journal{};
+  bool found = false;
+  if (!this->read_transfer_journal_(journal, found))
+    return false;
+  if (!found)
+    return true;
+  if (!this->valid_slot_(journal.slot)) {
+    ESP_LOGE(TAG, "Transfer journal refers to unavailable slot %u",
+             journal.slot);
+    return false;
+  }
+
+  auto &managed = this->slots_[journal.slot];
+  managed.cover->set_runtime_enabled(false);
+  if (static_cast<ManagedTransferRole>(journal.role) ==
+      ManagedTransferRole::SOURCE) {
+    // Whether power failed before or after the source record write, converge
+    // on a durable ARCHIVED copy. It is never re-enabled automatically.
+    managed.record = journal.record;
+    managed.record.state = static_cast<uint8_t>(ManagedSlotState::ARCHIVED);
+    managed.record.flags &= FLAG_FEATURE_MASK;
+    managed.has_record = true;
+    if (!this->save_record_(journal.slot))
+      return false;
+    this->apply_slot_(journal.slot);
+    ESP_LOGW(TAG,
+             "Recovered pending transfer source in slot %u as disabled; "
+             "commit or roll back token %s",
+             journal.slot, format_token_(journal.token).c_str());
+    return true;
+  }
+
+  // Destination import converges to the journaled phase. ARCHIVED remains
+  // disabled; ACTIVE is safe to restore because activation can only be
+  // journaled after the source has already been durably archived.
+  managed.record = journal.record;
+  managed.record.flags &= FLAG_FEATURE_MASK;
+  managed.has_record = true;
+  managed.cover->set_runtime_enabled(false);
+  if (!this->seed_slot_rolling_code_(journal.slot,
+                                     managed.record.initial_rolling_code) ||
+      !this->save_record_(journal.slot)) {
+    return false;
+  }
+  this->apply_slot_(journal.slot);
+  const bool active = static_cast<ManagedSlotState>(managed.record.state) ==
+                      ManagedSlotState::ACTIVE;
+  ESP_LOGW(TAG,
+           "Recovered transfer destination in slot %u as %s; token %s",
+           journal.slot, active ? "active, pending finalize"
+                                : "disabled, pending activate/abort",
+           format_token_(journal.token).c_str());
   return true;
 }
 
@@ -1698,13 +2434,96 @@ void SomfyIohcManager::publish_status_(
   slots += ']';
   char output[384];
   snprintf(output, sizeof(output),
-           "{\"v\":1,\"pair_retry\":true,\"my_queue\":true,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
+           "{\"v\":1,\"pair_retry\":true,\"my_queue\":true,\"multi_bridge\":true,\"mb_caps\":15,\"event\":%" PRIu32 ",\"action\":\"%s\",\"slot\":%" PRId32
            ",\"slots\":%s"
            ",\"steps\":%u"
            ",\"state\":\"%s\",\"node\":\"0x%06" PRIX32 "\",\"remote\":\"0x%06" PRIX32
            "\",\"next\":%u,\"rssi\":%.1f,\"detail\":\"%s\"}",
            this->event_counter_, action, slot, slots.c_str(), step_count,
            state, node, remote, next, rssi, detail);
+  this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::publish_remote_observation_(
+    const char *command, uint32_t remote, uint16_t sequence,
+    bool has_sequence, bool complete, uint8_t steps, float rssi,
+    uint32_t slot_mask) {
+  if (this->status_sensor_ == nullptr)
+    return;
+  this->event_counter_++;
+  char output[384];
+  snprintf(output, sizeof(output),
+           "{\"v\":1,\"observation_v\":1,\"event\":%" PRIu32
+           ",\"action\":\"remote_observation\",\"remote\":\"0x%06" PRIX32
+           "\",\"command\":\"%s\",\"sequence\":%u,\"has_sequence\":%s"
+           ",\"complete\":%s,\"steps\":%u,\"rssi\":%.1f"
+           ",\"slot_mask\":%" PRIu32 "}",
+           this->event_counter_, remote & 0x00FFFFFF, command, sequence,
+           has_sequence ? "true" : "false", complete ? "true" : "false",
+           steps, rssi, slot_mask);
+  this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::publish_relay_event_(
+    const char *action, int32_t slot, const char *command, uint64_t token,
+    const std::string &envelope, const char *detail) {
+  if (this->status_sensor_ == nullptr)
+    return;
+  const std::string token_text = token == 0 ? "" : format_token_(token);
+  char output[384];
+  if (!envelope.empty()) {
+    // Omit the generic event counter here to keep a maximum-size authenticated
+    // relay envelope below ESPHome's text-state limit. relay_token is random,
+    // so every offer is still a distinct state.
+    snprintf(output, sizeof(output),
+             "{\"v\":1,\"relay_v\":1,\"action\":\"%s\",\"slot\":%" PRId32
+             ",\"command\":\"%s\",\"relay_token\":\"%s\""
+             ",\"relay_envelope\":\"%s\"}",
+             action, slot, command, token_text.c_str(), envelope.c_str());
+  } else {
+    this->event_counter_++;
+    snprintf(output, sizeof(output),
+             "{\"v\":1,\"relay_v\":1,\"event\":%" PRIu32
+             ",\"action\":\"%s\",\"slot\":%" PRId32
+             ",\"command\":\"%s\",\"relay_token\":\"%s\""
+             ",\"detail\":\"%s\"}",
+             this->event_counter_, action, slot, command, token_text.c_str(),
+             detail);
+  }
+  this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::publish_transfer_event_(const char *action,
+                                                int32_t slot,
+                                                uint64_t token,
+                                                const char *detail) {
+  if (this->status_sensor_ == nullptr)
+    return;
+  this->event_counter_++;
+  const std::string token_text = token == 0 ? "" : format_token_(token);
+  char output[256];
+  snprintf(output, sizeof(output),
+           "{\"v\":1,\"transfer_v\":1,\"event\":%" PRIu32
+           ",\"action\":\"%s\",\"slot\":%" PRId32
+           ",\"transfer_token\":\"%s\",\"detail\":\"%s\"}",
+           this->event_counter_, action, slot, token_text.c_str(), detail);
+  this->status_sensor_->publish_state(output);
+}
+
+void SomfyIohcManager::publish_transfer_state_(int32_t slot, uint64_t token,
+                                                const char *role,
+                                                const char *phase) {
+  if (this->status_sensor_ == nullptr)
+    return;
+  this->event_counter_++;
+  const std::string token_text = token == 0 ? "" : format_token_(token);
+  char output[256];
+  snprintf(output, sizeof(output),
+           "{\"v\":1,\"transfer_v\":1,\"event\":%" PRIu32
+           ",\"action\":\"transfer_state\",\"slot\":%" PRId32
+           ",\"transfer_token\":\"%s\",\"role\":\"%s\""
+           ",\"phase\":\"%s\"}",
+           this->event_counter_, slot, token_text.c_str(), role, phase);
   this->status_sensor_->publish_state(output);
 }
 
@@ -1816,22 +2635,457 @@ void SomfyIohcManager::on_iohc_packet_(const IohcDecodedPacket &packet) {
       return;
     }
   }
-  if (this->discovery_slot_ < 0 || packet.cmd != iohc_cmd::CMD_EXECUTE ||
-      packet.data == nullptr || packet.data_len < 4)
+  if (packet.src_node == 0 || packet.src_node == iohc::BROADCAST_ADDR ||
+      this->node_id_in_use_(packet.src_node) ||
+      packet.dest_node != iohc::BROADCAST_ADDR || packet.data == nullptr)
     return;
-  if (this->node_id_in_use_(packet.src_node))
-    return;
-  const uint8_t slot = static_cast<uint8_t>(this->discovery_slot_);
-  this->discovery_slot_ = -1;
-  auto &record = this->slots_[slot].record;
-  record.physical_remote = packet.src_node & 0x00FFFFFF;
-  if (!this->save_record_(slot)) {
-    this->publish_status_("error", slot, "storage_write_failed");
+
+  // Commissioning discovery remains compatible, but only an ordinary user
+  // movement EXECUTE can claim the staged slot. The same packet is then also
+  // eligible for the bridge-wide normalized observation path below.
+  if (this->discovery_slot_ >= 0 && packet.cmd == iohc_cmd::CMD_EXECUTE &&
+      packet.data_len >= 4 && packet.data[0] == iohc_cmd::ORIGINATOR_USER &&
+      packet.data[1] == iohc_cmd::ACEI_DEFAULT) {
+    const uint16_t param =
+        (static_cast<uint16_t>(packet.data[2]) << 8) | packet.data[3];
+    if (param == iohc_cmd::MP_OPEN || param == iohc_cmd::MP_CLOSE) {
+      const uint8_t slot = static_cast<uint8_t>(this->discovery_slot_);
+      this->discovery_slot_ = -1;
+      auto &record = this->slots_[slot].record;
+      record.physical_remote = packet.src_node & 0x00FFFFFF;
+      if (!this->save_record_(slot)) {
+        this->publish_status_("error", slot, "storage_write_failed");
+        return;
+      }
+      this->apply_slot_(slot);
+      this->publish_status_("remote_detected", slot, "", packet.rssi);
+      this->publish_backup_(slot);
+      return;
+    }
+  }
+
+  uint16_t sequence = 0;
+  const bool has_sequence = iohc_proto::extract_sequence_1w(
+      packet.data, packet.data_len, sequence);
+
+  if (packet.cmd == iohc_cmd::CMD_BUTTON_EVENT && packet.data_len >= 6 &&
+      packet.data[0] == 0x02 && packet.data[1] == 0xFF &&
+      packet.data[2] == iohc_cmd::ORIGINATOR_USER &&
+      packet.data[3] == iohc_cmd::ACEI_DEFAULT) {
+    const uint8_t action = packet.data[4];
+    const uint8_t phase = packet.data[5];
+    const uint16_t code = static_cast<uint16_t>(0xF000U | action);
+    if (this->observed_frame_duplicate_(packet.src_node, code, sequence,
+                                        has_sequence)) {
+      return;
+    }
+    if (action == iohc_cmd::BUTTON_ACTION_STOP_MY && phase == 0x0C) {
+      const bool matches_prefix = this->pending_observed_stop_.active &&
+          iohc_proto::gesture_terminal_matches_prefix(
+              this->pending_observed_stop_.remote,
+              this->pending_observed_stop_.sequence,
+              this->pending_observed_stop_.has_sequence, packet.src_node,
+              sequence, has_sequence);
+      if (matches_prefix) {
+        const float strongest_rssi =
+            std::max(packet.rssi, this->pending_observed_stop_.rssi);
+        this->pending_observed_stop_ = {};
+        // Use the terminal event sequence on every bridge. A bridge which
+        // missed the D200 prefix will therefore still produce the same
+        // cross-bridge deduplication key.
+        this->emit_observation_("stop_my", packet.src_node, strongest_rssi,
+                                sequence, has_sequence, 1, true);
+      } else {
+        if (this->pending_observed_stop_.active)
+          this->flush_observed_stop_();
+        this->emit_observation_("stop_my", packet.src_node, packet.rssi,
+                                sequence, has_sequence, 1, true);
+      }
+      return;
+    }
+    if (action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE ||
+        action == iohc_cmd::BUTTON_ACTION_TILT_COUNTERCLOCKWISE) {
+      uint8_t steps = 1;
+      float strongest_rssi = packet.rssi;
+      const bool matches_prefix = this->pending_observed_stop_.active &&
+          iohc_proto::gesture_terminal_matches_prefix(
+              this->pending_observed_stop_.remote,
+              this->pending_observed_stop_.sequence,
+              this->pending_observed_stop_.has_sequence, packet.src_node,
+              sequence, has_sequence);
+      if (matches_prefix) {
+        steps = this->pending_observed_stop_.steps;
+        strongest_rssi =
+            std::max(strongest_rssi, this->pending_observed_stop_.rssi);
+        this->pending_observed_stop_ = {};
+      } else if (this->pending_observed_stop_.active) {
+        this->flush_observed_stop_();
+      }
+      this->emit_observation_(
+          action == iohc_cmd::BUTTON_ACTION_TILT_CLOCKWISE
+              ? "tilt_clockwise"
+              : "tilt_counterclockwise",
+          packet.src_node, strongest_rssi, sequence, has_sequence, steps,
+          true);
+      return;
+    }
     return;
   }
-  this->apply_slot_(slot);
-  this->publish_status_("remote_detected", slot, "", packet.rssi);
-  this->publish_backup_(slot);
+
+  if (packet.cmd != iohc_cmd::CMD_EXECUTE || packet.data_len < 12 ||
+      packet.data[0] != iohc_cmd::ORIGINATOR_USER ||
+      packet.data[1] != iohc_cmd::ACEI_DEFAULT) {
+    return;
+  }
+  const uint16_t main_param =
+      (static_cast<uint16_t>(packet.data[2]) << 8) | packet.data[3];
+  if (this->observed_frame_duplicate_(packet.src_node, main_param, sequence,
+                                      has_sequence)) {
+    if (main_param == iohc_cmd::MP_STOP &&
+        this->pending_observed_stop_.active &&
+        this->pending_observed_stop_.remote == packet.src_node &&
+        packet.rssi > this->pending_observed_stop_.rssi) {
+      this->pending_observed_stop_.rssi = packet.rssi;
+    }
+    return;
+  }
+
+  if (main_param == iohc_cmd::MP_OPEN || main_param == iohc_cmd::MP_CLOSE) {
+    if (this->pending_observed_stop_.active &&
+        this->pending_observed_stop_.remote == packet.src_node)
+      this->flush_observed_stop_();
+    this->emit_observation_(main_param == iohc_cmd::MP_OPEN ? "open" : "close",
+                            packet.src_node, packet.rssi, sequence,
+                            has_sequence, 1);
+    return;
+  }
+  if (main_param == iohc_cmd::MP_MY) {
+    this->emit_observation_("stop_my", packet.src_node, packet.rssi,
+                            sequence, has_sequence, 1);
+    return;
+  }
+  if (main_param != iohc_cmd::MP_STOP)
+    return;
+
+  uint8_t tilt_steps = 1;
+  if (packet.data_len >= 16 && packet.data[4] == 0x20 &&
+      packet.data[7] == 0x00) {
+    const uint16_t magnitude =
+        (static_cast<uint16_t>(packet.data[5]) << 8) | packet.data[6];
+    const int32_t delta = static_cast<int32_t>(magnitude) -
+                          iohc_cmd::TILT_MAGNITUDE_CENTER;
+    const uint32_t distance =
+        delta < 0 ? static_cast<uint32_t>(-delta)
+                  : static_cast<uint32_t>(delta);
+    const uint32_t units =
+        (distance + iohc_cmd::TILT_MAGNITUDE_UNIT / 2U) /
+        iohc_cmd::TILT_MAGNITUDE_UNIT;
+    const uint32_t effective =
+        units <= 1
+            ? 1
+            : (units + iohc_cmd::TILT_MAGNITUDE_UNITS_PER_STEP / 2U) /
+                  iohc_cmd::TILT_MAGNITUDE_UNITS_PER_STEP;
+    tilt_steps = static_cast<uint8_t>(clamp<uint32_t>(effective, 1U, 254U));
+  }
+  this->stage_observed_stop_(packet.src_node, packet.rssi, sequence,
+                             has_sequence, tilt_steps);
+}
+
+void SomfyIohcManager::stage_observed_stop_(uint32_t remote, float rssi,
+                                            uint16_t sequence,
+                                            bool has_sequence,
+                                            uint8_t steps) {
+  if (this->pending_observed_stop_.active &&
+      this->pending_observed_stop_.remote != (remote & 0x00FFFFFF)) {
+    this->flush_observed_stop_();
+  }
+  this->pending_observed_stop_.active = true;
+  this->pending_observed_stop_.remote = remote & 0x00FFFFFF;
+  this->pending_observed_stop_.rssi = rssi;
+  this->pending_observed_stop_.sequence = sequence;
+  this->pending_observed_stop_.has_sequence = has_sequence;
+  this->pending_observed_stop_.steps = std::max<uint8_t>(steps, 1);
+  this->pending_observed_stop_.deadline_ms =
+      millis() + iohc_cmd::RX_GESTURE_CORRELATION_MS;
+}
+
+void SomfyIohcManager::flush_observed_stop_() {
+  if (!this->pending_observed_stop_.active)
+    return;
+  const PendingObservedStop pending = this->pending_observed_stop_;
+  this->pending_observed_stop_ = {};
+  this->emit_observation_("stop_my", pending.remote, pending.rssi,
+                          pending.sequence, pending.has_sequence, 1, false);
+}
+
+bool SomfyIohcManager::observed_frame_duplicate_(uint32_t remote,
+                                                 uint16_t code,
+                                                 uint16_t sequence,
+                                                 bool has_sequence) {
+  const uint32_t now = millis();
+  while (!this->recent_observed_frames_.empty() &&
+         now - this->recent_observed_frames_.front().seen_ms >=
+             OBSERVATION_DEDUP_WINDOW_MS) {
+    this->recent_observed_frames_.pop_front();
+  }
+  for (auto &recent : this->recent_observed_frames_) {
+    const bool same = recent.remote == (remote & 0x00FFFFFF) &&
+                      recent.code == code &&
+                      recent.has_sequence == has_sequence &&
+                      (has_sequence ? recent.sequence == sequence : true);
+    if (same)
+      return true;
+  }
+  if (this->recent_observed_frames_.size() >= OBSERVATION_DEDUP_CAPACITY)
+    this->recent_observed_frames_.pop_front();
+  this->recent_observed_frames_.push_back(
+      {remote & 0x00FFFFFF, code, sequence, now, has_sequence});
+  return false;
+}
+
+uint32_t SomfyIohcManager::slots_for_remote_(uint32_t remote) const {
+  uint32_t mask = 0;
+  const int8_t alias_index = this->find_remote_alias_(remote);
+  for (uint8_t slot = 0; slot < this->slots_.size(); slot++) {
+    const auto &managed = this->slots_[slot];
+    if (!managed.has_record ||
+        static_cast<ManagedSlotState>(managed.record.state) !=
+            ManagedSlotState::ACTIVE) {
+      continue;
+    }
+    bool matches = managed.record.physical_remote ==
+                   (remote & 0x00FFFFFF);
+    if (!matches && alias_index >= 0) {
+      matches = this->remote_alias_contains_node_(
+          this->remote_aliases_[alias_index].record,
+          managed.record.node_id);
+    }
+    if (matches)
+      mask |= uint32_t{1} << slot;
+  }
+  return mask;
+}
+
+bool SomfyIohcManager::apply_observation_to_slot_(uint8_t slot,
+                                                  const std::string &command,
+                                                  uint8_t steps) {
+  if (!this->valid_slot_(slot))
+    return false;
+  auto &managed = this->slots_[slot];
+  if (!managed.has_record ||
+      static_cast<ManagedSlotState>(managed.record.state) !=
+          ManagedSlotState::ACTIVE) {
+    return false;
+  }
+  if (command == "open")
+    managed.cover->runtime_observe_command(iohc_cmd::MP_OPEN);
+  else if (command == "close")
+    managed.cover->runtime_observe_command(iohc_cmd::MP_CLOSE);
+  else if (command == "stop_my")
+    managed.cover->runtime_observe_command(iohc_cmd::MP_STOP);
+  else if (command == "tilt_clockwise") {
+    if (!managed.cover->is_venetian())
+      return false;
+    managed.cover->runtime_observe_tilt(true, steps);
+  } else if (command == "tilt_counterclockwise") {
+    if (!managed.cover->is_venetian())
+      return false;
+    managed.cover->runtime_observe_tilt(false, steps);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+void SomfyIohcManager::emit_observation_(const char *command,
+                                         uint32_t remote, float rssi,
+                                         uint16_t sequence,
+                                         bool has_sequence, uint8_t steps,
+                                         bool complete) {
+  const uint32_t slot_mask = this->slots_for_remote_(remote);
+  if (complete) {
+    for (uint8_t slot = 0; slot < this->slots_.size(); slot++) {
+      if ((slot_mask & (uint32_t{1} << slot)) != 0)
+        this->apply_observation_to_slot_(slot, command, steps);
+    }
+  }
+  this->accepted_remote_command_count_++;
+  this->publish_remote_observation_(command, remote, sequence, has_sequence,
+                                    complete, steps, rssi, slot_mask);
+}
+
+void SomfyIohcManager::on_relayable_frame_(
+    uint8_t slot, uint16_t main_param, const std::vector<uint8_t> &frame,
+    uint8_t repeat_count) {
+  if (!this->relay_capture_active_ || slot != this->relay_capture_slot_ ||
+      main_param != this->relay_capture_param_)
+    return;
+  this->relay_capture_completed_ = true;
+
+  uint16_t validated_param = 0;
+  uint16_t sequence = 0;
+  if (!validate_relay_frame_(frame, validated_param, sequence) ||
+      validated_param != main_param) {
+    this->publish_status_("error", slot, "primary_frame_not_relayable");
+    return;
+  }
+  std::string envelope;
+  if (!this->encrypt_relay_envelope_(this->relay_capture_token_, main_param,
+                                     frame, repeat_count, envelope)) {
+    this->publish_status_("error", slot, "relay_envelope_encryption_failed");
+    return;
+  }
+  const char *command = main_param == iohc_cmd::MP_OPEN
+                            ? "open"
+                            : (main_param == iohc_cmd::MP_CLOSE ? "close"
+                                                                : "stop");
+  this->publish_relay_event_("relay_offer", slot, command,
+                             this->relay_capture_token_, envelope);
+}
+
+bool SomfyIohcManager::validate_relay_frame_(
+    const std::vector<uint8_t> &frame, uint16_t &main_param,
+    uint16_t &sequence) {
+  // Exact canonical ordinary 1W EXECUTE shape. Extended D200 (MY/tilt),
+  // button events, position payloads, PROG/remove/key-transfer, addressed
+  // frames and first-copy wake-bit variants are all rejected.
+  if (frame.size() != 25 || frame[0] != 0xF6 || frame[1] != 0x00 ||
+      frame[2] != 0x00 || frame[3] != 0x00 || frame[4] != 0x3F ||
+      (frame[5] == 0 && frame[6] == 0 && frame[7] == 0) ||
+      (frame[5] == 0 && frame[6] == 0 &&
+       frame[7] == static_cast<uint8_t>(iohc::BROADCAST_ADDR)) ||
+      frame[8] != iohc_cmd::CMD_EXECUTE ||
+      frame[9] != iohc_cmd::ORIGINATOR_USER ||
+      frame[10] != iohc_cmd::ACEI_DEFAULT || frame[13] != 0x00 ||
+      frame[14] != 0x00) {
+    return false;
+  }
+  const size_t declared_length = 1U + (frame[0] & 0x1FU) + 2U;
+  if (declared_length != frame.size())
+    return false;
+  if (crc16_kermit(frame.data(), frame.size()) != 0)
+    return false;
+  main_param = (static_cast<uint16_t>(frame[11]) << 8U) | frame[12];
+  if (main_param != iohc_cmd::MP_OPEN && main_param != iohc_cmd::MP_CLOSE &&
+      main_param != iohc_cmd::MP_STOP) {
+    return false;
+  }
+  sequence = (static_cast<uint16_t>(frame[15]) << 8U) | frame[16];
+  return sequence != 0;
+}
+
+bool SomfyIohcManager::encrypt_relay_envelope_(
+    uint64_t token, uint16_t main_param, const std::vector<uint8_t> &frame,
+    uint8_t repeat_count, std::string &output) const {
+  (void) main_param;  // recovered by strict frame validation on the relay
+  if (!this->has_relay_key_ || token == 0 || frame.empty() ||
+      frame.size() > 64 || repeat_count == 0 || repeat_count > 20)
+    return false;
+
+  std::vector<uint8_t> plaintext;
+  plaintext.reserve(10 + frame.size());
+  for (int shift = 56; shift >= 0; shift -= 8)
+    plaintext.push_back(static_cast<uint8_t>(token >> shift));
+  plaintext.push_back(repeat_count);
+  plaintext.push_back(static_cast<uint8_t>(frame.size()));
+  plaintext.insert(plaintext.end(), frame.begin(), frame.end());
+
+  std::vector<uint8_t> envelope(
+      1 + GCM_NONCE_SIZE + plaintext.size() + GCM_TAG_SIZE);
+  envelope[0] = RELAY_ENVELOPE_VERSION;
+  uint8_t *nonce = envelope.data() + 1;
+  uint8_t *ciphertext = nonce + GCM_NONCE_SIZE;
+  uint8_t *tag = ciphertext + plaintext.size();
+  esp_fill_random(nonce, GCM_NONCE_SIZE);
+
+  mbedtls_gcm_context context;
+  mbedtls_gcm_init(&context);
+  int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES,
+                                  this->relay_key_, 128);
+  if (result == 0) {
+    result = mbedtls_gcm_crypt_and_tag(
+        &context, MBEDTLS_GCM_ENCRYPT, plaintext.size(), nonce,
+        GCM_NONCE_SIZE, reinterpret_cast<const uint8_t *>(RELAY_GCM_AAD),
+        sizeof(RELAY_GCM_AAD) - 1, plaintext.data(), ciphertext,
+        GCM_TAG_SIZE, tag);
+  }
+  mbedtls_gcm_free(&context);
+  if (result != 0)
+    return false;
+  output = hex_encode(envelope.data(), envelope.size());
+  return output.size() <= MAX_STATE_LEN;
+}
+
+bool SomfyIohcManager::decrypt_relay_envelope_(
+    const std::string &input, uint64_t &token, uint16_t &main_param,
+    std::vector<uint8_t> &frame, uint8_t &repeat_count) const {
+  token = 0;
+  main_param = 0;
+  repeat_count = 0;
+  frame.clear();
+  if (!this->has_relay_key_)
+    return false;
+  std::vector<uint8_t> envelope;
+  if (!hex_decode(input, envelope) ||
+      envelope.size() < 1 + GCM_NONCE_SIZE + 10 + GCM_TAG_SIZE ||
+      envelope[0] != RELAY_ENVELOPE_VERSION) {
+    return false;
+  }
+  const size_t plaintext_size =
+      envelope.size() - 1 - GCM_NONCE_SIZE - GCM_TAG_SIZE;
+  const uint8_t *nonce = envelope.data() + 1;
+  const uint8_t *ciphertext = nonce + GCM_NONCE_SIZE;
+  const uint8_t *tag = ciphertext + plaintext_size;
+  std::vector<uint8_t> plaintext(plaintext_size);
+
+  mbedtls_gcm_context context;
+  mbedtls_gcm_init(&context);
+  int result = mbedtls_gcm_setkey(&context, MBEDTLS_CIPHER_ID_AES,
+                                  this->relay_key_, 128);
+  if (result == 0) {
+    result = mbedtls_gcm_auth_decrypt(
+        &context, plaintext_size, nonce, GCM_NONCE_SIZE,
+        reinterpret_cast<const uint8_t *>(RELAY_GCM_AAD),
+        sizeof(RELAY_GCM_AAD) - 1, tag, GCM_TAG_SIZE, ciphertext,
+        plaintext.data());
+  }
+  mbedtls_gcm_free(&context);
+  if (result != 0)
+    return false;
+
+  for (size_t index = 0; index < 8; index++)
+    token = (token << 8U) | plaintext[index];
+  repeat_count = plaintext[8];
+  const size_t frame_size = plaintext[9];
+  if (token == 0 || frame_size == 0 || frame_size > 64 ||
+      plaintext.size() != 10 + frame_size) {
+    return false;
+  }
+  frame.assign(plaintext.begin() + 10, plaintext.end());
+  uint16_t sequence = 0;
+  return validate_relay_frame_(frame, main_param, sequence);
+}
+
+bool SomfyIohcManager::parse_token_(const std::string &value,
+                                    uint64_t &token) {
+  if (value.size() != 16)
+    return false;
+  token = 0;
+  for (char ch : value) {
+    const int digit = hex_digit(ch);
+    if (digit < 0)
+      return false;
+    token = (token << 4U) | static_cast<uint64_t>(digit);
+  }
+  return token != 0;
+}
+
+std::string SomfyIohcManager::format_token_(uint64_t token) {
+  char output[17];
+  snprintf(output, sizeof(output), "%08" PRIX32 "%08" PRIX32,
+           static_cast<uint32_t>(token >> 32U),
+           static_cast<uint32_t>(token));
+  return output;
 }
 
 bool SomfyIohcManager::encrypt_record_(

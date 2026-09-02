@@ -21,6 +21,7 @@ CONF_SOMFY_ID = "somfy_id"
 CONF_STATUS_SENSOR = "status_sensor"
 CONF_BACKUP_SENSOR = "backup_sensor"
 CONF_BACKUP_KEY = "backup_key"
+CONF_RELAY_KEY = "relay_key"
 CONF_MAX_SHUTTERS = "max_shutters"
 CONF_IMPORTS = "imports"
 CONF_SLOT = "slot"
@@ -89,6 +90,11 @@ CONFIG_SCHEMA = cv.All(
             cv.Required(CONF_STATUS_SENSOR): cv.use_id(text_sensor.TextSensor),
             cv.Required(CONF_BACKUP_SENSOR): cv.use_id(text_sensor.TextSensor),
             cv.Required(CONF_BACKUP_KEY): mark_sensitive(validate_hex_key),
+            # Cluster transport key used only to authenticate/encrypt opaque
+            # exact-frame relay envelopes. It never replaces a shutter's
+            # controller key. Defaulting to backup_key keeps existing manager
+            # YAML valid while allowing operators to rotate it independently.
+            cv.Optional(CONF_RELAY_KEY): mark_sensitive(validate_hex_key),
             cv.Optional(CONF_MAX_SHUTTERS, default=DEFAULT_MAX_SHUTTERS): cv.int_range(
                 min=1, max=32
             ),
@@ -111,6 +117,7 @@ async def to_code(config):
     cg.add(var.set_status_sensor(status))
     cg.add(var.set_backup_sensor(backup))
     cg.add(var.set_backup_key(config[CONF_BACKUP_KEY]))
+    cg.add(var.set_relay_key(config.get(CONF_RELAY_KEY, config[CONF_BACKUP_KEY])))
     cg.add(var.set_max_shutters(config[CONF_MAX_SHUTTERS]))
     cg.add(var.set_cover_device_class_index(register_device_class("shutter")))
 

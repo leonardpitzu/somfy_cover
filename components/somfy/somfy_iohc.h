@@ -180,10 +180,22 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
       std::function<void(uint16_t, uint32_t, float, uint8_t)> callback) {
     this->remote_command_callback_ = std::move(callback);
   }
+  void set_relay_frame_callback(
+      std::function<void(uint16_t, const std::vector<uint8_t> &, uint8_t)> callback) {
+    this->relay_frame_callback_ = std::move(callback);
+  }
+  // A manager-owned cover is decoded centrally by SomfyIohcManager. This
+  // avoids one physical packet advancing the estimator twice while allowing
+  // YAML-defined standalone covers to retain their original RX path.
+  void set_manager_rx_owned(bool owned) { this->manager_rx_owned_ = owned; }
   void set_my_sequence_complete_callback(std::function<void()> callback) {
     this->my_sequence_complete_callback_ = std::move(callback);
   }
+  void set_tilt_sequence_complete_callback(std::function<void()> callback) {
+    this->tilt_sequence_complete_callback_ = std::move(callback);
+  }
   uint16_t peek_next_rolling_code() const;
+  bool runtime_seed_rolling_code(uint16_t next_code);
   void runtime_clear_receive_remote_codes();
   bool runtime_program();
   void runtime_open();
@@ -194,6 +206,10 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void runtime_set_tilt(float tilt);
   void runtime_tilt_step(bool clockwise);
   void runtime_stop_tilt() { this->cancel_1w_tilt_sequence(); }
+  // Estimator-only hooks for cross-bridge observations. They deliberately do
+  // not enter control(), build a frame, or consume a rolling code.
+  void runtime_observe_command(uint16_t main_param);
+  void runtime_observe_tilt(bool clockwise, uint8_t steps);
   void runtime_setup() { this->call_setup(); }
   void runtime_loop() { this->call(); }
 
@@ -259,8 +275,13 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   std::function<void(uint16_t)> rolling_code_callback_;
   std::function<void(uint16_t, uint32_t, float, uint8_t)>
       remote_command_callback_;
+  std::function<void(uint16_t, const std::vector<uint8_t> &, uint8_t)>
+      relay_frame_callback_;
   std::function<void()> my_sequence_complete_callback_;
+  std::function<void()> tilt_sequence_complete_callback_;
   bool my_sequence_active_{false};
+  bool tilt_sequence_active_{false};
+  bool manager_rx_owned_{false};
 
   // Cover trigger wiring (open/close/stop -> radio commands)
   std::unique_ptr<Automation<>> open_automation_;
@@ -293,6 +314,7 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   void start_tilt_steps_(int16_t steps, int8_t logical_direction, float target);
   void send_next_tilt_step_();
   void cancel_1w_tilt_sequence();
+  void finish_1w_tilt_sequence_();
   // Build a complete ordinary 1W frame. The MAC authenticates
   // cmd || data[0..auth_len); auth_len defaults to the full data length.
   // Pairing's special no-MAC 0x30 frame uses the protocol helper directly.

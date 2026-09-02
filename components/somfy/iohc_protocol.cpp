@@ -229,6 +229,21 @@ bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequenc
   return true;
 }
 
+bool gesture_terminal_matches_prefix(uint32_t prefix_remote,
+                                     uint16_t prefix_sequence,
+                                     bool prefix_has_sequence,
+                                     uint32_t terminal_remote,
+                                     uint16_t terminal_sequence,
+                                     bool terminal_has_sequence) {
+  if ((prefix_remote & 0x00FFFFFFU) !=
+      (terminal_remote & 0x00FFFFFFU)) {
+    return false;
+  }
+  if (!prefix_has_sequence || !terminal_has_sequence)
+    return true;
+  return terminal_sequence == static_cast<uint16_t>(prefix_sequence + 1U);
+}
+
 bool RxBurstDeduplicator::is_duplicate(uint32_t now_ms, uint32_t src, uint16_t main_param,
                                        uint16_t sequence, bool has_sequence, uint32_t window_ms) {
   const bool same_frame = has_sequence && this->has_sequence_

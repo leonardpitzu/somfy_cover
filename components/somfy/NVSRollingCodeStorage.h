@@ -29,6 +29,10 @@ public:
   ~NVSRollingCodeStorage() override;
   /// Return the next persisted code without consuming it, or 0 on error.
   uint16_t peekNextCode();
+  /// Explicitly replace the next persisted code. This is reserved for a
+  /// guarded cross-bridge identity transfer into a disabled destination slot;
+  /// ordinary commands must only advance through nextCode().
+  bool seedNextCode(uint16_t code);
   /// Consume and persist the next code, or return 0 without transmitting on error.
   uint16_t nextCode() override;
 };

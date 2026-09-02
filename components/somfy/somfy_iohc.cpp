@@ -103,11 +103,25 @@ void SomfyIohcCover::set_venetian(bool enabled, uint8_t tilt_steps,
 }
 
 void SomfyIohcCover::set_runtime_enabled(bool enabled) {
-  this->runtime_enabled_ = enabled;
+  if (!enabled) {
+    // A transfer/archive is a hard RF ownership boundary. Cancel every delayed
+    // gesture and freeze the time-based estimator without firing its normal
+    // STOP trigger; otherwise an intermediate-position timer could transmit
+    // after this identity had been handed to another bridge.
+    this->cancel_1w_my_sequence();
+    this->cancel_1w_tilt_sequence();
 #ifdef USE_SOMFY_IOHC_RX
-  if (!enabled)
     this->clear_pending_rx_stop_();
+    this->rx_sync_.stop();
 #endif
+    if (this->current_operation != cover::COVER_OPERATION_IDLE) {
+      this->recompute_position_();
+      this->current_operation = cover::COVER_OPERATION_IDLE;
+      this->stop_prev_trigger_();
+      this->publish_state();
+    }
+  }
+  this->runtime_enabled_ = enabled;
 }
 
 cover::CoverTraits SomfyIohcCover::get_traits() {
@@ -130,6 +144,10 @@ void SomfyIohcCover::reconfigure_storage(const char *ns, const char *key, uint16
 
 uint16_t SomfyIohcCover::peek_next_rolling_code() const {
   return this->storage_ == nullptr ? 0 : this->storage_->peekNextCode();
+}
+
+bool SomfyIohcCover::runtime_seed_rolling_code(uint16_t next_code) {
+  return this->storage_ != nullptr && this->storage_->seedNextCode(next_code);
 }
 
 void SomfyIohcCover::runtime_clear_receive_remote_codes() {
@@ -181,6 +199,27 @@ void SomfyIohcCover::runtime_tilt_step(bool clockwise) {
   const float target = clamp(this->tilt + logical_direction / static_cast<float>(this->tilt_steps_),
                              0.0f, 1.0f);
   this->start_tilt_steps_(1, logical_direction, target);
+}
+
+void SomfyIohcCover::runtime_observe_command(uint16_t main_param) {
+#ifdef USE_SOMFY_IOHC_RX
+  if (!this->runtime_enabled_)
+    return;
+  this->handle_rx_command_(main_param);
+#else
+  (void) main_param;
+#endif
+}
+
+void SomfyIohcCover::runtime_observe_tilt(bool clockwise, uint8_t steps) {
+#ifdef USE_SOMFY_IOHC_RX
+  if (!this->runtime_enabled_ || !this->venetian_)
+    return;
+  this->handle_rx_tilt_steps_(clockwise, std::max<uint8_t>(steps, 1));
+#else
+  (void) clockwise;
+  (void) steps;
+#endif
 }
 
 // ---------------------------------------------------------------------------
@@ -268,6 +307,8 @@ void SomfyIohcCover::dump_config() {
 // ---------------------------------------------------------------------------
 
 void SomfyIohcCover::open() {
+  if (!this->runtime_enabled_)
+    return;
   this->cancel_1w_my_sequence();
   this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "OPEN node=0x%06" PRIX32 " mode=%s", this->node_id_,
@@ -280,6 +321,8 @@ void SomfyIohcCover::open() {
 }
 
 void SomfyIohcCover::close() {
+  if (!this->runtime_enabled_)
+    return;
   this->cancel_1w_my_sequence();
   this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "CLOSE node=0x%06" PRIX32 " mode=%s", this->node_id_,
@@ -292,6 +335,8 @@ void SomfyIohcCover::close() {
 }
 
 void SomfyIohcCover::stop() {
+  if (!this->runtime_enabled_)
+    return;
   this->cancel_1w_my_sequence();
   this->cancel_1w_tilt_sequence();
   ESP_LOGD(TAG, "STOP node=0x%06" PRIX32 " mode=%s", this->node_id_,
@@ -303,6 +348,8 @@ void SomfyIohcCover::stop() {
 }
 
 void SomfyIohcCover::my() {
+  if (!this->runtime_enabled_)
+    return;
   // RF semantics do not depend on our time-based position estimate. A
   // dedicated MY action first sends stop-only D200, then emits the full native
   // MY sequence after the motor has settled. It therefore always means "go to
@@ -444,6 +491,9 @@ bool SomfyIohcCover::send_1w_command(uint16_t main_param) {
   // configurable per shutter for unusually strong/weak RF paths; pairing uses
   // the separate four-copy remote pattern above.
   this->hub_->transmit_packet(frame, static_cast<uint8_t>(this->repeat_count_));
+  if (this->relay_frame_callback_)
+    this->relay_frame_callback_(main_param, frame,
+                                static_cast<uint8_t>(this->repeat_count_));
   return true;
 }
 
@@ -601,6 +651,8 @@ void SomfyIohcCover::set_tilt_target_(float target) {
   if (steps == 0) {
     this->tilt = reachable_target;
     this->publish_state();
+    if (this->tilt_sequence_complete_callback_)
+      this->tilt_sequence_complete_callback_();
     return;
   }
   this->start_tilt_steps_(steps, step_delta > 0 ? 1 : -1,
@@ -611,6 +663,7 @@ void SomfyIohcCover::start_tilt_steps_(int16_t steps, int8_t logical_direction,
                                        float target) {
   this->cancel_1w_my_sequence();
   this->cancel_1w_tilt_sequence();
+  this->tilt_sequence_active_ = true;
 
 #ifdef USE_SOMFY_IOHC_RX
   if (this->rx_sync_.active())
@@ -657,6 +710,7 @@ void SomfyIohcCover::send_next_tilt_step_() {
       this->tilt = this->tilt_target_;
       this->tilt_direction_ = 0;
       this->publish_state();
+      this->finish_1w_tilt_sequence_();
       return;
     }
 
@@ -675,6 +729,15 @@ void SomfyIohcCover::cancel_1w_tilt_sequence() {
   this->cancel_timeout("iohc-tilt-next");
   this->tilt_steps_remaining_ = 0;
   this->tilt_direction_ = 0;
+  this->finish_1w_tilt_sequence_();
+}
+
+void SomfyIohcCover::finish_1w_tilt_sequence_() {
+  if (!this->tilt_sequence_active_)
+    return;
+  this->tilt_sequence_active_ = false;
+  if (this->tilt_sequence_complete_callback_)
+    this->tilt_sequence_complete_callback_();
 }
 
 void SomfyIohcCover::cancel_1w_my_sequence() {
@@ -812,6 +875,8 @@ void SomfyIohcCover::on_iohc_packet_(const IohcDecodedPacket &pkt) {
     return;
 
 #ifdef USE_SOMFY_IOHC_RX
+  if (this->manager_rx_owned_)
+    return;
   // --- State-sync + discovery: surface movement commands sent by physical
   //     io-homecontrol remotes so the HA UI matches the motor when driven
   //     outside HA. Runs for both 1W and 2W covers — a foreign remote command
