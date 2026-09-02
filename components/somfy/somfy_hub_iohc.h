@@ -166,6 +166,8 @@ class SomfyIohcHub : public Component,
   // length validation, and protocol CRC.
   uint32_t get_rx_raw_packet_count() const { return this->rx_raw_packet_count_; }
   uint32_t get_rx_valid_frame_count() const { return this->rx_valid_frame_count_; }
+  float get_last_raw_frequency_offset() const { return this->last_raw_frequency_offset_; }
+  float get_last_raw_rssi() const { return this->last_raw_rssi_; }
   float get_last_valid_rssi() const { return this->last_valid_rssi_; }
 
   // CC1101Listener interface
@@ -188,6 +190,8 @@ class SomfyIohcHub : public Component,
   std::vector<IohcRxCallback> rx_callbacks_;
   uint32_t rx_raw_packet_count_{0};
   uint32_t rx_valid_frame_count_{0};
+  float last_raw_frequency_offset_{0.0f};
+  float last_raw_rssi_{0.0f};
   float last_valid_rssi_{0.0f};
 
   // 2W session management

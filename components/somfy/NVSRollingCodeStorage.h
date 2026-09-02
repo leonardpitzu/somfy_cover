@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <nvs.h>
 
 #include "RollingCodeStorage.h"
@@ -14,8 +15,10 @@
  */
 class NVSRollingCodeStorage : public RollingCodeStorage {
 private:
-  const char *name_;
-  const char *key_;
+  // Own the identity instead of relying on the caller to keep C strings alive
+  // for the complete lifetime of this storage object.
+  std::string name_;
+  std::string key_;
   nvs_handle handle_{0};
   bool opened_{false};
   uint16_t initial_code_{1};

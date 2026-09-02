@@ -2576,13 +2576,15 @@ void SomfyIohcManager::flush_pending_remote_command_() {
 }
 
 void SomfyIohcManager::publish_rx_stats_(int32_t slot) {
-  char detail[128];
+  char detail[192];
   snprintf(detail, sizeof(detail),
            "raw=%" PRIu32 ",valid=%" PRIu32 ",accepted=%" PRIu32
-           ",last_rssi=%.1f",
+           ",last_rssi=%.1f,raw_rssi=%.1f,freq_offset=%.0f",
            this->hub_->get_rx_raw_packet_count(),
            this->hub_->get_rx_valid_frame_count(),
-           this->accepted_remote_command_count_, this->hub_->get_last_valid_rssi());
+           this->accepted_remote_command_count_, this->hub_->get_last_valid_rssi(),
+           this->hub_->get_last_raw_rssi(),
+           this->hub_->get_last_raw_frequency_offset());
   this->publish_status_("rx_stats", slot, detail,
                         this->hub_->get_last_valid_rssi());
 }

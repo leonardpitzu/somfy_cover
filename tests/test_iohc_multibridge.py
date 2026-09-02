@@ -21,6 +21,7 @@ MANAGER_PY = (
 ).read_text()
 COVER_CPP = (ROOT / "components/somfy/somfy_iohc.cpp").read_text()
 COVER_H = (ROOT / "components/somfy/somfy_iohc.h").read_text()
+HUB_CPP = (ROOT / "components/somfy/somfy_hub_iohc.cpp").read_text()
 STORAGE_CPP = (ROOT / "components/somfy/NVSRollingCodeStorage.cpp").read_text()
 STORAGE_H = (ROOT / "components/somfy/NVSRollingCodeStorage.h").read_text()
 
@@ -624,3 +625,37 @@ def test_composite_commands_publish_completion_after_their_final_frame():
     assert tilt_sequence.index("send_1w_button_event") < tilt_sequence.index(
         "finish_1w_tilt_sequence_"
     )
+
+
+def test_dynamic_slots_own_their_nvs_identity_strings():
+    """Empty/reset slots must not retain pointers into temporary records."""
+
+    assert "std::string storage_key_;" in COVER_H
+    assert "std::string storage_namespace_;" in COVER_H
+    assert "this->storage_namespace_ = ns == nullptr ? \"\" : ns;" in COVER_CPP
+    assert "this->storage_key_ = key == nullptr ? \"\" : key;" in COVER_CPP
+    assert "this->storage_namespace_.c_str()" in COVER_CPP
+    assert "this->storage_key_.c_str()" in COVER_CPP
+
+    # The NVS adapter also owns a copy so callers can safely pass local strings.
+    assert "std::string name_;" in STORAGE_H
+    assert "std::string key_;" in STORAGE_H
+    assert "this->name_.c_str()" in STORAGE_CPP
+    assert "this->key_.c_str()" in STORAGE_CPP
+
+
+def test_rx_stats_expose_raw_frequency_diagnostics_before_crc_validation():
+    on_packet = _function(
+        HUB_CPP,
+        "void SomfyIohcHub::on_packet",
+        "void SomfyIohcHub::handle_2w_packet_",
+    )
+    assert "last_raw_frequency_offset_ = freq_offset" in on_packet
+    assert "last_raw_rssi_ = rssi" in on_packet
+    stats = _function(
+        MANAGER_CPP,
+        "void SomfyIohcManager::publish_rx_stats_",
+        "void SomfyIohcManager::publish_backup_",
+    )
+    assert 'raw_rssi=%.1f,freq_offset=%.0f' in stats
+    assert "get_last_raw_frequency_offset()" in stats

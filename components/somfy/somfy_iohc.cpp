@@ -131,14 +131,14 @@ cover::CoverTraits SomfyIohcCover::get_traits() {
 }
 
 void SomfyIohcCover::reconfigure_storage(const char *ns, const char *key, uint16_t initial_code) {
-  this->storage_namespace_ = ns;
-  this->storage_key_ = key;
+  this->storage_namespace_ = ns == nullptr ? "" : ns;
+  this->storage_key_ = key == nullptr ? "" : key;
   this->initial_rolling_code_ = initial_code == 0 ? 1 : initial_code;
   // This is also safe after setup: NVSRollingCodeStorage closes its old handle
   // before the replacement stream is opened.
   if (this->storage_ != nullptr) {
     this->storage_ = std::make_unique<NVSRollingCodeStorage>(
-        this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
+        this->storage_namespace_.c_str(), this->storage_key_.c_str(), this->initial_rolling_code_);
   }
 }
 
@@ -229,12 +229,12 @@ void SomfyIohcCover::runtime_observe_tilt(bool clockwise, uint8_t steps) {
 void SomfyIohcCover::setup() {
   ESP_LOGCONFIG(TAG, "Setting up Somfy iohc cover...");
 
-  if (this->storage_namespace_ == nullptr || this->storage_key_ == nullptr) {
+  if (this->storage_namespace_.empty() || this->storage_key_.empty()) {
     ESP_LOGE(TAG, "Rolling-code storage identity is missing; RF transmission will remain disabled");
     this->runtime_enabled_ = false;
   } else {
     this->storage_ = std::make_unique<NVSRollingCodeStorage>(
-        this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
+        this->storage_namespace_.c_str(), this->storage_key_.c_str(), this->initial_rolling_code_);
   }
   const uint16_t next_code = this->storage_ == nullptr ? 0 : this->storage_->peekNextCode();
   if (next_code == 0) {
@@ -283,7 +283,7 @@ void SomfyIohcCover::dump_config() {
   if (this->mode_ == IohcMode::MODE_2W) {
     ESP_LOGCONFIG(TAG, "  Target node: 0x%06" PRIX32, this->target_node_);
   }
-  ESP_LOGCONFIG(TAG, "  Storage: %s/%s", this->storage_namespace_, this->storage_key_);
+  ESP_LOGCONFIG(TAG, "  Storage: %s/%s", this->storage_namespace_.c_str(), this->storage_key_.c_str());
   ESP_LOGCONFIG(TAG, "  Missing-NVS initial rolling code: %u", this->initial_rolling_code_);
   ESP_LOGCONFIG(TAG, "  Custom key: %s", this->has_custom_key_ ? "yes" : "no (transfer key)");
   if (this->has_my_position_) {

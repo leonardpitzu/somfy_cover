@@ -343,21 +343,38 @@ void SomfyIohcHub::send_2w_frame_(uint32_t src, uint32_t dest, uint8_t cmd,
 void SomfyIohcHub::on_packet(const std::vector<uint8_t> &raw, float freq_offset,
                               float rssi, uint8_t lqi) {
   this->rx_raw_packet_count_++;
+  this->last_raw_frequency_offset_ = freq_offset;
+  this->last_raw_rssi_ = rssi;
   // The CC1101 captures a fixed-size window of raw on-air bytes after the
   // hardware sync match (0x57FD). Strip the io-homecontrol UART 8N1 framing to
   // recover the logical frame bytes (this is what the documented captures show).
   auto &packet = this->rx_frame_;
   iohc_proto::uart_decode(raw.data(), raw.size(), packet);
+  ESP_LOGV(TAG,
+           "RX raw: on_air=%u decoded=%u rssi=%.1f offset=%.0f lqi=%u data=%s",
+           static_cast<unsigned>(raw.size()), static_cast<unsigned>(packet.size()),
+           rssi, freq_offset, lqi, format_hex_pretty(raw).c_str());
 
   // ctrl0 low 5 bits = frame length excluding ctrl0 and the trailing 2-byte
   // CRC. Use it to drop any noise the fixed-length capture decoded past the
   // real frame, so the CRC residue check sees exactly the frame.
-  if (packet.size() < 3) return;
+  if (packet.size() < 3) {
+    ESP_LOGV(TAG, "RX rejected: UART decode produced fewer than 3 bytes");
+    return;
+  }
   size_t frame_len = 1 + (packet[0] & 0x1F) + 2;
-  if (packet.size() < frame_len) return;  // truncated / undecodable capture
+  if (packet.size() < frame_len) {
+    ESP_LOGV(TAG, "RX rejected: decoded=%u declared=%u",
+             static_cast<unsigned>(packet.size()),
+             static_cast<unsigned>(frame_len));
+    return;  // truncated / undecodable capture
+  }
   packet.resize(frame_len);
 
-  if (packet.size() < 11) return;  // minimum valid frame
+  if (packet.size() < 11) {
+    ESP_LOGV(TAG, "RX rejected: frame shorter than 11-byte minimum");
+    return;  // minimum valid frame
+  }
 
   // Verify CRC
   uint16_t received_crc = static_cast<uint16_t>(packet[packet.size() - 2]) |

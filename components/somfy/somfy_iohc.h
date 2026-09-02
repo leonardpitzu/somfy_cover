@@ -154,8 +154,8 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
     this->has_my_position_ = true;
   }
   void set_remote_code(uint32_t code) { this->node_id_ = code & 0x00FFFFFF; }
-  void set_storage_key(const char *key) { this->storage_key_ = key; }
-  void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns; }
+  void set_storage_key(const char *key) { this->storage_key_ = key == nullptr ? "" : key; }
+  void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns == nullptr ? "" : ns; }
   void set_initial_rolling_code(uint16_t code) { this->initial_rolling_code_ = code; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
   void set_encryption_key(const char *hex_key);
@@ -236,8 +236,11 @@ class SomfyIohcCover : public SomfyTimeBasedCover {
   // Per-device identity
   uint32_t node_id_{0};
   uint32_t target_node_{0};  // 2W: destination actuator address
-  const char *storage_key_{nullptr};
-  const char *storage_namespace_{nullptr};
+  // Manager-created slots are configured from records that may be temporary
+  // stack values while slots are reset or moved. Own these strings so setup()
+  // never observes a dangling NVS namespace/key pointer.
+  std::string storage_key_;
+  std::string storage_namespace_;
   uint16_t initial_rolling_code_{1};
   int repeat_count_{iohc_cmd::TX_REPEAT_COUNT};
 
