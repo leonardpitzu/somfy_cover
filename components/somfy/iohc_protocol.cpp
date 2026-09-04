@@ -132,15 +132,144 @@ void obfuscate_key_1w(Aes128EcbFn aes, const uint8_t transfer_key[16], uint32_t 
     enc_out[i] = static_cast<uint8_t>(plain_key[i] ^ keystream[i]);
 }
 
+bool build_frame_1w(Aes128EcbFn aes, const uint8_t key[16], uint32_t src_node,
+                    uint32_t dest_node, uint8_t cmd, const uint8_t *data,
+                    size_t data_len, size_t auth_len, uint16_t sequence,
+                    std::vector<uint8_t> &out) {
+  constexpr size_t MAC_LEN = 6;
+  constexpr uint8_t CTRL0_1W = 0xE0;
+
+  out.clear();
+  if (aes == nullptr || key == nullptr || auth_len > data_len ||
+      (data_len != 0 && data == nullptr))
+    return false;
+
+  out.reserve(2 + 6 + 1 + data_len + 2 + MAC_LEN + 2);
+  out.push_back(0x00);  // ctrl0 placeholder
+  out.push_back(0x00);  // ctrl1
+
+  out.push_back(static_cast<uint8_t>((dest_node >> 16) & 0xFF));
+  out.push_back(static_cast<uint8_t>((dest_node >> 8) & 0xFF));
+  out.push_back(static_cast<uint8_t>(dest_node & 0xFF));
+  out.push_back(static_cast<uint8_t>((src_node >> 16) & 0xFF));
+  out.push_back(static_cast<uint8_t>((src_node >> 8) & 0xFF));
+  out.push_back(static_cast<uint8_t>(src_node & 0xFF));
+  out.push_back(cmd);
+  if (data_len > 0)
+    out.insert(out.end(), data, data + data_len);
+  out.push_back(static_cast<uint8_t>(sequence >> 8));
+  out.push_back(static_cast<uint8_t>(sequence & 0xFF));
+
+  std::vector<uint8_t> authenticated;
+  authenticated.reserve(1 + auth_len);
+  authenticated.push_back(cmd);
+  if (auth_len > 0)
+    authenticated.insert(authenticated.end(), data, data + auth_len);
+
+  uint8_t iv[16];
+  build_iv_1w(authenticated.data(), authenticated.size(), sequence, iv);
+  uint8_t mac[MAC_LEN];
+  compute_mac(aes, key, iv, mac);
+  out.insert(out.end(), mac, mac + MAC_LEN);
+
+  const size_t declared_size = out.size() - 1;
+  if (declared_size > 0x1F) {
+    out.clear();
+    return false;
+  }
+  out[0] = static_cast<uint8_t>(CTRL0_1W | declared_size);
+
+  const uint16_t crc = crc16(out.data(), out.size());
+  out.push_back(static_cast<uint8_t>(crc & 0xFF));
+  out.push_back(static_cast<uint8_t>(crc >> 8));
+  return true;
+}
+
+bool build_key_transfer_frame_1w(uint32_t src_node, uint32_t dest_node,
+                                 const uint8_t encrypted_key[16],
+                                 uint8_t manufacturer, uint8_t data,
+                                 uint16_t sequence, uint8_t ctrl1,
+                                 std::vector<uint8_t> &out) {
+  constexpr uint8_t CMD_WRITE_PRIVATE = 0x30;
+  constexpr uint8_t CTRL0_1W = 0xE0;
+  constexpr size_t DECLARED_SIZE = 28;
+
+  out.clear();
+  if (encrypted_key == nullptr)
+    return false;
+
+  out.reserve(31);
+  out.push_back(static_cast<uint8_t>(CTRL0_1W | DECLARED_SIZE));
+  out.push_back(ctrl1);
+  out.push_back(static_cast<uint8_t>((dest_node >> 16) & 0xFF));
+  out.push_back(static_cast<uint8_t>((dest_node >> 8) & 0xFF));
+  out.push_back(static_cast<uint8_t>(dest_node & 0xFF));
+  out.push_back(static_cast<uint8_t>((src_node >> 16) & 0xFF));
+  out.push_back(static_cast<uint8_t>((src_node >> 8) & 0xFF));
+  out.push_back(static_cast<uint8_t>(src_node & 0xFF));
+  out.push_back(CMD_WRITE_PRIVATE);
+  out.insert(out.end(), encrypted_key, encrypted_key + 16);
+  out.push_back(manufacturer);
+  out.push_back(data);
+  out.push_back(static_cast<uint8_t>(sequence >> 8));
+  out.push_back(static_cast<uint8_t>(sequence & 0xFF));
+
+  const uint16_t crc = crc16(out.data(), out.size());
+  out.push_back(static_cast<uint8_t>(crc & 0xFF));
+  out.push_back(static_cast<uint8_t>(crc >> 8));
+  return true;
+}
+
+bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequence) {
+  constexpr size_t SEQUENCE_AND_MAC_LEN = 8;
+  if (data == nullptr || data_len < SEQUENCE_AND_MAC_LEN)
+    return false;
+  const size_t offset = data_len - SEQUENCE_AND_MAC_LEN;
+  sequence = (static_cast<uint16_t>(data[offset]) << 8) | data[offset + 1];
+  return true;
+}
+
+bool gesture_terminal_matches_prefix(uint32_t prefix_remote,
+                                     uint16_t prefix_sequence,
+                                     bool prefix_has_sequence,
+                                     uint32_t terminal_remote,
+                                     uint16_t terminal_sequence,
+                                     bool terminal_has_sequence) {
+  if ((prefix_remote & 0x00FFFFFFU) !=
+      (terminal_remote & 0x00FFFFFFU)) {
+    return false;
+  }
+  if (!prefix_has_sequence || !terminal_has_sequence)
+    return true;
+  return terminal_sequence == static_cast<uint16_t>(prefix_sequence + 1U);
+}
+
+bool RxBurstDeduplicator::is_duplicate(uint32_t now_ms, uint32_t src, uint16_t main_param,
+                                       uint16_t sequence, bool has_sequence, uint32_t window_ms) {
+  const bool same_frame = has_sequence && this->has_sequence_
+                              ? sequence == this->sequence_
+                              : !has_sequence && !this->has_sequence_ && main_param == this->main_param_;
+  if (this->valid_ && src == this->src_ && same_frame && (now_ms - this->seen_ms_) < window_ms) {
+    this->seen_ms_ = now_ms;  // extend the window across the whole RF burst
+    return true;
+  }
+
+  this->valid_ = true;
+  this->src_ = src;
+  this->main_param_ = main_param;
+  this->sequence_ = sequence;
+  this->has_sequence_ = has_sequence;
+  this->seen_ms_ = now_ms;
+  return false;
+}
+
 void uart_encode(const uint8_t *logical, size_t len, std::vector<uint8_t> &out) {
   out.clear();
   BitWriter bw(out);
-  // 4-bit encoded-sync tail (0b1001) — the leftover bits of the UART-framed
-  // 0x33 sync byte that follow the 16-bit hardware sync match.
-  bw.put(1);
-  bw.put(0);
-  bw.put(0);
-  bw.put(1);
+  // Eight-bit encoded-sync residue after the preamble-aligned 0x57FD hardware
+  // sync. This is the remainder of the UART-framed logical 0x33 byte.
+  for (uint8_t k = 0; k < 8; k++)
+    bw.put((PHY_SYNC_RESIDUE >> (7 - k)) & 1);
   for (size_t i = 0; i < len; i++) {
     bw.put(0);  // start bit
     for (uint8_t k = 0; k < 8; k++)
@@ -153,7 +282,7 @@ void uart_encode(const uint8_t *logical, size_t len, std::vector<uint8_t> &out) 
 size_t uart_decode(const uint8_t *payload, size_t len, std::vector<uint8_t> &out) {
   out.clear();
   BitReader br(payload, len);
-  br.skip(PHY_SYNC_TAIL_BITS);
+  br.skip(PHY_SYNC_RESIDUE_BITS);
   while (br.remaining() >= 10) {
     uint8_t start = 0;
     br.get(start);

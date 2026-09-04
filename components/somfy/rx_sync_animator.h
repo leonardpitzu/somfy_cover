@@ -12,7 +12,7 @@ struct RxSyncUpdate {
   float position;
   /// True when the caller should publish the new position to Home Assistant.
   bool publish;
-  /// True when the cover has reached the end stop and the animation is over.
+  /// True when the cover has reached the requested target and the animation is over.
   bool finished;
 };
 
@@ -27,8 +27,8 @@ struct RxSyncUpdate {
 /// the entity and decides when to actually publish, which keeps the logic
 /// testable on a host without any of the ESPHome cover machinery.
 ///
-/// RTS is the only consumer verified against real hardware, so it is the
-/// reference behaviour here; do not retune this to suit io-homecontrol.
+/// The same arithmetic is used for hardware-tested RTS/io-homecontrol remote
+/// state synchronisation and for the IOHC MY estimate.
 class RxSyncAnimator {
  public:
   static constexpr float POSITION_OPEN = 1.0f;
@@ -40,10 +40,30 @@ class RxSyncAnimator {
 
   /// Begin animating from @p from_position towards the open or closed end stop.
   void start(bool opening, float from_position, uint32_t now_ms) {
+    this->start_to(opening ? POSITION_OPEN : POSITION_CLOSED, from_position, now_ms);
+  }
+
+  /// Begin animating from @p from_position towards an arbitrary target.
+  ///
+  /// This is used for a motor's stored MY/favourite position. It deliberately
+  /// shares the same travel-time arithmetic as end-stop movements so every
+  /// cover's configured open/close durations remain the single calibration
+  /// source for Home Assistant position estimates.
+  void start_to(float target_position, float from_position, uint32_t now_ms) {
+    if (target_position < POSITION_CLOSED)
+      target_position = POSITION_CLOSED;
+    if (target_position > POSITION_OPEN)
+      target_position = POSITION_OPEN;
+    if (from_position < POSITION_CLOSED)
+      from_position = POSITION_CLOSED;
+    if (from_position > POSITION_OPEN)
+      from_position = POSITION_OPEN;
+
     this->active_ = true;
-    this->opening_ = opening;
+    this->opening_ = target_position >= from_position;
     this->start_ms_ = now_ms;
     this->start_position_ = from_position;
+    this->target_position_ = target_position;
     this->last_publish_ms_ = 0;
     this->last_published_position_ = -1.0f;
   }
@@ -53,13 +73,14 @@ class RxSyncAnimator {
 
   bool active() const { return this->active_; }
   bool opening() const { return this->opening_; }
+  float target_position() const { return this->target_position_; }
 
   /// Advance the animation.
   ///
   /// @param full_duration_ms Time for a full travel in the current direction,
   ///        i.e. open_duration when opening(), close_duration otherwise.
   RxSyncUpdate update(uint32_t now_ms, uint32_t full_duration_ms) {
-    const float target = this->opening_ ? POSITION_OPEN : POSITION_CLOSED;
+    const float target = this->target_position_;
 
     // Only the remaining travel takes time, so a half-open cover reaches the
     // end stop in half the configured duration.
@@ -105,6 +126,7 @@ class RxSyncAnimator {
   bool opening_{false};
   uint32_t start_ms_{0};
   float start_position_{0.0f};
+  float target_position_{0.0f};
   uint32_t last_publish_ms_{0};
   float last_published_position_{-1.0f};
 };

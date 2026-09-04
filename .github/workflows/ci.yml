@@ -56,13 +56,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       # The protocol test uses OpenSSL as an independent AES oracle on Linux
-      # (CommonCrypto on macOS). Installed explicitly rather than relying on
-      # whatever the runner image happens to ship.
+      # (CommonCrypto on macOS).
       - name: Install OpenSSL headers
         run: sudo apt-get update && sudo apt-get install -y libssl-dev
-      # Compiles the real component sources against stubs in tests/cpp/stubs.
-      # Covers cover state-sync and protocol maths, which an `esphome compile`
-      # cannot: a firmware build succeeding says nothing about behaviour.
+      # Compile production sources against the minimal host stubs.
       - name: Run C++ suites
         run: tests/cpp/run.sh
 
@@ -73,10 +70,12 @@ jobs:
     strategy:
       matrix:
         fixture:
+          - test_iohc_1w
+          - test_iohc_1w_arduino
+          - test_iohc_2w
+          - test_iohc_manager
           - test_rts_tx_only
           - test_rts_rx
-          - test_iohc_1w
-          - test_iohc_2w
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

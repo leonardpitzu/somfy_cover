@@ -1,0 +1,88 @@
+esphome:
+  name: test-somfy-iohc-manager
+  build_path: /tmp/somfy-iohc-manager-build
+
+esp32:
+  board: seeed_xiao_esp32s3
+  framework:
+    type: arduino
+
+logger:
+
+wifi:
+  ssid: test-network
+  password: test-password
+
+api:
+  custom_services: true
+
+external_components:
+  - source:
+      type: local
+      path: ../../components
+
+spi:
+  clk_pin: GPIO07
+  mosi_pin: GPIO09
+  miso_pin: GPIO08
+
+cc1101:
+  id: cc1101_radio
+  cs_pin: GPIO04
+  gdo0_pin: GPIO02
+  frequency: 868.95MHz
+  modulation_type: 2-FSK
+  symbol_rate: 38400
+  fsk_deviation: 19.2kHz
+  filter_bandwidth: 100kHz
+  output_power: 10
+  manchester: false
+  packet_mode: true
+  packet_length: 0
+  crc_enable: false
+  sync_mode: "16/16"
+  sync1: 0x57
+  sync0: 0xFD
+  num_preamble: 7
+
+somfy:
+  - id: iohc_hub
+    type: iohc
+    cc1101_id: cc1101_radio
+
+text_sensor:
+  - platform: template
+    id: manager_status
+    name: "Commissioning Status"
+    entity_category: diagnostic
+  - platform: template
+    id: manager_backup
+    name: "Encrypted Controller Backup"
+    entity_category: diagnostic
+
+somfy_iohc_manager:
+  id: shutter_manager
+  somfy_id: iohc_hub
+  status_sensor: manager_status
+  backup_sensor: manager_backup
+  backup_key: "FFEEDDCCBBAA99887766554433221100"
+  max_shutters: 20
+  imports:
+    - slot: 0
+      remote_code: 0x123456
+      encryption_key: "00112233445566778899AABBCCDDEEFF"
+      storage_namespace: somfy
+      storage_key: ExistingStream
+      initial_rolling_code: 30
+      physical_remote: 0x654321
+      open_duration: 31.2s
+      close_duration: 29.8s
+      my_position: 42%
+      repeat_command_count: 6
+
+somfy_iohc_capture:
+  id: iohc_raw_capture
+  somfy_id: iohc_hub
+  remote_code: 0x654321
+  capture:
+    name: "IOHC Raw Frame Capture"

@@ -142,18 +142,12 @@ class TestValidateRtsConfigValid:
             {CONF_TYPE: TYPE_RTS, CONF_ALLOWED_REMOTES: []},
             TX_ONLY_HUB,
         ),
-        # Hub could not be resolved -> skip rather than guess
-        (
-            {CONF_TYPE: TYPE_RTS, CONF_ALLOWED_REMOTES: [0x123456]},
-            None,
-        ),
     ], ids=[
         "full-rx-path",
         "receiver-and-allowed",
         "receiver-and-detected",
         "receiver-unused",
         "tx-only",
-        "unresolved-hub",
     ])
     def test_passes(self, config, hub):
         assert validate_rts_config(config, hub) is config
@@ -185,6 +179,11 @@ class TestValidateRtsConfigInvalid:
     def test_raises_invalid(self, config):
         with pytest.raises(cv.Invalid):
             validate_rts_config(config, TX_ONLY_HUB)
+
+    def test_unresolved_hub_does_not_bypass_receiver_validation(self):
+        config = {CONF_TYPE: TYPE_RTS, CONF_ALLOWED_REMOTES: [0x123456]}
+        with pytest.raises(cv.Invalid):
+            validate_rts_config(config, None)
 
 
 # ---------------------------------------------------------------------------

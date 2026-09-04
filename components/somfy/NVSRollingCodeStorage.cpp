@@ -18,15 +18,10 @@ bool NVSRollingCodeStorage::ensure_nvs_initialized_() {
     return true;
 
   esp_err_t err = nvs_flash_init();
-  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-    ESP_LOGW(TAG, "NVS needs a reformat (%s), erasing", esp_err_to_name(err));
-    err = nvs_flash_erase();
-    if (err == ESP_OK)
-      err = nvs_flash_init();
-  }
-
   if (err != ESP_OK) {
-    ESP_LOGE(TAG, "nvs_flash_init failed: %s", esp_err_to_name(err));
+    // Never erase NVS automatically. Rolling codes are part of the pairing
+    // identity and may be impossible to reconstruct after a blanket erase.
+    ESP_LOGE(TAG, "nvs_flash_init failed: %s; refusing to erase pairing state", esp_err_to_name(err));
     return false;
   }
 
@@ -34,47 +29,82 @@ bool NVSRollingCodeStorage::ensure_nvs_initialized_() {
   return true;
 }
 
-NVSRollingCodeStorage::NVSRollingCodeStorage(const char *name, const char *key)
-    : name_(name), key_(key) {}
+NVSRollingCodeStorage::NVSRollingCodeStorage(const char *name, const char *key, uint16_t initial_code)
+    : name_(name == nullptr ? "" : name), key_(key == nullptr ? "" : key),
+      initial_code_(initial_code == 0 ? 1 : initial_code) {}
 
-uint16_t NVSRollingCodeStorage::next_volatile_code_() {
-  // Storage is unavailable. Keep transmitting using an in-RAM counter that only
-  // ever moves forward, instead of aborting — ESP_ERROR_CHECK would reboot the
-  // device in the middle of a command.
-  return ++this->last_code_;
+NVSRollingCodeStorage::~NVSRollingCodeStorage() {
+  if (this->opened_)
+    nvs_close(this->handle_);
 }
 
-uint16_t NVSRollingCodeStorage::nextCode() {
-  if (!this->opened_) {
-    if (!ensure_nvs_initialized_())
-      return this->next_volatile_code_();
+bool NVSRollingCodeStorage::open_() {
+  if (this->opened_)
+    return true;
 
-    esp_err_t err = nvs_open(this->name_, NVS_READWRITE, &this->handle_);
-    if (err != ESP_OK) {
-      ESP_LOGE(TAG, "nvs_open('%s') failed: %s", this->name_, esp_err_to_name(err));
-      return this->next_volatile_code_();
-    }
-    this->opened_ = true;
+  if (!ensure_nvs_initialized_())
+    return false;
+
+  esp_err_t err = nvs_open(this->name_.c_str(), NVS_READWRITE, &this->handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "nvs_open('%s') failed: %s", this->name_.c_str(), esp_err_to_name(err));
+    return false;
   }
+  this->opened_ = true;
+  return true;
+}
 
-  uint16_t code = 1;
-  esp_err_t err = nvs_get_u16(this->handle_, this->key_, &code);
+bool NVSRollingCodeStorage::read_next_(uint16_t &code) {
+  if (!this->open_())
+    return false;
+
+  code = this->initial_code_;
+  esp_err_t err = nvs_get_u16(this->handle_, this->key_.c_str(), &code);
   if (err == ESP_ERR_NVS_NOT_FOUND) {
-    code = 1;
+    code = this->initial_code_;
   } else if (err != ESP_OK) {
-    ESP_LOGE(TAG, "nvs_get_u16('%s') failed: %s", this->key_, esp_err_to_name(err));
-    return this->next_volatile_code_();
+    ESP_LOGE(TAG, "nvs_get_u16('%s') failed: %s", this->key_.c_str(), esp_err_to_name(err));
+    return false;
   }
+  if (code == 0) {
+    ESP_LOGE(TAG, "rolling code '%s' wrapped/exhausted; re-pair with a new identity", this->key_.c_str());
+    return false;
+  }
+  return true;
+}
 
-  err = nvs_set_u16(this->handle_, this->key_, static_cast<uint16_t>(code + 1));
+uint16_t NVSRollingCodeStorage::peekNextCode() {
+  uint16_t code;
+  return this->read_next_(code) ? code : 0;
+}
+
+bool NVSRollingCodeStorage::seedNextCode(uint16_t code) {
+  if (code == 0 || !this->open_())
+    return false;
+  esp_err_t err = nvs_set_u16(this->handle_, this->key_.c_str(), code);
   if (err == ESP_OK)
     err = nvs_commit(this->handle_);
   if (err != ESP_OK) {
-    // The code itself is still valid to send; only persistence failed. That
-    // means the next boot may replay codes, so make it loud.
-    ESP_LOGE(TAG, "persisting rolling code '%s' failed: %s", this->key_, esp_err_to_name(err));
+    ESP_LOGE(TAG, "seeding rolling code '%s' failed: %s", this->key_.c_str(),
+             esp_err_to_name(err));
+    return false;
+  }
+  this->initial_code_ = code;
+  return true;
+}
+
+uint16_t NVSRollingCodeStorage::nextCode() {
+  uint16_t code;
+  if (!this->read_next_(code))
+    return 0;
+
+  esp_err_t err = nvs_set_u16(this->handle_, this->key_.c_str(), static_cast<uint16_t>(code + 1));
+  if (err == ESP_OK)
+    err = nvs_commit(this->handle_);
+  if (err != ESP_OK) {
+    ESP_LOGE(TAG, "persisting rolling code '%s' failed: %s", this->key_.c_str(), esp_err_to_name(err));
+    return 0;
   }
 
-  this->last_code_ = code;
   return code;
 }

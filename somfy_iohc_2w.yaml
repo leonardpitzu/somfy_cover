@@ -14,7 +14,6 @@ logger:
   level: DEBUG
 
 esphome:
-  name: $devicename
   comment: $devicelabel
 
 esp32:
@@ -35,21 +34,22 @@ spi:
 # The somfy iohc component will auto-configure modulation parameters.
 cc1101:
   id: cc1101_radio
-  cs_pin: GPIO6
-  gdo0_pin: GPIO04
+  cs_pin: GPIO04
+  gdo0_pin: GPIO02
   frequency: 868.95MHz
   modulation_type: 2-FSK
   symbol_rate: 38400
   fsk_deviation: 19.2kHz
   filter_bandwidth: 100kHz
+  output_power: 10
   manchester: false
   packet_mode: true
   packet_length: 0
   crc_enable: false
   sync_mode: "16/16"
-  sync1: 0xFF
-  sync0: 0x33
-  num_preamble: 4
+  sync1: 0x57
+  sync0: 0xFD
+  num_preamble: 7
 
 somfy:
   - id: iohc_radio
@@ -61,13 +61,10 @@ button:
     id: "program_living_room_blind"
     name: "Prog Living Room Blind"
     entity_category: config
-
-# Optional: shows the ID + command of any io-homecontrol remote heard on air,
-# so you can learn the IDs of the physical remotes paired with your motor.
-text_sensor:
+    disabled_by_default: true
   - platform: template
-    id: somfy_iohc_rx_last
-    name: "Detected iohc Remote"
+    id: my_living_room_blind
+    name: "Living Room Blind MY"
 
 cover:
   - platform: somfy
@@ -77,14 +74,13 @@ cover:
     device_class: shutter
     open_duration: 25s
     close_duration: 25s
+    my_position: 50%
+    my_button: my_living_room_blind
     storage_key: KeyLivBlind
+    initial_rolling_code: 1
     remote_code: 0xAABBCC
     prog_button: program_living_room_blind
     somfy_id: iohc_radio
     mode: 2w
     target_node: 0xDEADBE
     encryption_key: "YOUR_SYSTEM_KEY_HEX_32_CHARS_HERE"
-    # RX state-sync: keep HA in sync when the motor is driven by an original remote.
-    detected_remote: somfy_iohc_rx_last
-    allowed_remotes:
-      - 0x112233

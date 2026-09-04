@@ -33,6 +33,7 @@ CONF_SOMFY_STORAGE_KEY = "storage_key"
 CONF_SOMFY_STORAGE_NAMESPACE = "storage_namespace"
 CONF_REPEAT_COMMAND_COUNT = "repeat_command_count"
 CONF_PROG_BUTTON = "prog_button"
+CONF_INITIAL_ROLLING_CODE = "initial_rolling_code"
 
 # RTS-specific
 CONF_ALLOWED_REMOTES = "allowed_remotes"
@@ -42,6 +43,8 @@ CONF_DETECTED_REMOTE = "detected_remote"
 CONF_ENCRYPTION_KEY = "encryption_key"
 CONF_IOHC_MODE = "mode"
 CONF_TARGET_NODE = "target_node"
+CONF_MY_BUTTON = "my_button"
+CONF_MY_POSITION = "my_position"
 
 TYPE_RTS = "rts"
 TYPE_IOHC = "iohc"
@@ -63,7 +66,19 @@ def validate_iohc_config(config):
             raise cv.Invalid(
                 f"'{CONF_ENCRYPTION_KEY}' (system key) is required for 2W mode"
             )
+    if CONF_MY_BUTTON in config and CONF_MY_POSITION not in config:
+        raise cv.Invalid(
+            f"'{CONF_MY_POSITION}' is required when '{CONF_MY_BUTTON}' is configured"
+        )
     return config
+
+
+def validate_encryption_key(value):
+    """Require exactly 16 bytes encoded as 32 hexadecimal characters."""
+    value = cv.string(value)
+    if len(value) != 32 or any(ch not in "0123456789abcdefABCDEF" for ch in value):
+        raise cv.Invalid("encryption_key must contain exactly 32 hexadecimal characters")
+    return value
 
 
 def uses_rx(config):
@@ -86,10 +101,10 @@ def iohc_uses_rx(config):
     """
     if config.get(CONF_IOHC_MODE, IOHC_MODE_1W) == IOHC_MODE_2W:
         return True
-    return uses_rx(config)
+    return uses_rx(config) or CONF_MY_POSITION in config
 
 
-def validate_rts_config(config, hub_config):
+def validate_rts_config(config, hub_config=None):
     """Validate an RTS cover against the hub it references.
 
     ``allowed_remotes`` / ``detected_remote`` only do anything when the hub owns
@@ -99,7 +114,12 @@ def validate_rts_config(config, hub_config):
     """
     if not uses_rx(config):
         return config
-    if hub_config is None or CONF_REMOTE_RECEIVER in hub_config:
+    # The optional second argument is used by final validation, where the hub
+    # is available separately. Keeping the one-argument form preserves the
+    # public validator API and supports direct/unit validation of legacy maps
+    # that include remote_receiver inline.
+    effective_hub = config if hub_config is None else hub_config
+    if CONF_REMOTE_RECEIVER in effective_hub:
         return config
     raise cv.Invalid(
         f"'{CONF_ALLOWED_REMOTES}' and '{CONF_DETECTED_REMOTE}' need the somfy "
@@ -123,12 +143,17 @@ COMMON_COVER_FIELDS = {
     cv.Required(CONF_PROG_BUTTON): cv.use_id(button.Button),
     cv.Required(CONF_OPEN_DURATION): cv.positive_time_period_milliseconds,
     cv.Required(CONF_CLOSE_DURATION): cv.positive_time_period_milliseconds,
-    cv.Required(CONF_REMOTE_CODE): cv.hex_uint32_t,
+    cv.Required(CONF_REMOTE_CODE): cv.hex_int_range(min=1, max=0xFFFFFF),
     cv.Required(CONF_SOMFY_STORAGE_KEY): cv.All(cv.string, cv.Length(max=15)),
     cv.Optional(CONF_SOMFY_STORAGE_NAMESPACE, default="somfy"): cv.All(
         cv.string, cv.Length(max=15)
     ),
     cv.Optional(CONF_REPEAT_COMMAND_COUNT, default=4): cv.int_range(min=1, max=100),
+    # Used only when the NVS key does not exist (fresh/replacement ESP). Zero is
+    # reserved as a storage-error sentinel in C++.
+    cv.Optional(CONF_INITIAL_ROLLING_CODE, default=1): cv.hex_int_range(
+        min=1, max=0xFFFF
+    ),
 }
 
 RTS_COVER_SCHEMA = (
@@ -151,13 +176,13 @@ IOHC_COVER_SCHEMA = cv.All(
     .extend(
         {
             cv.Required(CONF_SOMFY_ID): cv.use_id(SomfyIohcHub),
-            cv.Optional(CONF_ENCRYPTION_KEY): cv.All(
-                cv.string, cv.Length(min=32, max=32)
-            ),
+            cv.Optional(CONF_ENCRYPTION_KEY): validate_encryption_key,
             cv.Optional(CONF_IOHC_MODE, default=IOHC_MODE_1W): cv.one_of(
                 IOHC_MODE_1W, IOHC_MODE_2W, lower=True
             ),
             cv.Optional(CONF_TARGET_NODE): cv.hex_uint32_t,
+            cv.Optional(CONF_MY_POSITION): cv.percentage,
+            cv.Optional(CONF_MY_BUTTON): cv.use_id(button.Button),
             # RX state-sync: learn physical io-homecontrol remote IDs and keep
             # HA in sync when a motor is driven by an original remote. The iohc
             # hub always listens (CC1101 sits in RX), so unlike RTS no separate
@@ -192,6 +217,38 @@ def _final_validate(config):
     if config[CONF_TYPE] == TYPE_RTS:
         hub_config = find_hub_config(fv.full_config.get(), config[CONF_SOMFY_ID])
         validate_rts_config(config, hub_config)
+
+    # A rolling-code key identifies one monotonically increasing stream. Two
+    # independently configured cover entities must never accidentally reuse it.
+    # Likewise, duplicate IOHC controller IDs would make broadcast commands a
+    # group operation; represent an intentional group as one cover entity.
+    all_covers = fv.full_config.get().get("cover") or []
+    this_id = str(config.get(CONF_ID))
+    this_storage = (
+        config.get(CONF_SOMFY_STORAGE_NAMESPACE, "somfy"),
+        config.get(CONF_SOMFY_STORAGE_KEY),
+    )
+    for other in all_covers:
+        if str(other.get(CONF_ID)) == this_id or CONF_SOMFY_ID not in other:
+            continue
+        other_storage = (
+            other.get(CONF_SOMFY_STORAGE_NAMESPACE, "somfy"),
+            other.get(CONF_SOMFY_STORAGE_KEY),
+        )
+        if this_storage == other_storage:
+            raise cv.Invalid(
+                "Somfy covers must not share storage_namespace/storage_key; "
+                f"duplicate {this_storage[0]}/{this_storage[1]}"
+            )
+        if (
+            config[CONF_TYPE] == TYPE_IOHC
+            and other.get(CONF_TYPE) == TYPE_IOHC
+            and config.get(CONF_REMOTE_CODE) == other.get(CONF_REMOTE_CODE)
+        ):
+            raise cv.Invalid(
+                "IOHC covers must not reuse remote_code; use one cover entity "
+                "for an intentional broadcast group"
+            )
     return config
 
 
@@ -227,6 +284,7 @@ async def _to_code_rts(config):
     cg.add(var.set_remote_code(config[CONF_REMOTE_CODE]))
     cg.add(var.set_storage_key(config[CONF_SOMFY_STORAGE_KEY]))
     cg.add(var.set_storage_namespace(config[CONF_SOMFY_STORAGE_NAMESPACE]))
+    cg.add(var.set_initial_rolling_code(config[CONF_INITIAL_ROLLING_CODE]))
     cg.add(var.set_repeat_count(config[CONF_REPEAT_COMMAND_COUNT]))
 
     if CONF_ALLOWED_REMOTES in config:
@@ -254,7 +312,14 @@ async def _to_code_iohc(config):
     cg.add(var.set_remote_code(config[CONF_REMOTE_CODE]))
     cg.add(var.set_storage_key(config[CONF_SOMFY_STORAGE_KEY]))
     cg.add(var.set_storage_namespace(config[CONF_SOMFY_STORAGE_NAMESPACE]))
+    cg.add(var.set_initial_rolling_code(config[CONF_INITIAL_ROLLING_CODE]))
     cg.add(var.set_repeat_count(config[CONF_REPEAT_COMMAND_COUNT]))
+
+    if CONF_MY_POSITION in config:
+        cg.add(var.set_my_position(config[CONF_MY_POSITION]))
+    if CONF_MY_BUTTON in config:
+        my_button = await cg.get_variable(config[CONF_MY_BUTTON])
+        cg.add(var.set_my_button(my_button))
 
     if CONF_ENCRYPTION_KEY in config:
         cg.add(var.set_encryption_key(config[CONF_ENCRYPTION_KEY]))

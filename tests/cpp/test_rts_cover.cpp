@@ -47,7 +47,9 @@ Logger *global_logger = &g_logger;
 // In-memory replacement for the ESP32 NVS-backed rolling code counter. The real
 // implementation is exercised on-device; here codes only need to advance.
 static uint16_t g_rolling_code = 1;
-NVSRollingCodeStorage::NVSRollingCodeStorage(const char *name, const char *key) : name_(name), key_(key) {}
+NVSRollingCodeStorage::NVSRollingCodeStorage(const char *name, const char *key, uint16_t initial_code)
+    : name_(name), key_(key), initial_code_(initial_code) {}
+NVSRollingCodeStorage::~NVSRollingCodeStorage() = default;
 uint16_t NVSRollingCodeStorage::nextCode() { return g_rolling_code++; }
 
 // ---------------------------------------------------------------------------

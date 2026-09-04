@@ -4,6 +4,7 @@
 
 class RollingCodeStorage {
 public:
+	virtual ~RollingCodeStorage() = default;
 	/**
 	 * Get the next rolling code from the store. This should also increase the rolling code and store it persistently.
 	 *

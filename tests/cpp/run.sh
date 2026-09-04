@@ -69,4 +69,3 @@ if [[ "$failed" -ne 0 ]]; then
 fi
 
 echo "All C++ suites passed."
-

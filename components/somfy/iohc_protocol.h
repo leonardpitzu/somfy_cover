@@ -53,6 +53,57 @@ void compute_mac(Aes128EcbFn aes, const uint8_t key[16], const uint8_t iv[16], u
 void obfuscate_key_1w(Aes128EcbFn aes, const uint8_t transfer_key[16], uint32_t node_addr,
                       const uint8_t plain_key[16], uint8_t enc_out[16]);
 
+// Build a complete ordinary logical 1W frame (ctrl0 .. CRC). The MAC
+// authenticates cmd || data[0..auth_len), and the sequence is placed between
+// data and MAC. Key transfer (cmd 0x30) has a special no-MAC wire format; use
+// build_key_transfer_frame_1w() for that command.
+bool build_frame_1w(Aes128EcbFn aes, const uint8_t key[16], uint32_t src_node,
+                    uint32_t dest_node, uint8_t cmd, const uint8_t *data,
+                    size_t data_len, size_t auth_len, uint16_t sequence,
+                    std::vector<uint8_t> &out);
+
+// Build the 31-byte cmd 0x30 install-key management frame:
+//   FC ctrl1 dst[3] src[3] 30 enc_key[16] manufacturer data seq[2] crc[2]
+bool build_key_transfer_frame_1w(uint32_t src_node, uint32_t dest_node,
+                                 const uint8_t encrypted_key[16],
+                                 uint8_t manufacturer, uint8_t data,
+                                 uint16_t sequence, uint8_t ctrl1,
+                                 std::vector<uint8_t> &out);
+
+// Extract the big-endian rolling sequence from the decoded data portion of an
+// ordinary 1W frame. The final eight bytes are sequence[2] || MAC[6], regardless
+// of the command payload length.
+bool extract_sequence_1w(const uint8_t *data, size_t data_len, uint16_t &sequence);
+
+// Decide whether a direction/STOP-MY terminal event completes a previously
+// staged D200 prefix while the caller's short gesture window is still open.
+// When both frames expose rolling sequences, a real terminal consumes exactly
+// the next sequence. Sequence-less captures fall back to the already-bounded
+// same-remote time correlation rather than inventing a sequence relation.
+bool gesture_terminal_matches_prefix(uint32_t prefix_remote,
+                                     uint16_t prefix_sequence,
+                                     bool prefix_has_sequence,
+                                     uint32_t terminal_remote,
+                                     uint16_t terminal_sequence,
+                                     bool terminal_has_sequence);
+
+// Collapses repeated RF copies of one logical frame while preserving rapid new
+// presses of the same button. Sequence-aware frames compare their rolling
+// sequence; legacy/fallback frames compare their main parameter.
+class RxBurstDeduplicator {
+ public:
+  bool is_duplicate(uint32_t now_ms, uint32_t src, uint16_t main_param,
+                    uint16_t sequence, bool has_sequence, uint32_t window_ms);
+
+ private:
+  uint32_t src_{0};
+  uint16_t main_param_{0};
+  uint16_t sequence_{0};
+  uint32_t seen_ms_{0};
+  bool has_sequence_{false};
+  bool valid_{false};
+};
+
 // --- Physical layer (UART-8N1) codec -------------------------------------
 //
 // io-homecontrol modulates 2-FSK at 38400 baud, but the bit stream is *not*
@@ -66,33 +117,34 @@ void obfuscate_key_1w(Aes128EcbFn aes, const uint8_t transfer_key[16], uint32_t 
 //
 // The CC1101 hardware can generate the alternating preamble and match a 16-bit
 // sync word, but it cannot UART-frame the payload. We therefore co-opt the
-// hardware: program the 16-bit sync word to the FIRST 16 bits of the encoded
-// sync (0x7FD9), and let software handle everything after it. The 4 remaining
-// encoded-sync bits (0b1001, the tail of the UART-framed 0x33) sit at the head
-// of the FIFO payload, immediately before the first logical byte's UART frame.
+// hardware: program a preamble-tail-aligned sync word (0x57FD), and let
+// software handle everything after it. The remaining 8 bits of UART-framed
+// 0x33 (0x99) sit at the head of the FIFO payload, immediately before the
+// first logical byte's UART frame. This alignment is validated on CC1101
+// hardware for both RX and TX.
 //
 // build_iv_1w / crc16 / etc. operate on the *logical* bytes (start/stop bits
 // stripped, bit order restored) — exactly what the documented captures show.
 
-// 16-bit hardware sync word: the first 16 bits of the UART-encoded 0xFF 0x33
-// sync sequence. Program SYNC1=0x7F, SYNC0=0xD9, sync_mode 16/16 at runtime.
-static constexpr uint8_t PHY_HW_SYNC1 = 0x7F;
-static constexpr uint8_t PHY_HW_SYNC0 = 0xD9;
+// Four preamble bits, the complete UART-framed 0xFF, and the first two bits of
+// UART-framed 0x33. Program sync_mode 16/16 at runtime.
+static constexpr uint8_t PHY_HW_SYNC1 = 0x57;
+static constexpr uint8_t PHY_HW_SYNC0 = 0xFD;
 
-// The 4 encoded-sync bits (0b1001) that follow the 16-bit hardware sync match
-// and precede the first logical byte inside the FIFO payload.
-static constexpr uint8_t PHY_SYNC_TAIL_BITS = 4;
+// Remaining UART-framed 0x33 bits after the 0x57FD hardware sync match.
+static constexpr uint8_t PHY_SYNC_RESIDUE = 0x99;
+static constexpr uint8_t PHY_SYNC_RESIDUE_BITS = 8;
 
 // Encode a logical frame (ctrl0 .. crc) into the CC1101 FIFO payload that
-// follows the 16-bit hardware sync word. The payload is the 4-bit encoded-sync
-// tail (0b1001) followed by each logical byte UART-framed (start 0, 8 data bits
+// follows the 16-bit hardware sync word. The payload is the 8-bit encoded-sync
+// residue (0x99) followed by each logical byte UART-framed (start 0, 8 data bits
 // LSB-first, stop 1), bit-packed MSB-first. Any partial trailing byte is padded
 // with idle (1) bits. The CC1101 must be in fixed-length packet mode with the
 // length set to out.size() and hardware CRC disabled.
 void uart_encode(const uint8_t *logical, size_t len, std::vector<uint8_t> &out);
 
-// Decode a CC1101 FIFO payload (captured after a 0x7FD9 sync match) back into
-// logical frame bytes. Skips the 4-bit encoded-sync tail, then UART-decodes
+// Decode a CC1101 FIFO payload (captured after a 0x57FD sync match) back into
+// logical frame bytes. Skips the 8-bit encoded-sync residue, then UART-decodes
 // each following 10-bit group. Stops at the first framing error (bad start/stop
 // bit) or when fewer than 10 bits remain. Returns the number of bytes decoded.
 size_t uart_decode(const uint8_t *payload, size_t len, std::vector<uint8_t> &out);

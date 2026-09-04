@@ -1,11 +1,11 @@
-# Minimal ESPHome config to compile-test the Somfy io-homecontrol cover in 2W mode.
+# Production-shaped IOHC 1W fixture for the XIAO's Arduino OTA migration path.
 esphome:
-  name: test-somfy-iohc-2w
+  name: test-somfy-iohc-1w-arduino
 
 esp32:
   board: seeed_xiao_esp32s3
   framework:
-    type: esp-idf
+    type: arduino
 
 logger:
 
@@ -28,6 +28,7 @@ cc1101:
   symbol_rate: 38400
   fsk_deviation: 19.2kHz
   filter_bandwidth: 100kHz
+  output_power: 10
   manchester: false
   packet_mode: true
   packet_length: 0
@@ -46,23 +47,36 @@ button:
   - platform: template
     id: prog_button
     name: "Prog Button"
+    entity_category: config
+    disabled_by_default: true
   - platform: template
     id: my_button
     name: "MY Button"
 
+text_sensor:
+  - platform: template
+    id: detected_remote
+    name: "Detected Remote"
+    entity_category: diagnostic
+
 cover:
   - platform: somfy
     type: iohc
-    name: "Test IOHC 2W Cover"
-    open_duration: 30s
-    close_duration: 30s
+    name: "Test IOHC 1W Arduino Cover"
+    device_class: shutter
+    open_duration: 31.2s
+    close_duration: 29.8s
     my_position: 42%
     my_button: my_button
-    storage_key: Iohc2W
-    initial_rolling_code: 0x0020
+    storage_namespace: somfy
+    storage_key: IohcArd
+    initial_rolling_code: 30
+    repeat_command_count: 6
     remote_code: 0x123456
+    encryption_key: "00112233445566778899AABBCCDDEEFF"
     prog_button: prog_button
     somfy_id: iohc_hub
-    mode: 2w
-    target_node: 0xABCDEF
-    encryption_key: "00112233445566778899AABBCCDDEEFF"
+    mode: 1w
+    allowed_remotes:
+      - 0x654321
+    detected_remote: detected_remote

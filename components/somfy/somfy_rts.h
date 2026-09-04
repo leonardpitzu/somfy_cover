@@ -62,6 +62,7 @@ public:
   void set_remote_code(uint32_t code) { this->remote_code_ = code; }
   void set_storage_namespace(const char *ns) { this->storage_namespace_ = ns; }
   void set_storage_key(const char *key) { this->storage_key_ = key; }
+  void set_initial_rolling_code(uint16_t code) { this->initial_rolling_code_ = code; }
   void set_repeat_count(int count) { this->repeat_count_ = count; }
 
   cover::CoverTraits get_traits() override;
@@ -77,6 +78,7 @@ protected:
   uint32_t remote_code_{0};
   const char *storage_namespace_{nullptr};
   const char *storage_key_{nullptr};
+  uint16_t initial_rolling_code_{1};
   int repeat_count_{4};
 
   // Rolling code storage

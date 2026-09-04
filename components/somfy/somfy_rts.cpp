@@ -80,7 +80,8 @@ bool SomfyCover::is_allowed_remote_(uint32_t code) const {
 // ---------------------------------------------------------------------------
 
 void SomfyCover::setup() {
-  this->storage_ = std::make_unique<NVSRollingCodeStorage>(this->storage_namespace_, this->storage_key_);
+  this->storage_ = std::make_unique<NVSRollingCodeStorage>(
+      this->storage_namespace_, this->storage_key_, this->initial_rolling_code_);
 
 #ifdef USE_SOMFY_COVER_RX
   // Register RX callback on hub (if hub has a receiver)
@@ -199,6 +200,10 @@ void SomfyCover::build_frame(std::array<uint8_t, 7> &bytes, RtsCommand command, 
 
 void SomfyCover::send_command(RtsCommand command) {
   const uint16_t rolling_code = this->storage_->nextCode();
+  if (rolling_code == 0) {
+    ESP_LOGE(TAG, "TX aborted: rolling-code storage unavailable or exhausted");
+    return;
+  }
   std::array<uint8_t, 7> frame;
   build_frame(frame, command, rolling_code);
   this->hub_->send_frame(frame, static_cast<uint8_t>(this->repeat_count_));
